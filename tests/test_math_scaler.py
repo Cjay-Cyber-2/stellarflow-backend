@@ -117,3 +117,27 @@ def test_pack_rate_equivalence():
 def test_pack_rate_deterministic():
     # Float and string representations must produce identical integers
     assert pack_rate(0.00065) == pack_rate("0.00065")
+
+import pytest
+from analytics.math_scaler import (
+    solve_multi_hop_corridor,
+    solve_arbitrage_route,
+    build_arbitrage_route_matrix,
+    SCALE_14
+)
+
+def test_fixed_point_vectors():
+    rates = [1.5, 2.0, 1.1]
+    # 1.5 * 2.0 * 1.1 = 3.3
+    # at SCALE_14 this is 3.3 * 10^14 = 330000000000000
+    res = solve_multi_hop_corridor(rates)
+    assert res == 330000000000000
+
+    matrix = build_arbitrage_route_matrix([[1.5, 2.0, 1.1], [1.1, 3.0]], [1.0, 2.0])
+    # route1 = 3.3
+    # route2 = 3.3
+    # weights: 1.0 and 2.0
+    # expected sum = (3.3*1 + 3.3*2) / 3 = 3.3
+    res2 = solve_arbitrage_route(matrix)
+    assert res2 == 330000000000000
+
