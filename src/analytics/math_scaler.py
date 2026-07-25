@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
-from typing import Union
+from typing import NamedTuple, Union
 from fractions import Fraction
 
 
