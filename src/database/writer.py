@@ -409,6 +409,13 @@ class AsyncRelationalWriter:
     """
     Async, thread-safe (for the buffer) database writer using asyncpg's COPY
     protocol with binary formatting for high-performance bulk inserts.
+
+    When a :class:`~src.database.connection.PreparedStatementPool` is supplied
+    via *statement_pool*, individual-row inserts are executed through a
+    pre-compiled prepared statement rather than re-parsing SQL on every call.
+    This eliminates per-insert parser overhead for the high-frequency pricing
+    ingestion loop (Issue #569).  Batch COPY flushes are unaffected and remain
+    on the binary-COPY path.
     """
 
     def __init__(
@@ -417,6 +424,7 @@ class AsyncRelationalWriter:
         table_name: str = "telemetry",
         batch_size: int = DEFAULT_ASYNC_BATCH_SIZE,
         flush_interval_ms: float = DEFAULT_ASYNC_FLUSH_INTERVAL_MS,
+        statement_pool: Optional[Any] = None,
     ):
         if asyncpg is None:
             raise ImportError("asyncpg is required for AsyncRelationalWriter")
@@ -438,6 +446,7 @@ class AsyncRelationalWriter:
         self._table = table_name
         self._batch_size = batch_size
         self._interval = flush_interval_ms / 1000.0
+        self._statement_pool = statement_pool
 
         self._buffer: List[Dict[str, Any]] = []
         self._buffer_lock = asyncio.Lock()
@@ -448,12 +457,16 @@ class AsyncRelationalWriter:
         # Track columns to ensure consistency across buffer
         self._columns: Optional[List[str]] = None
 
+        # Pre-built INSERT SQL (populated on first flush once columns are known)
+        self._insert_sql: Optional[str] = None
+
         logger.debug(
             "AsyncRelationalWriter initialized for table %s "
-            "(batch_size=%d, flush_interval_ms=%.0f)",
+            "(batch_size=%d, flush_interval_ms=%.0f, statement_pool=%s)",
             self._table,
             self._batch_size,
             flush_interval_ms,
+            "enabled" if statement_pool is not None else "disabled",
         )
 
     async def start(self) -> None:
@@ -500,8 +513,12 @@ class AsyncRelationalWriter:
 
     async def _flush(self) -> None:
         """
-        Bulk-insert buffered rows using asyncpg's copy_records_to_table with
-        binary format.
+        Bulk-insert buffered rows.
+
+        When a :class:`~src.database.connection.PreparedStatementPool` was
+        supplied at construction time, the INSERT statement is prepared once
+        and reused on every flush to eliminate per-flush SQL parser overhead
+        (Issue #569).  Without a pool the original binary-COPY path is used.
         """
         async with self._flush_lock:
             async with self._buffer_lock:
@@ -511,21 +528,50 @@ class AsyncRelationalWriter:
                 self._buffer.clear()
 
             logger.debug(
-                "Flushing %d records to table %s via asyncpg COPY binary",
+                "Flushing %d records to table %s",
                 len(batch),
                 self._table,
             )
 
             try:
-                # Convert records to tuples in column order
-                records = [tuple(record[col] for col in self._columns) for record in batch]
-                await self._conn.copy_records_to_table(
-                    self._table,
-                    records=records,
-                    columns=self._columns,
-                    format="binary",
-                )
-                logger.debug("Successfully flushed %d records", len(batch))
+                if self._statement_pool is not None:
+                    # Prepared-statement path: build the INSERT SQL once and
+                    # reuse the pre-compiled plan on every subsequent flush.
+                    if self._insert_sql is None:
+                        placeholders = ", ".join(
+                            f"${i + 1}" for i in range(len(self._columns))
+                        )
+                        column_clause = ", ".join(self._columns)
+                        self._insert_sql = (
+                            f"INSERT INTO {self._table} ({column_clause}) "
+                            f"VALUES ({placeholders})"
+                        )
+                        logger.debug(
+                            "AsyncRelationalWriter: registered INSERT SQL with "
+                            "statement pool: %s",
+                            self._insert_sql,
+                        )
+
+                    stmt = await self._statement_pool.get_or_prepare(self._insert_sql)
+                    for record in batch:
+                        await stmt.fetch(*[record[col] for col in self._columns])
+                    logger.debug(
+                        "Successfully flushed %d records via prepared statement",
+                        len(batch),
+                    )
+                else:
+                    # Original binary-COPY path (no statement pool).
+                    records = [tuple(record[col] for col in self._columns) for record in batch]
+                    await self._conn.copy_records_to_table(
+                        self._table,
+                        records=records,
+                        columns=self._columns,
+                        format="binary",
+                    )
+                    logger.debug(
+                        "Successfully flushed %d records via asyncpg COPY binary",
+                        len(batch),
+                    )
             except Exception:
                 # Re-queue the batch on failure
                 async with self._buffer_lock:

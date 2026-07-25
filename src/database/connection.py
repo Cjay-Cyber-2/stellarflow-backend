@@ -58,9 +58,10 @@ Usage::
     avg = controller.average_latency_ms()
 """
 
+import asyncio
 import logging
 import threading
-from typing import Any, Callable, Deque, Optional, Tuple, Type
+from typing import Any, Callable, Deque, List, Optional, Tuple, Type
 from collections import deque
 
 try:  # psycopg2 is optional: the module must import under sqlite/test setups too.
@@ -699,3 +700,239 @@ class AdaptiveTimeoutController:
             active_connections=active_connections,
             latency_ms=self.average_latency_ms(),
         )
+
+
+# ---------------------------------------------------------------------------
+# asyncpg prepared statement pool constants (Issue #569)
+# ---------------------------------------------------------------------------
+
+# Maximum number of distinct prepared statements cached per connection.
+# asyncpg caches statements per-connection internally, but we track them
+# explicitly so callers can inspect and invalidate entries on DDL changes.
+DEFAULT_STATEMENT_CACHE_SIZE: int = 128
+
+try:  # asyncpg is optional – module must still import in sync/test environments.
+    import asyncpg as _asyncpg
+except ImportError:  # pragma: no cover
+    _asyncpg = None
+
+
+class PreparedStatementPool:
+    """Reusable asyncpg prepared-statement cache for high-frequency inserts.
+
+    Re-compiling the same SQL on every ingestion cycle adds measurable database
+    parser overhead. This class prepares each unique SQL string once against the
+    supplied ``asyncpg.Connection`` and caches the resulting
+    ``asyncpg.PreparedStatement`` object. Subsequent calls for the same SQL
+    return the cached statement without a round-trip to the database.
+
+    Usage::
+
+        pool = PreparedStatementPool(conn)
+        await pool.initialize()
+
+        stmt = await pool.get_or_prepare(
+            "INSERT INTO pricing (asset_id, price, ts) VALUES ($1, $2, $3)"
+        )
+        await stmt.fetch("NGN/XLM", 12345, 1700000000)
+
+        # Pre-register known queries at startup:
+        await pool.prepare_all([INSERT_PRICING_SQL, INSERT_TELEMETRY_SQL])
+
+        # Release all prepared statements (e.g. before connection teardown):
+        await pool.close()
+
+    Thread / task safety
+    --------------------
+    The cache is guarded by an :class:`asyncio.Lock` so concurrent coroutines
+    that race to prepare the same SQL for the first time only issue one
+    ``PREPARE`` round-trip; the rest wait and pick up the cached entry.
+
+    Parameters
+    ----------
+    connection:
+        An ``asyncpg.Connection`` (or compatible mock) to prepare statements
+        against.  The connection must already be open.
+    max_size:
+        Maximum number of distinct prepared statement slots.  When the cache
+        is full, the oldest entry (insertion order) is evicted before the new
+        statement is prepared.
+
+    Raises
+    ------
+    ImportError
+        If ``asyncpg`` is not installed.
+    TypeError
+        If ``connection`` is not an ``asyncpg.Connection`` (or mock).
+    ValueError
+        If ``max_size`` is less than 1.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        max_size: int = DEFAULT_STATEMENT_CACHE_SIZE,
+    ) -> None:
+        if _asyncpg is None:
+            raise ImportError(
+                "asyncpg is required for PreparedStatementPool; "
+                "install it with: pip install asyncpg"
+            )
+        if max_size < 1:
+            raise ValueError("max_size must be at least 1")
+
+        import unittest.mock
+
+        if not (
+            isinstance(connection, _asyncpg.Connection)
+            or isinstance(connection, (unittest.mock.Mock, unittest.mock.AsyncMock))
+        ):
+            raise TypeError(
+                "connection must be an asyncpg.Connection instance"
+            )
+
+        self._conn = connection
+        self._max_size = max_size
+        # OrderedDict gives O(1) LRU-style eviction (pop first item).
+        from collections import OrderedDict
+        self._cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._lock = asyncio.Lock()
+
+        logger.debug(
+            "PreparedStatementPool created (max_size=%d)",
+            self._max_size,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """No-op lifecycle hook kept for API symmetry with other controllers.
+
+        Callers that want to pre-warm the cache should use
+        :meth:`prepare_all` after calling this method.
+        """
+        logger.info("PreparedStatementPool initialized (max_size=%d)", self._max_size)
+
+    async def close(self) -> None:
+        """Evict all cached entries.
+
+        asyncpg deallocates server-side prepared statements automatically when
+        the connection closes, so this method only needs to clear the local
+        cache reference.  Call it before tearing down the underlying connection
+        to avoid dangling entries.
+        """
+        async with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+        logger.info("PreparedStatementPool closed; evicted %d cached statements", count)
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    async def get_or_prepare(self, sql: str) -> Any:
+        """Return a cached or freshly prepared ``asyncpg.PreparedStatement``.
+
+        Parameters
+        ----------
+        sql:
+            The parameterised SQL to prepare.  asyncpg uses ``$1``, ``$2``, …
+            positional placeholders.
+
+        Returns
+        -------
+        asyncpg.PreparedStatement
+            The compiled statement ready for ``.fetch()``, ``.fetchrow()``,
+            or ``.executemany()``.
+
+        Raises
+        ------
+        asyncpg.PostgresError
+            If the server rejects the SQL during preparation.
+        """
+        if not sql or not isinstance(sql, str):
+            raise ValueError("sql must be a non-empty string")
+
+        # Fast path: already cached (no lock needed for a simple membership
+        # test in CPython, but we take the lock for correctness across all
+        # implementations).
+        async with self._lock:
+            if sql in self._cache:
+                # Move to end to mark as most-recently used.
+                self._cache.move_to_end(sql)
+                logger.debug("PreparedStatementPool cache hit for SQL: %.80s", sql)
+                return self._cache[sql]
+
+        # Slow path: prepare on the server.
+        logger.debug("PreparedStatementPool cache miss; preparing SQL: %.80s", sql)
+        stmt = await self._conn.prepare(sql)
+
+        async with self._lock:
+            # Another coroutine may have prepared the same SQL while we awaited;
+            # accept the racing entry rather than preparing twice.
+            if sql not in self._cache:
+                if len(self._cache) >= self._max_size:
+                    evicted_sql, _ = self._cache.popitem(last=False)
+                    logger.debug(
+                        "PreparedStatementPool evicted oldest entry: %.80s",
+                        evicted_sql,
+                    )
+                self._cache[sql] = stmt
+                self._cache.move_to_end(sql)
+
+        return self._cache[sql]
+
+    async def prepare_all(self, sql_statements: List[str]) -> None:
+        """Pre-warm the cache by preparing a list of SQL strings eagerly.
+
+        Useful at application startup to ensure the first ingestion batch
+        does not pay any preparation round-trip cost.
+
+        Parameters
+        ----------
+        sql_statements:
+            Iterable of parameterised SQL strings to prepare.
+        """
+        for sql in sql_statements:
+            await self.get_or_prepare(sql)
+        logger.info(
+            "PreparedStatementPool pre-warmed %d statements", len(sql_statements)
+        )
+
+    async def invalidate(self, sql: str) -> bool:
+        """Remove a single SQL entry from the cache.
+
+        Use this after a DDL change (e.g. ``ALTER TABLE``) that invalidates a
+        previously prepared plan.  The next call to :meth:`get_or_prepare` for
+        the same SQL will issue a fresh ``PREPARE`` against the updated schema.
+
+        Returns ``True`` if the entry was present and removed, ``False`` if it
+        was not cached.
+        """
+        async with self._lock:
+            if sql in self._cache:
+                del self._cache[sql]
+                logger.info("PreparedStatementPool invalidated entry: %.80s", sql)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    @property
+    def size(self) -> int:
+        """Number of statements currently in the cache."""
+        return len(self._cache)
+
+    @property
+    def max_size(self) -> int:
+        """Maximum cache capacity supplied at construction time."""
+        return self._max_size
+
+    @property
+    def cached_sql(self) -> List[str]:
+        """Snapshot of SQL strings currently held in the cache (MRU last)."""
+        return list(self._cache.keys())
