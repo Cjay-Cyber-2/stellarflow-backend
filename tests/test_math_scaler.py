@@ -91,6 +91,11 @@ def test_cross_feed_multiply_identity():
     # rate_a=1, rate_b=1 → result should equal SCALE_7
     assert cross_feed_multiply(1, 1) == SCALE_7
 
+def test_cross_feed_multiply_uses_integer_flooring_for_string_inputs():
+    result = cross_feed_multiply("1.00000001", "1.00000001")
+    expected = scale_up("1.00000001") * scale_up("1.00000001") // (SCALE_14 // SCALE_7)
+    assert result == expected
+
 
 # ---------------------------------------------------------------------------
 # floor_divide
