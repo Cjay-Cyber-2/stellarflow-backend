@@ -1283,6 +1283,97 @@ def current_seccomp_mode() -> int:
         return -1
 
 
+# ==========================================================================
+# Subprocess Signal Forwarding
+# ==========================================================================
+
+import signal
+import subprocess
+import threading
+from typing import List, Set
+
+_child_processes: Set[subprocess.Popen] = set()
+_child_lock: threading.Lock = threading.Lock()
+
+
+def register_child_process(proc: subprocess.Popen) -> None:
+    """Register a child subprocess for signal forwarding.
+
+    When the parent process receives SIGTERM or SIGINT, all registered
+    child processes will receive the same signal.
+
+    Parameters
+    ----------
+    proc : subprocess.Popen
+        The child process to track.
+    """
+    with _child_lock:
+        _child_processes.add(proc)
+
+
+def unregister_child_process(proc: subprocess.Popen) -> None:
+    """Unregister a child subprocess that has already terminated.
+
+    Parameters
+    ----------
+    proc : subprocess.Popen
+        The child process to remove from tracking.
+    """
+    with _child_lock:
+        _child_processes.discard(proc)
+
+
+def _forward_signal(signum: int, frame: object) -> None:
+    """Forward *signum* to all tracked child processes.
+
+    Sends the signal to each registered child that is still running.
+    Cleans up terminated children from the tracking set automatically.
+    """
+    terminated: List[subprocess.Popen] = []
+    with _child_lock:
+        for proc in list(_child_processes):
+            if proc.poll() is None:
+                try:
+                    proc.send_signal(signum)
+                except ProcessLookupError:
+                    terminated.append(proc)
+            else:
+                terminated.append(proc)
+        for proc in terminated:
+            _child_processes.discard(proc)
+
+    # Re-raise the signal for the parent process's default handler
+    # so that the parent also terminates cleanly.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def register_signal_handlers() -> None:
+    """Register SIGTERM and SIGINT handlers that forward signals to child
+    subprocesses tracked by :func:`register_child_process`.
+
+    Should be called once at process startup before spawning any workers.
+
+    After forwarding the signal to all tracked children, the original
+    default handler is restored and the signal is re-raised on the
+    parent to ensure clean termination.
+
+    Example::
+
+        from src.utils.sandbox import (
+            register_signal_handlers,
+            register_child_process,
+        )
+
+        register_signal_handlers()
+
+        proc = subprocess.Popen([...])
+        register_child_process(proc)
+    """
+    signal.signal(signal.SIGTERM, _forward_signal)
+    signal.signal(signal.SIGINT, _forward_signal)
+
+
 __all__ = [
     # Core API
     "SandboxPolicy",
@@ -1294,6 +1385,10 @@ __all__ = [
     "BPFBuilder",
     # Syscall enumeration
     "Syscall",
+    # Subprocess signal forwarding
+    "register_signal_handlers",
+    "register_child_process",
+    "unregister_child_process",
     # Utilities
     "seccomp_available",
     "current_seccomp_mode",
