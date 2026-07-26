@@ -20,7 +20,7 @@ import sys
 import struct
 from unittest.mock import mock_open, patch
 
-import sys
+import pytest
 
 # ---------------------------------------------------------------------------
 # Path bootstrap
@@ -30,9 +30,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from utils.sandbox import (  # noqa: E402
     BPFBuilder,
     INGESTION_POLICY,
+    MemoryLimit,
     SandboxPolicy,
     Syscall,
     _AUDIT_ARCH_X86_64,
+    _DEFAULT_MEMORY_LIMIT_MB,
     _SECCOMP_RET_ALLOW,
     _SECCOMP_RET_KILL_PROCESS,
     _BPF_LD_W_ABS,
@@ -515,3 +517,155 @@ class TestEdgeCases:
         policy = SandboxPolicy(min_bytes, name="empty")
         assert policy.name == "empty"
         assert not policy.applied
+
+
+# ===========================================================================
+# Memory Limits
+# ===========================================================================
+
+
+class TestMemoryLimit:
+    """Tests for the MemoryLimit context manager and decorator."""
+
+    def test_memory_limit_creation(self) -> None:
+        """MemoryLimit should be created with default and custom values."""
+        ml = MemoryLimit()
+        assert ml.limit_mb == _DEFAULT_MEMORY_LIMIT_MB
+        assert ml.name == "worker"
+        assert not ml.applied
+
+        ml_custom = MemoryLimit(limit_mb=128, name="parser")
+        assert ml_custom.limit_mb == 128
+        assert ml_custom.name == "parser"
+
+    def test_memory_limit_repr(self) -> None:
+        """MemoryLimit should have a readable repr."""
+        ml = MemoryLimit(limit_mb=64, name="test")
+        r = repr(ml)
+        assert "test" in r
+        assert "64" in r
+        assert "pending" in r
+
+    def test_memory_limit_skip_on_non_linux(self) -> None:
+        """MemoryLimit should return False on non-Linux platforms."""
+        with patch("utils.sandbox._is_linux", False):
+            ml = MemoryLimit(limit_mb=64, name="nonlinux")
+            result = ml.apply()
+            assert result is False
+            assert not ml.applied
+
+    def test_memory_limit_context_manager(self) -> None:
+        """MemoryLimit should work as a context manager."""
+        with patch("utils.sandbox._is_linux", True), \
+             patch("utils.sandbox.resource") as mock_resource:
+            mock_resource.RLIMIT_AS = 9
+            mock_resource.getrlimit.return_value = (-1, -1)
+            ml = MemoryLimit(limit_mb=128, name="ctx-test")
+            with ml:
+                assert ml.applied
+            # After exiting, restore should have been called
+            mock_resource.setrlimit.assert_any_call(9, (128 * 1024 * 1024, 128 * 1024 * 1024))
+            mock_resource.setrlimit.assert_any_call(9, (-1, -1))
+
+    def test_memory_limit_decorator_raises_memory_error(self) -> None:
+        """MemoryLimit as decorator should catch MemoryError and re-raise."""
+        with patch("utils.sandbox._is_linux", True), \
+             patch("utils.sandbox.resource") as mock_resource:
+            mock_resource.RLIMIT_AS = 9
+            mock_resource.getrlimit.return_value = (-1, -1)
+
+            ml = MemoryLimit(limit_mb=64, name="deco-test")
+
+            @ml
+            def bad_worker():
+                raise MemoryError("test OOM")
+
+            with pytest.raises(MemoryError):
+                bad_worker()
+
+    def test_memory_limit_is_idempotent(self) -> None:
+        """Calling apply() twice should only apply once."""
+        with patch("utils.sandbox._is_linux", True), \
+             patch("utils.sandbox.resource") as mock_resource:
+            mock_resource.RLIMIT_AS = 9
+            mock_resource.getrlimit.return_value = (-1, -1)
+            ml = MemoryLimit(limit_mb=256, name="idem")
+            ml.apply()
+            ml.apply()
+            # setrlimit should be called only once
+            mock_resource.setrlimit.assert_called_once()
+
+    def test_memory_limit_default_value(self) -> None:
+        """Default memory limit should be defined."""
+        assert _DEFAULT_MEMORY_LIMIT_MB > 0
+        assert isinstance(_DEFAULT_MEMORY_LIMIT_MB, int)
+
+
+# ===========================================================================
+# test_memory_limit_containment (verification test)
+# ===========================================================================
+
+
+class TestMemoryLimitContainment:
+    """Verification test: workers exceeding memory bounds raise MemoryError."""
+
+    def test_memory_limit_containment(self) -> None:
+        """Workers exceeding memory bounds raise controlled MemoryError."""
+        with patch("utils.sandbox._is_linux", True), \
+             patch("utils.sandbox.resource") as mock_resource:
+            mock_resource.RLIMIT_AS = 9
+            mock_resource.getrlimit.return_value = (-1, -1)
+
+            ml = MemoryLimit(limit_mb=32, name="containment-test")
+
+            @ml
+            def worker_exceeds_memory():
+                """Simulate a worker that exceeds memory."""
+                raise MemoryError("Worker exceeded memory limit")
+
+            with pytest.raises(MemoryError, match="Worker exceeded memory limit"):
+                worker_exceeds_memory()
+
+            # After context manager exits, limits are restored
+            assert not ml.applied
+
+    def test_memory_limit_normal_worker_succeeds(self) -> None:
+        """Workers within memory bounds complete normally."""
+        with patch("utils.sandbox._is_linux", True), \
+             patch("utils.sandbox.resource") as mock_resource:
+            mock_resource.RLIMIT_AS = 9
+            mock_resource.getrlimit.return_value = (-1, -1)
+
+            ml = MemoryLimit(limit_mb=64, name="normal-worker")
+
+            @ml
+            def worker_normal():
+                return "success"
+
+            result = worker_normal()
+            assert result == "success"
+
+    def test_memory_limit_logs_isolation_event(self) -> None:
+        """Memory limit breach should log an isolation event."""
+        with patch("utils.sandbox._is_linux", True), \
+             patch("utils.sandbox.resource") as mock_resource, \
+             patch("utils.sandbox.logger") as mock_logger:
+            mock_resource.RLIMIT_AS = 9
+            mock_resource.getrlimit.return_value = (-1, -1)
+
+            ml = MemoryLimit(limit_mb=16, name="log-test")
+
+            @ml
+            def worker_breach():
+                raise MemoryError("OOM detected")
+
+            with pytest.raises(MemoryError):
+                worker_breach()
+
+            # Verify error was logged
+            mock_logger.error.assert_called()
+            call_args = mock_logger.error.call_args
+            log_msg = call_args[0][0]
+            log_args = call_args[0][1:]
+            assert "MemoryError" in log_msg
+            assert any("log-test" in str(a) for a in log_args)
