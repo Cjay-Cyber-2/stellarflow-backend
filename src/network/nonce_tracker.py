@@ -847,6 +847,212 @@ nonce_tracker = NonceTracker()
 nonce_window = NonceWindow()
 
 
+# =========================================================================
+# Transaction Resubmission Manager with Gas Escalation
+# =========================================================================
+
+
+@dataclass
+class PendingSubmission:
+    """Tracks a submitted transaction awaiting confirmation.
+
+    Attributes
+    ----------
+    tx_id:
+        Unique transaction identifier (e.g. hash).
+    base_fee:
+        The base fee in stroops for this submission attempt.
+    submitted_at:
+        Monotonic timestamp of submission.
+    attempts:
+        Number of resubmission attempts so far.
+    """
+
+    tx_id: str
+    base_fee: int
+    submitted_at: float = field(default_factory=time.monotonic)
+    attempts: int = 0
+
+
+class TransactionResubmitter:
+    """Automated transaction resubmission manager with fee escalation.
+
+    Monitors pending transactions and resubmits them with escalated fees
+    when they remain unconfirmed beyond a configurable timeout.  Fee
+    escalation follows a multiplicative strategy: each attempt increases
+    the base fee by *escalation_factor* until *max_fee* is reached.
+
+    The resubmitter does **not** dispatch transactions itself — instead it
+    calls a user-provided *resubmit_fn* callback that is responsible for
+    building and broadcasting the replacement transaction with the new fee.
+
+    Parameters
+    ----------
+    initial_fee:
+        Starting base fee in stroops (default: 100 = 0.00001 XLM).
+    escalation_factor:
+        Multiplier applied per attempt (default: 1.5 → 50% increase).
+    max_fee:
+        Ceiling in stroops beyond which fee will not escalate (default: 10000).
+    resubmit_timeout:
+        Seconds since submission before a pending tx is escalated (default: 30).
+    resubmit_fn:
+        Async callback ``(tx_id: str, new_fee: int) -> bool`` that performs
+        the actual resubmission.  Must return ``True`` on success.
+
+    Example usage::
+
+        async def resubmit(tx_id: str, fee: int) -> bool:
+            tx = build_replacement(tx_id, fee)
+            return await broadcast(tx)
+
+        submitter = TransactionResubmitter(resubmit_fn=resubmit)
+        submitter.track("tx-hash-123", base_fee=100)
+
+        # Called periodically:
+        await submitter.escalate_pending()
+    """
+
+    def __init__(
+        self,
+        initial_fee: int = 100,
+        escalation_factor: float = 1.5,
+        max_fee: int = 10_000,
+        resubmit_timeout: float = 30.0,
+        resubmit_fn: Optional[Callable[[str, int], bool]] = None,
+    ) -> None:
+        if initial_fee < 100:
+            raise ValueError("initial_fee must be at least 100 stroops")
+        if escalation_factor <= 1.0:
+            raise ValueError("escalation_factor must be > 1.0")
+        if max_fee < initial_fee:
+            raise ValueError("max_fee must be >= initial_fee")
+        if resubmit_timeout <= 0:
+            raise ValueError("resubmit_timeout must be > 0")
+
+        self._initial_fee = initial_fee
+        self._escalation_factor = escalation_factor
+        self._max_fee = max_fee
+        self._resubmit_timeout = resubmit_timeout
+        self._resubmit_fn = resubmit_fn
+
+        self._lock = threading.Lock()
+        self._pending: Dict[str, PendingSubmission] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def track(self, tx_id: str, base_fee: Optional[int] = None) -> None:
+        """Register *tx_id* for automated escalation monitoring.
+
+        Parameters
+        ----------
+        tx_id:
+            Unique transaction identifier.
+        base_fee:
+            Initial base fee in stroops. Defaults to *initial_fee*.
+        """
+        with self._lock:
+            if tx_id in self._pending:
+                logger.debug("[TxResubmitter] %s already tracked — skipping", tx_id)
+                return
+            self._pending[tx_id] = PendingSubmission(
+                tx_id=tx_id,
+                base_fee=base_fee if base_fee is not None else self._initial_fee,
+            )
+            logger.info("[TxResubmitter] Tracking %s (fee=%d)", tx_id, base_fee or self._initial_fee)
+
+    def untrack(self, tx_id: str) -> None:
+        """Remove *tx_id* from escalation monitoring (e.g. on confirmation).
+
+        Parameters
+        ----------
+        tx_id:
+            Transaction identifier to stop tracking.
+        """
+        with self._lock:
+            self._pending.pop(tx_id, None)
+            logger.info("[TxResubmitter] Stopped tracking %s", tx_id)
+
+    def set_resubmit_fn(self, fn: Callable[[str, int], bool]) -> None:
+        """Set or replace the resubmission callback."""
+        self._resubmit_fn = fn
+
+    async def escalate_pending(self) -> List[str]:
+        """Check all pending transactions and escalate those past the timeout.
+
+        For each pending transaction whose age exceeds *resubmit_timeout*,
+        computes the escalated fee and calls *resubmit_fn*.
+
+        Returns
+        -------
+        List[str]
+            Transaction IDs that were escalated (or attempted).
+        """
+        now = time.monotonic()
+        candidates: List[PendingSubmission] = []
+
+        with self._lock:
+            for tx_id, sub in list(self._pending.items()):
+                age = now - sub.submitted_at
+                if age >= self._resubmit_timeout:
+                    candidates.append(sub)
+
+        escalated: List[str] = []
+        for sub in candidates:
+            new_fee = self._compute_escalated_fee(sub)
+            sub.attempts += 1
+            sub.submitted_at = time.monotonic()
+
+            try:
+                if self._resubmit_fn is not None:
+                    success = self._resubmit_fn(sub.tx_id, new_fee)
+                    if success:
+                        sub.base_fee = new_fee
+                        escalated.append(sub.tx_id)
+                        logger.info(
+                            "[TxResubmitter] Resubmitted %s (attempt=%d, fee=%d)",
+                            sub.tx_id, sub.attempts, new_fee,
+                        )
+                    else:
+                        logger.warning(
+                            "[TxResubmitter] Resubmit callback returned False for %s",
+                            sub.tx_id,
+                        )
+            except Exception as exc:
+                logger.error(
+                    "[TxResubmitter] Resubmit failed for %s: %s",
+                    sub.tx_id, exc,
+                )
+
+        return escalated
+
+    def get_pending_count(self) -> int:
+        """Return the number of currently tracked pending transactions."""
+        with self._lock:
+            return len(self._pending)
+
+    def get_pending_ids(self) -> List[str]:
+        """Return a snapshot of all tracked transaction IDs."""
+        with self._lock:
+            return list(self._pending.keys())
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _compute_escalated_fee(self, sub: PendingSubmission) -> int:
+        """Calculate the next fee for *sub* using multiplicative escalation.
+
+        The formula is::
+
+            new_fee = min(current_fee * escalation_factor, max_fee)
+        """
+        raw = int(sub.base_fee * self._escalation_factor)
+        return min(raw, self._max_fee)
+
+
 class RPCNodeFailoverSupervisor:
     """Proactive RPC node failover supervisor that monitors node connectivity.
 
@@ -1001,6 +1207,8 @@ __all__ = [
     "NonceWindow",
     "NonceGapDetector",
     "NonceRecoveryEngine",
+    "TransactionResubmitter",
+    "PendingSubmission",
     "GapReport",
     "ReconciliationResult",
     "nonce_tracker",

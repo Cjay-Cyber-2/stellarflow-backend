@@ -16,6 +16,8 @@ from network.nonce_tracker import (
     NonceTracker,
     NonceWindow,
     ReconciliationResult,
+    TransactionResubmitter,
+    PendingSubmission,
 )
 
 
@@ -926,4 +928,200 @@ def test_gap_report_stale_equals_current_is_not_a_gap() -> None:
         current_nonce=105,
     )
     assert not report.has_gaps
+
+
+# =========================================================================
+# Gas Escalation Resubmission Tests
+# =========================================================================
+
+
+def test_gas_escalation_resubmission_construction_defaults() -> None:
+    """TransactionResubmitter constructs with default parameters."""
+    submitter = TransactionResubmitter()
+    assert submitter._initial_fee == 100
+    assert submitter._escalation_factor == 1.5
+    assert submitter._max_fee == 10_000
+    assert submitter._resubmit_timeout == 30.0
+    assert submitter.get_pending_count() == 0
+
+
+def test_gas_escalation_resubmission_custom_params() -> None:
+    """TransactionResubmitter accepts custom parameters."""
+    submitter = TransactionResubmitter(
+        initial_fee=200,
+        escalation_factor=2.0,
+        max_fee=5_000,
+        resubmit_timeout=10.0,
+    )
+    assert submitter._initial_fee == 200
+    assert submitter._escalation_factor == 2.0
+    assert submitter._max_fee == 5_000
+    assert submitter._resubmit_timeout == 10.0
+
+
+def test_gas_escalation_resubmission_rejects_invalid_params() -> None:
+    """Invalid constructor parameters raise ValueError."""
+    with pytest.raises(ValueError, match="initial_fee"):
+        TransactionResubmitter(initial_fee=50)
+    with pytest.raises(ValueError, match="escalation_factor"):
+        TransactionResubmitter(escalation_factor=1.0)
+    with pytest.raises(ValueError, match="max_fee"):
+        TransactionResubmitter(initial_fee=500, max_fee=300)
+    with pytest.raises(ValueError, match="resubmit_timeout"):
+        TransactionResubmitter(resubmit_timeout=0)
+
+
+def test_gas_escalation_resubmission_track_and_untrack() -> None:
+    """Track adds and untrack removes from pending set."""
+    submitter = TransactionResubmitter()
+    submitter.track("tx-1")
+    assert submitter.get_pending_count() == 1
+    assert "tx-1" in submitter.get_pending_ids()
+
+    submitter.track("tx-2", base_fee=500)
+    assert submitter.get_pending_count() == 2
+
+    submitter.untrack("tx-1")
+    assert submitter.get_pending_count() == 1
+    assert "tx-1" not in submitter.get_pending_ids()
+
+
+def test_gas_escalation_resubmission_skips_duplicate() -> None:
+    """Tracking the same tx_id twice does not create duplicates."""
+    submitter = TransactionResubmitter()
+    submitter.track("tx-1")
+    submitter.track("tx-1")
+    assert submitter.get_pending_count() == 1
+
+
+def test_gas_escalation_resubmission_computes_escalated_fee() -> None:
+    """_compute_escalated_fee multiplies base fee by factor, capped at max."""
+    submitter = TransactionResubmitter(initial_fee=100, escalation_factor=2.0, max_fee=1000)
+    from network.nonce_tracker import PendingSubmission
+
+    sub = PendingSubmission(tx_id="tx-1", base_fee=100)
+    assert submitter._compute_escalated_fee(sub) == 200
+
+    sub.base_fee = 600
+    assert submitter._compute_escalated_fee(sub) == 1000  # capped at max_fee
+
+    sub.base_fee = 1000
+    assert submitter._compute_escalated_fee(sub) == 1000  # already at cap
+
+
+def test_gas_escalation_resubmission_escalate_pending_timeout_not_reached() -> None:
+    """No escalation when txs have not yet exceeded the timeout."""
+    submitter = TransactionResubmitter(resubmit_timeout=60.0)
+    submitter.track("tx-1", base_fee=100)
+
+    import asyncio
+    escalated = asyncio.run(submitter.escalate_pending())
+    assert escalated == []
+
+
+def test_gas_escalation_resubmission_escalate_pending_calls_callback() -> None:
+    """Callback is invoked for pending tx exceeding timeout."""
+    callback_log: list = []
+
+    def fake_resubmit(tx_id: str, new_fee: int) -> bool:
+        callback_log.append((tx_id, new_fee))
+        return True
+
+    submitter = TransactionResubmitter(
+        resubmit_timeout=0.001,
+        initial_fee=100,
+        escalation_factor=2.0,
+        max_fee=10_000,
+        resubmit_fn=fake_resubmit,
+    )
+
+    # Manually set submitted_at far in the past to trigger escalation
+    from network.nonce_tracker import PendingSubmission
+    import time
+
+    submitter._pending["tx-1"] = PendingSubmission(
+        tx_id="tx-1", base_fee=100, submitted_at=time.monotonic() - 60,
+    )
+
+    import asyncio
+    escalated = asyncio.run(submitter.escalate_pending())
+    assert "tx-1" in escalated
+    assert len(callback_log) == 1
+    assert callback_log[0] == ("tx-1", 200)  # 100 * 2.0
+
+
+def test_gas_escalation_resubmission_escalate_multiple() -> None:
+    """Multiple pending txs are escalated correctly."""
+    callback_log: list = []
+
+    def fake_resubmit(tx_id: str, new_fee: int) -> bool:
+        callback_log.append((tx_id, new_fee))
+        return True
+
+    submitter = TransactionResubmitter(
+        resubmit_timeout=0.001,
+        escalation_factor=1.5,
+        max_fee=10_000,
+        resubmit_fn=fake_resubmit,
+    )
+
+    import time
+    from network.nonce_tracker import PendingSubmission
+
+    for i in range(3):
+        submitter._pending[f"tx-{i}"] = PendingSubmission(
+            tx_id=f"tx-{i}", base_fee=100, submitted_at=time.monotonic() - 60,
+        )
+
+    import asyncio
+    escalated = asyncio.run(submitter.escalate_pending())
+    assert len(escalated) == 3
+    assert len(callback_log) == 3
+    for tx_id, new_fee in callback_log:
+        assert new_fee == 150  # 100 * 1.5
+
+
+def test_gas_escalation_resubmission_callback_failure_does_not_crash() -> None:
+    """A failing callback is caught and does not prevent other escalations."""
+    call_count = 0
+
+    def fake_resubmit(tx_id: str, new_fee: int) -> bool:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("Network error")
+        return True
+
+    submitter = TransactionResubmitter(
+        resubmit_timeout=0.001,
+        resubmit_fn=fake_resubmit,
+    )
+
+    import time
+    from network.nonce_tracker import PendingSubmission
+
+    submitter._pending["tx-1"] = PendingSubmission(
+        tx_id="tx-1", base_fee=100, submitted_at=time.monotonic() - 60,
+    )
+    submitter._pending["tx-2"] = PendingSubmission(
+        tx_id="tx-2", base_fee=100, submitted_at=time.monotonic() - 60,
+    )
+
+    import asyncio
+    escalated = asyncio.run(submitter.escalate_pending())
+    assert len(escalated) == 1
+    assert "tx-2" in escalated
+    assert call_count == 2
+
+
+def test_gas_escalation_resubmission_set_resubmit_fn() -> None:
+    """set_resubmit_fn replaces the callback after construction."""
+    submitter = TransactionResubmitter()
+    assert submitter._resubmit_fn is None
+
+    def fn(tx_id: str, fee: int) -> bool:
+        return True
+
+    submitter.set_resubmit_fn(fn)
+    assert submitter._resubmit_fn is fn
 
