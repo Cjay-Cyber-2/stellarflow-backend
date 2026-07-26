@@ -57,6 +57,89 @@ DEFAULT_FLUSH_INTERVAL_MS = 1000.0
 DEFAULT_ASYNC_BATCH_SIZE = 1000
 DEFAULT_ASYNC_FLUSH_INTERVAL_MS = 100.0
 
+# Dynamic query timeout defaults
+DEFAULT_BASE_TIMEOUT = 30.0
+DEFAULT_MIN_TIMEOUT = 5.0
+DEFAULT_MAX_TIMEOUT = 600.0
+DEFAULT_PER_ROW_MS = 0.05
+DEFAULT_PER_TABLE_MS = 5.0
+DEFAULT_AGGREGATION_MULTIPLIER = 2.0
+
+
+class DynamicQueryTimeout:
+    """Compute dynamic query timeouts that scale with query complexity.
+
+    Instead of a single static timeout, the actual limit is calculated from:
+
+    * ``row_count``   – each row adds ``per_row_ms`` milliseconds.
+    * ``table_count`` – each additional table adds ``per_table_ms`` ms.
+    * ``is_aggregation`` – analytical queries receive a configurable multiplier.
+
+    The final value is clamped to ``[min_timeout, max_timeout]``.
+
+    Usage::
+
+        dqt = DynamicQueryTimeout()
+        timeout = dqt.calculate(row_count=10_000, table_count=3, is_aggregation=True)
+    """
+
+    def __init__(
+        self,
+        base_timeout: float = DEFAULT_BASE_TIMEOUT,
+        min_timeout: float = DEFAULT_MIN_TIMEOUT,
+        max_timeout: float = DEFAULT_MAX_TIMEOUT,
+        per_row_ms: float = DEFAULT_PER_ROW_MS,
+        per_table_ms: float = DEFAULT_PER_TABLE_MS,
+        aggregation_multiplier: float = DEFAULT_AGGREGATION_MULTIPLIER,
+    ) -> None:
+        if base_timeout <= 0:
+            raise ValueError("base_timeout must be positive")
+        if min_timeout <= 0:
+            raise ValueError("min_timeout must be positive")
+        if max_timeout < min_timeout:
+            raise ValueError("max_timeout must be >= min_timeout")
+        if per_row_ms < 0:
+            raise ValueError("per_row_ms must be non-negative")
+        if per_table_ms < 0:
+            raise ValueError("per_table_ms must be non-negative")
+        if aggregation_multiplier < 1.0:
+            raise ValueError("aggregation_multiplier must be >= 1.0")
+
+        self._base_timeout = base_timeout
+        self._min_timeout = min_timeout
+        self._max_timeout = max_timeout
+        self._per_row_ms = per_row_ms
+        self._per_table_ms = per_table_ms
+        self._aggregation_multiplier = aggregation_multiplier
+
+    def calculate(
+        self,
+        row_count: int = 0,
+        table_count: int = 1,
+        is_aggregation: bool = False,
+    ) -> float:
+        """Return the computed timeout in **seconds**."""
+        timeout = (
+            self._base_timeout
+            + row_count * self._per_row_ms
+            + table_count * self._per_table_ms
+        )
+        if is_aggregation:
+            timeout *= self._aggregation_multiplier
+        return max(self._min_timeout, min(timeout, self._max_timeout))
+
+    @property
+    def base_timeout(self) -> float:
+        return self._base_timeout
+
+    @property
+    def min_timeout(self) -> float:
+        return self._min_timeout
+
+    @property
+    def max_timeout(self) -> float:
+        return self._max_timeout
+
 
 try:
     import asyncpg
