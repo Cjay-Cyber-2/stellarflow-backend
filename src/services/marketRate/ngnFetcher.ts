@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout.js";
 import {
   MarketRateFetcher,
@@ -109,14 +109,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
 
     const response = await withRetry(
       () =>
-        axios.get<VtpassVariationsResponse>(
+        httpClient.get<VtpassVariationsResponse>(
           `${this.vtpassBase()}/service-variations`,
           {
             params: { serviceID: serviceId },
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
             headers: {
               ...headers,
-              "User-Agent": "StellarFlow-Oracle/1.0",
             },
           },
         ),
@@ -159,21 +158,18 @@ export class NGNRateFetcher implements MarketRateFetcher {
 
         const coinGeckoResponse = await withRetry(
           () =>
-            axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
+            httpClient.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
               timeout: OUTGOING_HTTP_TIMEOUT_MS,
-              headers: {
-                "User-Agent": "StellarFlow-Oracle/1.0",
-              },
             }),
           { maxRetries: 3, retryDelay: 1000 },
         );
 
-          rawResponses.push({
-            provider: "CoinGecko",
-            endpoint: this.coinGeckoUrl,
-            payload: coinGeckoResponse.data,
-            receivedAt: new Date(),
-          });
+        rawResponses.push({
+          provider: "CoinGecko",
+          endpoint: this.coinGeckoUrl,
+          payload: coinGeckoResponse.data,
+          receivedAt: new Date(),
+        });
 
         const usd = coinGeckoResponse.data.stellar?.usd;
         if (typeof usd === "number" && usd > 0) {
@@ -191,17 +187,16 @@ export class NGNRateFetcher implements MarketRateFetcher {
         }
       }
     } catch (error) {
-      this.logger.debug("VTpass + CoinGecko XLM/USD failed", { error: error instanceof Error ? error.message : error });
+      this.logger.debug("VTpass + CoinGecko XLM/USD failed", {
+        error: error instanceof Error ? error.message : error,
+      });
     }
 
     try {
       const coinGeckoResponse = await withRetry(
         () =>
-          axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
+          httpClient.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
-            headers: {
-              "User-Agent": "StellarFlow-Oracle/1.0",
-            },
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );
@@ -230,17 +225,16 @@ export class NGNRateFetcher implements MarketRateFetcher {
         });
       }
     } catch (error) {
-      this.logger.debug("CoinGecko direct NGN failed", { error: error instanceof Error ? error.message : error });
+      this.logger.debug("CoinGecko direct NGN failed", {
+        error: error instanceof Error ? error.message : error,
+      });
     }
 
     try {
       const coinGeckoResponse = await withRetry(
         () =>
-          axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
+          httpClient.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
-            headers: {
-              "User-Agent": "StellarFlow-Oracle/1.0",
-            },
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );
@@ -260,11 +254,8 @@ export class NGNRateFetcher implements MarketRateFetcher {
       ) {
         const fxResponse = await withRetry(
           () =>
-            axios.get<ExchangeRateApiResponse>(this.usdToNgnUrl, {
+            httpClient.get<ExchangeRateApiResponse>(this.usdToNgnUrl, {
               timeout: OUTGOING_HTTP_TIMEOUT_MS,
-              headers: {
-                "User-Agent": "StellarFlow-Oracle/1.0",
-              },
             }),
           { maxRetries: 3, retryDelay: 1000 },
         );
@@ -298,16 +289,17 @@ export class NGNRateFetcher implements MarketRateFetcher {
         }
       }
     } catch (error) {
-      this.logger.debug("CoinGecko + ExchangeRate API (NGN) failed", { error: error instanceof Error ? error.message : error });
+      this.logger.debug("CoinGecko + ExchangeRate API (NGN) failed", {
+        error: error instanceof Error ? error.message : error,
+      });
     }
 
     if (prices.length === 0) {
       const error = new Error("All NGN rate sources failed");
-      this.logger.fetcherError(
-        error,
-        "All price sources failed - no rates obtained",
-        { attemptedSources: 3, pricesLength: prices.length }
-      );
+      this.logger.fetcherError("All price sources failed - no rates obtained", {
+        attemptedSources: 3,
+        pricesLength: prices.length,
+      });
       throw error;
     }
 
@@ -318,17 +310,16 @@ export class NGNRateFetcher implements MarketRateFetcher {
     const filteredPrices = prices.filter((price) =>
       filteredRateValues.includes(price.rate),
     );
-    const pricesToUse =
-      filteredPrices.length >= 3 ? filteredPrices : prices;
+    const pricesToUse = filteredPrices.length >= 3 ? filteredPrices : prices;
 
     if (pricesToUse.length < 3) {
       const error = new Error(
         `Need at least 3 price sources for median calculation, got ${pricesToUse.length}`,
       );
-      this.logger.fetcherError(error.message, {
-        attemptedSources: 3,
-        pricesLength: pricesToUse.length,
-      });
+      this.logger.fetcherError(
+        `Need at least 3 price sources for median calculation, got ${pricesToUse.length}`,
+        { attemptedSources: 3, pricesLength: pricesToUse.length },
+      );
       throw error;
     }
 
@@ -353,10 +344,17 @@ export class NGNRateFetcher implements MarketRateFetcher {
   async isHealthy(): Promise<boolean> {
     try {
       const rate = await this.fetchRate();
-      this.logger.info("Health check passed", { rate: rate.rate, source: rate.source });
+      this.logger.info("Health check passed", {
+        rate: rate.rate,
+        source: rate.source,
+      });
       return rate.rate > 0;
     } catch (error) {
-      this.logger.error("Health check failed", undefined, error instanceof Error ? error : new Error(String(error)));
+      this.logger.error(
+        "Health check failed",
+        undefined,
+        error instanceof Error ? error : new Error(String(error)),
+      );
       return false;
     }
   }

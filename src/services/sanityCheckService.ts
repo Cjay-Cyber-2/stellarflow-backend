@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../lib/httpClient";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../utils/httpTimeout";
 import { withRetry } from "../utils/retryUtil";
 import { createFetcherLogger } from "../utils/logger";
@@ -59,13 +59,10 @@ export class SanityCheckService {
 
       const response = await withRetry(
         () =>
-          axios.get(
+          httpClient.get(
             `https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=${vsCurrency}`,
             {
               timeout: OUTGOING_HTTP_TIMEOUT_MS,
-              headers: {
-                "User-Agent": "StellarFlow-Oracle/1.0",
-              },
             },
           ),
         { maxRetries: 2, retryDelay: 1000 },
@@ -91,13 +88,10 @@ export class SanityCheckService {
       // Get XLM/USD from CoinGecko
       const xlmUsdResponse = await withRetry(
         () =>
-          axios.get(
+          httpClient.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd",
             {
               timeout: OUTGOING_HTTP_TIMEOUT_MS,
-              headers: {
-                "User-Agent": "StellarFlow-Oracle/1.0",
-              },
             },
           ),
         { maxRetries: 2, retryDelay: 1000 },
@@ -109,11 +103,8 @@ export class SanityCheckService {
       // Get USD to local currency rate
       const fxResponse = await withRetry(
         () =>
-          axios.get("https://open.er-api.com/v6/latest/USD", {
+          httpClient.get("https://open.er-api.com/v6/latest/USD", {
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
-            headers: {
-              "User-Agent": "StellarFlow-Oracle/1.0",
-            },
           }),
         { maxRetries: 2, retryDelay: 1000 },
       );

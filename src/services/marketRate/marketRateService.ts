@@ -19,7 +19,7 @@ import { normalizeDateToUTC } from "../../utils/timeUtils";
 import { sanityCheckService } from "../sanityCheckService";
 import { appConfig } from "../../config/configWatcher";
 import { isLockdownEnabled } from "../../state/appState";
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient.js";
 import { createFetcherLogger } from "../../utils/logger";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
 import { checkCrossPairConsistency } from "../../logic/crossPairArbitrageDetection";
@@ -269,13 +269,15 @@ export class MarketRateService {
         console.warn(
           `[MarketRateService] Anomaly detected for ${normalizedCurrency}: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`,
         );
-        await webhookService.sendPriorityAlert({
+        await webhookService.sendManualReviewNotification({
+          reviewId: 0,
           currency: normalizedCurrency,
           rate: rate.rate,
-          zScore: anomalyCheck.zScore,
-          mean: anomalyCheck.mean,
-          stdDev: anomalyCheck.stdDev,
+          previousRate: anomalyCheck.mean,
+          changePercent: Math.abs(anomalyCheck.zScore * 100),
+          source: rate.source,
           timestamp: rate.timestamp,
+          reason: `Anomaly detected: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`,
         });
       }
 
@@ -788,11 +790,10 @@ export class MarketRateService {
 
   private async runCrossPairCheck(ngnXlmRate: number): Promise<void> {
     try {
-      const response = await axios.get(
+      const response = await httpClient.get(
         "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd",
         {
           timeout: OUTGOING_HTTP_TIMEOUT_MS,
-          headers: { "User-Agent": "StellarFlow-Oracle/1.0" },
         },
       );
       const xlmUsd: unknown = response.data?.stellar?.usd;
