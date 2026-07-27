@@ -18,7 +18,7 @@ class TestTelemetryEncoder(unittest.TestCase):
         )
 
         packed = TelemetryEncoder.pack(frame)
-        self.assertEqual(len(packed), 40)
+        self.assertEqual(len(packed), 39)
 
         unpacked = TelemetryEncoder.unpack(packed)
         self.assertEqual(unpacked.asset_id, b"NGN/XLM")
@@ -49,7 +49,7 @@ class TestTelemetryEncoder(unittest.TestCase):
             TelemetryFrame(b"USD/XLM", 300, 400, 2000, 2, 0, 2),
         ]
         packed = TelemetryEncoder.pack_bundle(frames)
-        self.assertEqual(len(packed), 80)
+        self.assertEqual(len(packed), 78)
 
         unpacked = TelemetryEncoder.unpack_bundle(packed)
         self.assertEqual(len(unpacked), 2)

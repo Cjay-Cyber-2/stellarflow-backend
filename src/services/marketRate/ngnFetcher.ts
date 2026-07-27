@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout.js";
 import {
   MarketRateFetcher,
@@ -109,14 +109,13 @@ export class NGNRateFetcher implements MarketRateFetcher {
 
     const response = await withRetry(
       () =>
-        axios.get<VtpassVariationsResponse>(
+        httpClient.get<VtpassVariationsResponse>(
           `${this.vtpassBase()}/service-variations`,
           {
             params: { serviceID: serviceId },
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
             headers: {
               ...headers,
-              "User-Agent": "StellarFlow-Oracle/1.0",
             },
           },
         ),
@@ -159,11 +158,8 @@ export class NGNRateFetcher implements MarketRateFetcher {
 
         const coinGeckoResponse = await withRetry(
           () =>
-            axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
+            httpClient.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
               timeout: OUTGOING_HTTP_TIMEOUT_MS,
-              headers: {
-                "User-Agent": "StellarFlow-Oracle/1.0",
-              },
             }),
           { maxRetries: 3, retryDelay: 1000 },
         );
@@ -199,11 +195,8 @@ export class NGNRateFetcher implements MarketRateFetcher {
     try {
       const coinGeckoResponse = await withRetry(
         () =>
-          axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
+          httpClient.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
-            headers: {
-              "User-Agent": "StellarFlow-Oracle/1.0",
-            },
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );
@@ -240,11 +233,8 @@ export class NGNRateFetcher implements MarketRateFetcher {
     try {
       const coinGeckoResponse = await withRetry(
         () =>
-          axios.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
+          httpClient.get<CoinGeckoPriceResponse>(this.coinGeckoUrl, {
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
-            headers: {
-              "User-Agent": "StellarFlow-Oracle/1.0",
-            },
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );
@@ -264,11 +254,8 @@ export class NGNRateFetcher implements MarketRateFetcher {
       ) {
         const fxResponse = await withRetry(
           () =>
-            axios.get<ExchangeRateApiResponse>(this.usdToNgnUrl, {
+            httpClient.get<ExchangeRateApiResponse>(this.usdToNgnUrl, {
               timeout: OUTGOING_HTTP_TIMEOUT_MS,
-              headers: {
-                "User-Agent": "StellarFlow-Oracle/1.0",
-              },
             }),
           { maxRetries: 3, retryDelay: 1000 },
         );

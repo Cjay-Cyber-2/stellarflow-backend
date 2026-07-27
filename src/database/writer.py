@@ -330,17 +330,19 @@ class PartitionedTelemetryWriter:
         table_name = _partition_table_name(self._base_table, iso_year, iso_week)
 
         # Ensure the partition table exists before buffering.
-        # Only one writer thread can hold the lock at a time; the check-
-        # then-create sequence is therefore race-free.
+        # Double-checked locking: the lock guards both the existence
+        # check and the _known_partitions update so ANALYZE (Issue #634)
+        # is never duplicated by concurrent saves to the same new week.
         if table_name not in self._known_partitions:
-            if not self._create_if_missing:
-                raise RuntimeError(
-                    f"Partition table '{table_name}' does not exist and "
-                    "create_if_missing is disabled"
-                )
-            self._create_partition(table_name)
             with self._lock:
-                self._known_partitions.add(table_name)
+                if table_name not in self._known_partitions:
+                    if not self._create_if_missing:
+                        raise RuntimeError(
+                            f"Partition table '{table_name}' does not exist and "
+                            "create_if_missing is disabled"
+                        )
+                    self._create_partition(table_name)
+                    self._known_partitions.add(table_name)
 
         # Rewrite the target table on the fly.  We bypass BatchSink.save
         # because it hard-codes self._table.  Instead we call _flush-like
@@ -368,6 +370,9 @@ class PartitionedTelemetryWriter:
         """Issue ``CREATE TABLE IF NOT EXISTS`` for a child partition.
 
         The DDL mirrors the canonical schema expected in telemetry payloads.
+        After a genuinely new partition is created, ``ANALYZE`` is executed
+        so SQLite refreshes its query-plan statistics immediately
+        (Issue #634).
         """
         schema_columns = self._schema or {
             "asset_id": "TEXT",
@@ -382,8 +387,30 @@ class PartitionedTelemetryWriter:
 
         cursor = self._sink._conn.cursor()
         try:
+            # Determine whether the table already exists so we only
+            # ANALYZE genuinely new partitions (Issue #634).
+            cursor.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            table_existed = cursor.fetchone() is not None
+
             cursor.execute(create_sql)
             logger.info("Created/verified partition table %s", table_name)
+
+            if not table_existed:
+                try:
+                    cursor.execute(f'ANALYZE "{table_name}"')
+                    logger.info(
+                        "ANALYZE executed on new partition table %s",
+                        table_name,
+                    )
+                except sqlite3.Error:
+                    logger.exception(
+                        "Failed to ANALYZE partition table %s", table_name
+                    )
+                    raise
         except sqlite3.Error:
             logger.exception("Failed to create partition table %s", table_name)
             raise
@@ -409,6 +436,13 @@ class AsyncRelationalWriter:
     """
     Async, thread-safe (for the buffer) database writer using asyncpg's COPY
     protocol with binary formatting for high-performance bulk inserts.
+
+    When a :class:`~src.database.connection.PreparedStatementPool` is supplied
+    via *statement_pool*, individual-row inserts are executed through a
+    pre-compiled prepared statement rather than re-parsing SQL on every call.
+    This eliminates per-insert parser overhead for the high-frequency pricing
+    ingestion loop (Issue #569).  Batch COPY flushes are unaffected and remain
+    on the binary-COPY path.
     """
 
     def __init__(
@@ -417,6 +451,7 @@ class AsyncRelationalWriter:
         table_name: str = "telemetry",
         batch_size: int = DEFAULT_ASYNC_BATCH_SIZE,
         flush_interval_ms: float = DEFAULT_ASYNC_FLUSH_INTERVAL_MS,
+        statement_pool: Optional[Any] = None,
     ):
         if asyncpg is None:
             raise ImportError("asyncpg is required for AsyncRelationalWriter")
@@ -438,6 +473,7 @@ class AsyncRelationalWriter:
         self._table = table_name
         self._batch_size = batch_size
         self._interval = flush_interval_ms / 1000.0
+        self._statement_pool = statement_pool
 
         self._buffer: List[Dict[str, Any]] = []
         self._buffer_lock = asyncio.Lock()
@@ -448,12 +484,16 @@ class AsyncRelationalWriter:
         # Track columns to ensure consistency across buffer
         self._columns: Optional[List[str]] = None
 
+        # Pre-built INSERT SQL (populated on first flush once columns are known)
+        self._insert_sql: Optional[str] = None
+
         logger.debug(
             "AsyncRelationalWriter initialized for table %s "
-            "(batch_size=%d, flush_interval_ms=%.0f)",
+            "(batch_size=%d, flush_interval_ms=%.0f, statement_pool=%s)",
             self._table,
             self._batch_size,
             flush_interval_ms,
+            "enabled" if statement_pool is not None else "disabled",
         )
 
     async def start(self) -> None:
@@ -500,8 +540,12 @@ class AsyncRelationalWriter:
 
     async def _flush(self) -> None:
         """
-        Bulk-insert buffered rows using asyncpg's copy_records_to_table with
-        binary format.
+        Bulk-insert buffered rows.
+
+        When a :class:`~src.database.connection.PreparedStatementPool` was
+        supplied at construction time, the INSERT statement is prepared once
+        and reused on every flush to eliminate per-flush SQL parser overhead
+        (Issue #569).  Without a pool the original binary-COPY path is used.
         """
         async with self._flush_lock:
             async with self._buffer_lock:
@@ -511,21 +555,50 @@ class AsyncRelationalWriter:
                 self._buffer.clear()
 
             logger.debug(
-                "Flushing %d records to table %s via asyncpg COPY binary",
+                "Flushing %d records to table %s",
                 len(batch),
                 self._table,
             )
 
             try:
-                # Convert records to tuples in column order
-                records = [tuple(record[col] for col in self._columns) for record in batch]
-                await self._conn.copy_records_to_table(
-                    self._table,
-                    records=records,
-                    columns=self._columns,
-                    format="binary",
-                )
-                logger.debug("Successfully flushed %d records", len(batch))
+                if self._statement_pool is not None:
+                    # Prepared-statement path: build the INSERT SQL once and
+                    # reuse the pre-compiled plan on every subsequent flush.
+                    if self._insert_sql is None:
+                        placeholders = ", ".join(
+                            f"${i + 1}" for i in range(len(self._columns))
+                        )
+                        column_clause = ", ".join(self._columns)
+                        self._insert_sql = (
+                            f"INSERT INTO {self._table} ({column_clause}) "
+                            f"VALUES ({placeholders})"
+                        )
+                        logger.debug(
+                            "AsyncRelationalWriter: registered INSERT SQL with "
+                            "statement pool: %s",
+                            self._insert_sql,
+                        )
+
+                    stmt = await self._statement_pool.get_or_prepare(self._insert_sql)
+                    for record in batch:
+                        await stmt.fetch(*[record[col] for col in self._columns])
+                    logger.debug(
+                        "Successfully flushed %d records via prepared statement",
+                        len(batch),
+                    )
+                else:
+                    # Original binary-COPY path (no statement pool).
+                    records = [tuple(record[col] for col in self._columns) for record in batch]
+                    await self._conn.copy_records_to_table(
+                        self._table,
+                        records=records,
+                        columns=self._columns,
+                        format="binary",
+                    )
+                    logger.debug(
+                        "Successfully flushed %d records via asyncpg COPY binary",
+                        len(batch),
+                    )
             except Exception:
                 # Re-queue the batch on failure
                 async with self._buffer_lock:

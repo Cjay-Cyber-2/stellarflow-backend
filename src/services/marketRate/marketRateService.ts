@@ -19,7 +19,7 @@ import { normalizeDateToUTC } from "../../utils/timeUtils";
 import { sanityCheckService } from "../sanityCheckService";
 import { appConfig } from "../../config/configWatcher";
 import { isLockdownEnabled } from "../../state/appState";
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient.js";
 import { createFetcherLogger } from "../../utils/logger";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
 import { checkCrossPairConsistency } from "../../logic/crossPairArbitrageDetection";
@@ -790,11 +790,10 @@ export class MarketRateService {
 
   private async runCrossPairCheck(ngnXlmRate: number): Promise<void> {
     try {
-      const response = await axios.get(
+      const response = await httpClient.get(
         "https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd",
         {
           timeout: OUTGOING_HTTP_TIMEOUT_MS,
-          headers: { "User-Agent": "StellarFlow-Oracle/1.0" },
         },
       );
       const xlmUsd: unknown = response.data?.stellar?.usd;
