@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
-from typing import Union
+from typing import NamedTuple, Union, Sequence
 from fractions import Fraction
 
 
@@ -212,15 +212,21 @@ def floor_divide(scaled_value: int, divisor: Number) -> int:
 
 
 def sqrt_scaled(value: int, scale: int = SCALE_7) -> int:
-    """Return the fixed-point square root of a scaled integer.
+    """Return the fixed-point square root of a scaled integer using Newton-Raphson.
 
     ``value`` is expected to be scaled by *scale*, and the returned integer uses
     the same scale.  The calculation is strictly integer-only:
 
-    ``sqrt(value / scale) * scale == sqrt(value * scale)``
+    ``floor(sqrt(value / scale)) * scale``
 
-    The final square root is calculated with binary search and floors toward
-    zero, matching the truncation behavior used across this module.
+    The square root is calculated using the Newton-Raphson method (also known as
+    Heron's method) with integer arithmetic only. The iteration formula is:
+
+        x_{n+1} = (x_n + S / x_n) // 2
+
+    Where S is the radicand (value // scale) and x_n is the current estimate. This
+    converges quadratically and floors toward zero, matching the truncation behavior
+    used across this module.
     """
     if isinstance(value, bool):
         raise TypeError("value must be an integer, not bool.")
@@ -233,24 +239,26 @@ def sqrt_scaled(value: int, scale: int = SCALE_7) -> int:
     if scale <= 0:
         raise ValueError("scale must be positive.")
 
-    radicand = value * scale
+    # Calculate the unscaled radicand: value // scale
+    radicand = value // scale
     if radicand < 2:
-        return radicand
+        return radicand * scale
 
-    low = 0
-    high = radicand
-    answer = 0
+    # Initial estimate using bit length for faster convergence
+    # For a number with bit length n, sqrt is approximately 2^(n/2)
+    x = 1 << ((radicand.bit_length() + 1) // 2)
+    
+    # Newton-Raphson iteration with integer arithmetic
+    # x_{n+1} = (x_n + S // x_n) // 2
+    while True:
+        next_x = (x + radicand // x) // 2
+        if next_x >= x:
+            # Converged: next estimate is not smaller, so x is the floor sqrt
+            break
+        x = next_x
 
-    while low <= high:
-        mid = (low + high) // 2
-        square = mid * mid
-        if square <= radicand:
-            answer = mid
-            low = mid + 1
-        else:
-            high = mid - 1
-
-    return answer
+    # Scale the result back
+    return x * scale
 
 
 def build_arbitrage_route_matrix(

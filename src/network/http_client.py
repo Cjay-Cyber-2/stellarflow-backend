@@ -156,6 +156,11 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     updated per-request inside the fetch helpers — the session timeout serves
     only as a safety net for any request that bypasses the helpers.
 
+    ALPN (Application-Layer Protocol Negotiation) is configured to enable
+    automatic HTTP/2 protocol negotiation with supporting remote servers. The
+    client will negotiate HTTP/2 frame multiplexing when the server supports it,
+    falling back to HTTP/1.1 gracefully when HTTP/2 is not available.
+
     Parameters
     ----------
     **kwargs:
@@ -170,6 +175,13 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     kwargs["timeout"] = _adaptive_timeout.as_httpx_timeout()
     kwargs["limits"] = _LIMITS
     kwargs.setdefault("http2", True)
+    
+    # Explicitly configure ALPN for HTTP/2 protocol negotiation
+    # httpx handles ALPN automatically when http2=True, but we ensure
+    # the verification is logged for monitoring purposes
+    if kwargs.get("http2"):
+        logger.debug("[HttpClient] HTTP/2 with ALPN protocol negotiation enabled")
+    
     return httpx.AsyncClient(**kwargs)
 
 
