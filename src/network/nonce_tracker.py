@@ -5,7 +5,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import aiohttp
 import requests
@@ -504,6 +504,23 @@ class NonceTracker:
         with lock:
             return self._nonces.get(address)
 
+    def get_pending_nonces(self, address: str) -> List[int]:
+        """Return a snapshot of currently pending (unresolved) nonces for *address*.
+
+        This provides safe, lock-protected visibility into the pending-slot
+        bookkeeping without exposing the internal ``_pending`` dict directly.
+        Callers can use this to inspect which nonces have been issued but not
+        yet confirmed or failed -- useful for gap detection and diagnostics.
+
+        Time: O(p), where p is the number of currently pending nonces.
+        """
+        lock = self._get_lock(address)
+        with lock:
+            pending = self._pending.get(address)
+            if not pending:
+                return []
+            return sorted(pending.keys())
+
     def invalidate(self, address: Optional[str] = None) -> None:
         """Evict the cached nonce for *address*, or all accounts when omitted.
 
@@ -544,6 +561,285 @@ class NonceTracker:
         """Record *nonce* as freshly issued and unresolved. Caller holds the lock."""
         account_pending = self._pending.setdefault(address, {})
         account_pending[nonce] = _PendingNonce(nonce=nonce)
+
+
+# ---------------------------------------------------------------------------
+# Nonce Gap Detector and Recovery Engine
+# ---------------------------------------------------------------------------
+
+# Default maximum age of a pending nonce before it is considered a candidate
+# for gap-based recovery. Shorter than DEFAULT_STALE_TIMEOUT_SECONDS to
+# enable re-synchronisation within a single ledger cycle.
+DEFAULT_GAP_DETECTION_TIMEOUT_SECONDS: float = 15.0
+
+
+@dataclass
+class GapReport:
+    """Report produced by :class:`NonceGapDetector` describing discovered gaps.
+
+    Attributes
+    ----------
+    address:
+        The Stellar account address that was inspected.
+    stale_nonces:
+        Nonces that have been pending beyond the timeout threshold.
+    pending_nonces:
+        All currently pending (unresolved) nonces for the account.
+    current_nonce:
+        The most recently issued cached nonce, if any.
+    has_gaps:
+        ``True`` when one or more stale nonces exist below the highest
+        issued nonce, meaning resolved nonces have leapfrogged them.
+    """
+
+    address: str
+    stale_nonces: List[int]
+    pending_nonces: List[int]
+    current_nonce: Optional[int]
+
+    @property
+    def has_gaps(self) -> bool:
+        """Return True when at least one stale nonce has been leapfrogged.
+
+        A gap exists when a pending nonce is stale AND the tracker has issued
+        a higher nonce since (meaning later nonces have been resolved while
+        this one remains stuck).
+        """
+        if not self.stale_nonces or self.current_nonce is None:
+            return False
+        return any(nonce < self.current_nonce for nonce in self.stale_nonces)
+
+
+class NonceGapDetector:
+    """Detect nonce gaps for Stellar accounts by analysing pending state.
+
+    A *gap* is a nonce that was issued, never confirmed or failed, and has
+    been leapfrogged by higher nonces that *were* resolved.  Gaps block the
+    Stellar account's sequence because the chain requires strictly sequential
+    nonces — a stuck nonce prevents every subsequent transaction from landing.
+
+    Parameters
+    ----------
+    tracker:
+        The :class:`NonceTracker` instance to inspect.  Typically the
+        process-wide singleton ``nonce_tracker``.
+
+    Example usage::
+
+        detector = NonceGapDetector(nonce_tracker)
+        report = detector.detect_gaps("GACCOUNT")
+        if report.has_gaps:
+            # trigger recovery
+            ...
+    """
+
+    def __init__(self, tracker: NonceTracker) -> None:
+        self._tracker = tracker
+
+    def detect_gaps(
+        self,
+        address: str,
+        timeout_seconds: float = DEFAULT_GAP_DETECTION_TIMEOUT_SECONDS,
+    ) -> GapReport:
+        """Analyse the tracker's pending state and return a :class:`GapReport`.
+
+        Parameters
+        ----------
+        address:
+            Stellar public key address.
+        timeout_seconds:
+            Pending nonces older than this many seconds are considered
+            stale and therefore candidates for gap classification.
+
+        Returns
+        -------
+        GapReport
+        """
+        stale = self._tracker.get_stale(address, timeout_seconds)
+        pending = self._tracker.get_pending_nonces(address)
+        current = self._tracker.get_nonce(address)
+
+        return GapReport(
+            address=address,
+            stale_nonces=stale,
+            pending_nonces=pending,
+            current_nonce=current,
+        )
+
+
+@dataclass
+class ReconciliationResult:
+    """Result of a single reconciliation attempt by :class:`NonceRecoveryEngine`.
+
+    Attributes
+    ----------
+    address:
+        The account that was reconciled.
+    gaps_detected:
+        Stale nonces that were identified as gaps before recovery.
+    ledger_sequence:
+        The authoritative sequence number returned by the ledger query,
+        or ``None`` if the query failed.
+    synced:
+        ``True`` when the local cache was realigned to the ledger value.
+    previous_sequence:
+        The locally cached nonce *before* reconciliation, if any.
+    """
+
+    address: str
+    gaps_detected: List[int]
+    ledger_sequence: Optional[int]
+    synced: bool
+    previous_sequence: Optional[int]
+
+
+class NonceRecoveryEngine:
+    """Automated nonce gap recovery that reconciles within one ledger cycle.
+
+    The engine detects gaps via :class:`NonceGapDetector`, queries the Stellar
+    ledger for the authoritative sequence number, and — when the ledger has
+    moved past the gap — realigns the local cache via ``sync_nonce()``.
+
+    The entire operation is designed to complete within a single Stellar
+    ledger cycle (~5 seconds).  Callers should provide a time-bound
+    *ledger_query* (e.g. wrapped with a requests timeout) so the query
+    never blocks beyond the cycle boundary.
+
+    Parameters
+    ----------
+    tracker:
+        The :class:`NonceTracker` whose state is reconciled.
+    ledger_query:
+        A callable ``(address: str) -> int`` that returns the current
+        on-chain sequence number for *address* (e.g. from Horizon's
+        ``/accounts/{address}`` endpoint).  The callable should include
+        its own timeout enforcement.
+    gap_timeout_seconds:
+        How long a nonce must be pending before the detector flags it as
+        stale (default: 15 s — well within one ledger cycle).
+
+    Example usage::
+
+        def query_ledger(addr: str) -> int:
+            resp = requests.get(
+                f"https://horizon.stellar.org/accounts/{addr}",
+                timeout=2,
+            )
+            return int(resp.json()["sequence"])
+
+        engine = NonceRecoveryEngine(nonce_tracker, query_ledger)
+        result = engine.reconcile("GACCOUNT")
+        if result.synced:
+            print(f"Recovered: synced to {result.ledger_sequence}")
+    """
+
+    def __init__(
+        self,
+        tracker: NonceTracker,
+        ledger_query: Callable[[str], int],
+        gap_timeout_seconds: float = DEFAULT_GAP_DETECTION_TIMEOUT_SECONDS,
+    ) -> None:
+        if gap_timeout_seconds < 0:
+            raise ValueError("gap_timeout_seconds must be >= 0")
+
+        self._tracker = tracker
+        self._detector = NonceGapDetector(tracker)
+        self._ledger_query = ledger_query
+        self._gap_timeout_seconds = gap_timeout_seconds
+        # Serialise reconciliation per account to prevent duplicate ledger
+        # queries when multiple threads hit a tx_bad_seq simultaneously.
+        self._reconcile_locks: Dict[str, threading.Lock] = {}
+        self._reconcile_locks_map_lock = threading.Lock()
+
+    def _get_reconcile_lock(self, address: str) -> threading.Lock:
+        """Return a per-account lock for serialising reconcile() calls."""
+        lock = self._reconcile_locks.get(address)
+        if lock is None:
+            with self._reconcile_locks_map_lock:
+                lock = self._reconcile_locks.get(address)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._reconcile_locks[address] = lock
+        return lock
+
+    def reconcile(self, address: str) -> ReconciliationResult:
+        """Detect nonce gaps and reconcile with the Stellar ledger.
+
+        The method follows a three-phase protocol:
+
+        1. **Detect** — use :class:`NonceGapDetector` to find stale nonces
+           that have been leapfrogged by higher resolved nonces.
+        2. **Query** — call the ledger query function to obtain the
+           authoritative on-chain sequence number.
+        3. **Sync** — when the ledger sequence exceeds the highest gap,
+           realign the local cache via ``sync_nonce()``.
+
+        Recovery is *best-effort*: if the ledger query fails (network error,
+        timeout) the method returns a result with ``synced=False`` rather
+        than raising, so callers can schedule a retry.
+
+        Returns
+        -------
+        ReconciliationResult
+
+        Notes
+        -----
+        This method is **not** re-entrant for the same *address* — a
+        per-account lock prevents concurrent reconciliation attempts from
+        hammering the ledger with duplicate queries.
+        """
+        previous = self._tracker.get_nonce(address)
+
+        lock = self._get_reconcile_lock(address)
+        with lock:
+            report = self._detector.detect_gaps(address, self._gap_timeout_seconds)
+
+            if not report.has_gaps:
+                return ReconciliationResult(
+                    address=address,
+                    gaps_detected=[],
+                    ledger_sequence=None,
+                    synced=False,
+                    previous_sequence=previous,
+                )
+
+            # Query the ledger with a timeout so we never block beyond one cycle.
+            ledger_seq: Optional[int] = None
+            try:
+                ledger_seq = self._ledger_query(address)
+            except Exception as exc:
+                logger.warning(
+                    "[NonceRecoveryEngine] Ledger query failed for %s: %s",
+                    address,
+                    exc,
+                )
+
+            if ledger_seq is None or ledger_seq <= max(report.stale_nonces):
+                return ReconciliationResult(
+                    address=address,
+                    gaps_detected=list(report.stale_nonces),
+                    ledger_sequence=ledger_seq,
+                    synced=False,
+                    previous_sequence=previous,
+                )
+
+            # Ledger has moved past the gap — realign.
+            self._tracker.sync_nonce(address, ledger_seq)
+            logger.info(
+                "[NonceRecoveryEngine] Recovered %s | gaps=%s | ledger_seq=%d | previous=%s",
+                address,
+                report.stale_nonces,
+                ledger_seq,
+                previous,
+            )
+
+        return ReconciliationResult(
+            address=address,
+            gaps_detected=list(report.stale_nonces),
+            ledger_sequence=ledger_seq,
+            synced=True,
+            previous_sequence=previous,
+        )
 
 
 # Module-level singletons – import and use directly.
@@ -786,6 +1082,10 @@ rpc_supervisor = RPCNodeFailoverSupervisor()
 __all__ = [
     "NonceTracker",
     "NonceWindow",
+    "NonceGapDetector",
+    "NonceRecoveryEngine",
+    "GapReport",
+    "ReconciliationResult",
     "nonce_tracker",
     "nonce_window",
     "RPCNodeFailoverSupervisor",

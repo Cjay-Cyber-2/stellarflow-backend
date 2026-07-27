@@ -313,6 +313,8 @@ export class WorkerChannelPool {
     if (!channel) {
       channel = new WorkerThreadChannel({
         channelName: name,
+        bufferSize: 1024,
+        batchSize: 32,
         ...this.defaultConfig,
         ...config,
       });
