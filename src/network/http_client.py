@@ -6,6 +6,10 @@ subsequent requests use a timeout derived from recent latency observations via
 an exponential moving average (EMA) so that the window adapts to regional
 network conditions without ever dropping below a safety floor.
 
+TCP socket buffers (SO_RCVBUF, SO_SNDBUF) are also tuned dynamically based on
+the same EMA latency estimate using the bandwidth-delay product (BDP) heuristic:
+larger buffers for high-latency links, smaller for low-latency links.
+
 Timeout handling contract
 -------------------------
 * ``httpx.TimeoutException`` / ``asyncio.TimeoutError`` are caught,
@@ -21,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
@@ -66,6 +72,42 @@ _LIMITS = httpx.Limits(
     max_keepalive_connections=1,
 )
 
+# ---------------------------------------------------------------------------
+# TCP buffer tuning constants
+# ---------------------------------------------------------------------------
+
+#: Assumed baseline bandwidth (bits per second) used in the BDP calculation.
+#: 10 Mbps is a conservative estimate for typical regional inter-datacenter
+#: links; operators may tune this via environment variable.
+_ASSUMED_BANDWIDTH_BPS: int = int(os.environ.get(
+    "HTTP_CLIENT_BANDWIDTH_BPS", "10_000_000"
+))
+
+#: Minimum receive buffer size in bytes.
+_MIN_RCVBUF: int = 65536  # 64 KB
+
+#: Maximum receive buffer size in bytes.
+_MAX_RCVBUF: int = 4_194_304  # 4 MB
+
+#: Minimum send buffer size in bytes.
+_MIN_SNDBUF: int = 65536  # 64 KB
+
+#: Maximum send buffer size in bytes.
+_MAX_SNDBUF: int = 2_097_152  # 2 MB
+
+# ---------------------------------------------------------------------------
+# Keep-alive constants (used by _KeepAliveTransport)
+# ---------------------------------------------------------------------------
+
+#: Idle time (seconds) before sending the first keep-alive probe.
+_KA_IDLE_S: int = 10
+
+#: Interval (seconds) between subsequent keep-alive probes.
+_KA_INTVL_S: int = 5
+
+#: Maximum number of keep-alive probes sent before dropping the connection.
+_KA_CNT: int = 3
+
 
 # ---------------------------------------------------------------------------
 # Adaptive timeout
@@ -107,10 +149,129 @@ class AdaptiveTimeout:
         t = self.timeout_s
         return httpx.Timeout(connect=t, read=t, write=t, pool=t)
 
+    @property
+    def rtt_estimate_s(self) -> float:
+        """Return the current EMA RTT estimate in seconds, or a default."""
+        if self._ema.value is None:
+            return REQUEST_TIMEOUT_S / _EMA_MULTIPLIER
+        return self._ema.value
+
 
 #: Module-level shared instance – all helpers use this by default so the EMA
 #: accumulates across every outbound request in the process.
 _adaptive_timeout: AdaptiveTimeout = AdaptiveTimeout()
+
+
+# ---------------------------------------------------------------------------
+# Buffer size computation
+# ---------------------------------------------------------------------------
+
+
+def compute_buffer_size(rtt_s: float) -> Tuple[int, int]:
+    """Compute optimal TCP send/receive buffer sizes using BDP.
+
+    The bandwidth-delay product (BDP) is ``(bandwidth in bytes/s) × RTT``.
+    The receive buffer is clamped to ``[_MIN_RCVBUF, _MAX_RCVBUF]``; the send
+    buffer is half the receive size, clamped to ``[_MIN_SNDBUF, _MAX_SNDBUF]``.
+
+    Parameters
+    ----------
+    rtt_s:
+        Round-trip time estimate in seconds.
+
+    Returns
+    -------
+    Tuple[int, int]
+        ``(recv_buffer_size, send_buffer_size)`` in bytes.
+    """
+    bandwidth_bytes_s = _ASSUMED_BANDWIDTH_BPS // 8
+    bdp = int(bandwidth_bytes_s * rtt_s)
+    rcvbuf = max(_MIN_RCVBUF, min(bdp, _MAX_RCVBUF))
+    sndbuf = max(_MIN_SNDBUF, min(bdp // 2, _MAX_SNDBUF))
+    return rcvbuf, sndbuf
+
+
+# ---------------------------------------------------------------------------
+# Socket helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keep-alive on *sock* with the module-level constants."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KA_IDLE_S)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTVL_S)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_CNT)
+    except OSError as exc:
+        logger.warning("Failed to set TCP keep-alive: %s", exc)
+
+
+def _apply_tcp_buffers(sock: socket.socket, rtt_s: float) -> None:
+    """Set SO_RCVBUF and SO_SNDBUF on *sock* based on the given RTT.
+
+    Parameters
+    ----------
+    sock:
+        The connected TCP socket to tune.
+    rtt_s:
+        Round-trip time estimate in seconds used to compute buffer sizes.
+    """
+    try:
+        rcvbuf, sndbuf = compute_buffer_size(rtt_s)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+        logger.debug(
+            "TCP buffers tuned | rcvbuf=%d | sndbuf=%d | rtt_s=%.3f",
+            rcvbuf,
+            sndbuf,
+            rtt_s,
+        )
+    except OSError as exc:
+        logger.warning("Failed to set TCP buffer sizes: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Custom transport with keep-alive + buffer tuning
+# ---------------------------------------------------------------------------
+
+
+class _KeepAliveTransport(AsyncHTTPTransport):
+    """An ``httpx.AsyncHTTPTransport`` that applies keep-alive and dynamic
+    TCP buffer sizing to every newly-created socket.
+
+    Buffer sizes are derived from the module-level ``_adaptive_timeout``
+    RTT estimate so they respond to the same dynamic network conditions used
+    for timeout tuning.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        # Let the parent transport do the actual I/O, then patch the socket.
+        response = await super().handle_async_request(request)
+        stream = response.stream
+        if stream is None:
+            return response
+
+        try:
+            conn = stream._connection
+        except AttributeError:
+            return response
+
+        try:
+            sock: Optional[socket.socket] = conn.network_stream.get_extra_info("socket")
+        except AttributeError:
+            sock = None
+
+        if sock is not None:
+            _apply_keepalive(sock)
+            if _adaptive_timeout.rtt_estimate_s > 0:
+                _apply_tcp_buffers(sock, _adaptive_timeout.rtt_estimate_s)
+
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +575,7 @@ __all__ = [
     "AdaptiveTimeout",
     "FetchTimeoutError",
     "MetricRequest",
+    "compute_buffer_size",
     "make_session",
     "fetch_json",
     "fetch_json_many",
