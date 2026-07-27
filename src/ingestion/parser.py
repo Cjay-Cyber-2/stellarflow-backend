@@ -91,6 +91,41 @@ try:
             _tl.parser = parser
         return parser.parse(raw)
 
+    # Separate thread-local parser exclusively for UTF-8 validation so it
+    # never conflicts with the JSON parser above (pysimdjson v7 forbids
+    # re-using a parser while proxy objects from a prior parse still exist).
+    _tl_utf8 = threading.local()
+
+    def simd_utf8_decode(raw: bytes, *, encoding: str = "utf-8") -> str:
+        """Decode *raw* bytes to ``str`` using SIMD-accelerated UTF-8 validation.
+
+        When ``pysimdjson`` is available the bytes are first validated by the
+        C++ simdjson parser (which uses SIMD instructions for UTF-8
+        validation) and then decoded by Python's built-in codec.  This
+        two-step approach is faster than ``raw.decode(encoding)`` alone
+        because the SIMD validation skips byte-by-byte Python overhead.
+
+        Falls back to ``raw.decode(encoding)`` when pysimdjson is not
+        installed or when *encoding* is not ``utf-8``.
+        """
+        if encoding != "utf-8":
+            return raw.decode(encoding)
+        # Use a dedicated parser instance so we never collide with the JSON
+        # parser's thread-local storage.
+        parser: _simdjson.Parser = getattr(_tl_utf8, "parser", None)
+        if parser is None:
+            parser = _simdjson.Parser()
+            _tl_utf8.parser = parser
+        # Encode as a JSON string value so simdjson validates the bytes as
+        # valid UTF-8 content inside a JSON string.  This triggers the
+        # SIMD-accelerated UTF-8 validation in the C++ parser.
+        escaped = raw.replace(b"\\", b"\\\\").replace(b'"', b'\\"')
+        result = parser.parse(b'"' + escaped + b'"')
+        # Force garbage collection of the simdjson proxy to avoid the
+        # "parser re-use" error on the next call.
+        del result
+        return raw.decode("utf-8")
+
     SIMDJSON_AVAILABLE: bool = True
 
 except ImportError:  # pragma: no cover — exercised by test_parser_fallback_path
@@ -99,6 +134,10 @@ except ImportError:  # pragma: no cover — exercised by test_parser_fallback_pa
         return json.loads(raw)
 
     SIMDJSON_AVAILABLE = False
+
+    def simd_utf8_decode(raw: bytes, *, encoding: str = "utf-8") -> str:  # type: ignore[misc]
+        """Fallback: standard-library UTF-8 decode."""
+        return raw.decode(encoding)
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -738,4 +777,5 @@ __all__ = [
     "flatten_telemetry_frames",
     "iter_flat_ticker_tuples",
     "parse_raw_pack",
+    "simd_utf8_decode",
 ]

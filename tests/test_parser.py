@@ -33,6 +33,7 @@ from ingestion.parser import (
     flatten_telemetry_frames,
     iter_price_events_from_stream,
     parse_raw_pack,
+    simd_utf8_decode,
 )
 
 
