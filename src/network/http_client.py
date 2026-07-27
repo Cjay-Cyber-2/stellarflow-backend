@@ -15,15 +15,26 @@ Timeout handling contract
   propagate unchanged — this module never swallows them.
 * Connections are always returned to the pool automatically — httpx manages
   this transparently via its internal connection pool.
+
+Multi-interface failover
+-------------------------
+* ``MultiInterfaceClient`` wraps ``httpx.AsyncClient`` with health-check
+  monitoring and automatic failover between primary and secondary network
+  interfaces.
+* On primary failure, traffic is rerouted through the secondary interface.
+* Health checks run periodically against a configurable endpoint.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from enum import Enum, auto
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import httpx
 from httpx import AsyncHTTPTransport
@@ -53,6 +64,269 @@ _EMA_MULTIPLIER: float = 3.0
 
 #: Human-readable label used in log messages so operators see milliseconds.
 _TIMEOUT_LABEL_MS: int = int(REQUEST_TIMEOUT_S * 1000)
+
+# ---------------------------------------------------------------------------
+# Multi-interface networking & failover
+# ---------------------------------------------------------------------------
+
+
+class InterfaceState(Enum):
+    """Health state of a network interface."""
+    HEALTHY = auto()
+    DEGRADED = auto()
+    DOWN = auto()
+
+
+@dataclass
+class InterfaceConfig:
+    """Configuration for a network interface.
+
+    Parameters
+    ----------
+    name:
+        Human-readable label (e.g. ``"primary"``, ``"secondary"``).
+    bind_ip:
+        Optional IP address to bind sockets to.  When ``None`` the OS
+        default interface is used.
+    description:
+        Optional description for logging / observability.
+    """
+    name: str
+    bind_ip: Optional[str] = None
+    description: str = ""
+
+
+@dataclass
+class FailoverConfig:
+    """Configuration for automatic interface failover.
+
+    Parameters
+    ----------
+    primary:
+        The primary network interface.
+    secondary:
+        The secondary (backup) network interface.
+    health_check_url:
+        URL used for periodic health checks (HEAD request).
+    check_interval_s:
+        Seconds between health checks when the primary is healthy.
+    check_timeout_s:
+        Timeout for each health check request.
+    retry_count:
+        Number of times to retry a failed request on the secondary
+        before giving up.
+    failure_threshold:
+        Consecutive health-check failures required to mark an interface DOWN.
+    """
+    primary: InterfaceConfig
+    secondary: InterfaceConfig
+    health_check_url: str = "https://example.com"
+    check_interval_s: float = 30.0
+    check_timeout_s: float = 5.0
+    retry_count: int = 2
+    failure_threshold: int = 3
+
+
+class MultiInterfaceClient:
+    """Async HTTP client with automatic network-interface failover.
+
+    Wraps two ``httpx.AsyncClient`` sessions (one per interface) and
+    monitors primary health.  On primary failure all new requests are
+    routed through the secondary interface.  Periodic health checks
+    automatically restore the primary when it recovers.
+
+    Parameters
+    ----------
+    config:
+        Failover configuration including primary/secondary interfaces.
+    session_kwargs:
+        Additional keyword arguments forwarded to ``make_session``.
+    """
+
+    def __init__(
+        self,
+        config: FailoverConfig,
+        **session_kwargs: Any,
+    ) -> None:
+        self.config = config
+        self._session_kwargs = session_kwargs
+
+        self._primary_state: InterfaceState = InterfaceState.HEALTHY
+        self._secondary_state: InterfaceState = InterfaceState.HEALTHY
+        self._active_interface: str = config.primary.name
+        self._primary_failures: int = 0
+        self._secondary_failures: int = 0
+        self._primary_session: Optional[httpx.AsyncClient] = None
+        self._secondary_session: Optional[httpx.AsyncClient] = None
+        self._health_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+        self._started: bool = False
+
+        logger.info(
+            "[MultiInterfaceClient] Initialised | primary=%s secondary=%s "
+            "health_url=%s check_interval=%.1fs",
+            config.primary.name, config.secondary.name,
+            config.health_check_url, config.check_interval_s,
+        )
+
+    async def _build_primary_session(self) -> httpx.AsyncClient:
+        """Create an httpx client bound to the primary interface."""
+        kwargs = dict(self._session_kwargs)
+        if self.config.primary.bind_ip:
+            transport = AsyncHTTPTransport(
+                local_address=self.config.primary.bind_ip,
+            )
+            kwargs.setdefault("transport", transport)
+        return make_session(**kwargs)
+
+    async def _build_secondary_session(self) -> httpx.AsyncClient:
+        """Create an httpx client bound to the secondary interface."""
+        kwargs = dict(self._session_kwargs)
+        if self.config.secondary.bind_ip:
+            transport = AsyncHTTPTransport(
+                local_address=self.config.secondary.bind_ip,
+            )
+            kwargs.setdefault("transport", transport)
+        return make_session(**kwargs)
+
+    async def start(self) -> None:
+        """Open both sessions and begin health monitoring."""
+        async with self._lock:
+            if self._started:
+                return
+            self._primary_session = await self._build_primary_session()
+            self._secondary_session = await self._build_secondary_session()
+            self._started = True
+            self._health_task = asyncio.create_task(self._health_loop())
+            logger.info(
+                "[MultiInterfaceClient] Started | active=%s",
+                self._active_interface,
+            )
+
+    async def stop(self) -> None:
+        """Shut down health monitoring and close both sessions."""
+        if self._health_task:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            if self._primary_session:
+                await self._primary_session.aclose()
+            if self._secondary_session:
+                await self._secondary_session.aclose()
+            self._started = False
+        logger.info("[MultiInterfaceClient] Stopped")
+
+    async def _health_loop(self) -> None:
+        """Periodically check primary interface health."""
+        while True:
+            try:
+                await asyncio.sleep(self.config.check_interval_s)
+                await self._check_primary_health()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[MultiInterfaceClient] Health check error")
+
+    async def _check_primary_health(self) -> None:
+        """Perform a single health check on the primary interface."""
+        if not self._primary_session:
+            return
+        try:
+            timeout = httpx.Timeout(self.config.check_timeout_s)
+            await self._primary_session.head(
+                self.config.health_check_url,
+                timeout=timeout,
+            )
+            self._primary_failures = 0
+            if self._primary_state != InterfaceState.HEALTHY:
+                self._primary_state = InterfaceState.HEALTHY
+                self._active_interface = self.config.primary.name
+                logger.warning(
+                    "[MultiInterfaceClient] Primary restored | "
+                    "failing back to %s",
+                    self.config.primary.name,
+                )
+        except httpx.RequestError:
+            self._primary_failures += 1
+            logger.warning(
+                "[MultiInterfaceClient] Primary health check failed "
+                "(%d/%d)",
+                self._primary_failures,
+                self.config.failure_threshold,
+            )
+            if self._primary_failures >= self.config.failure_threshold:
+                old_state = self._primary_state
+                self._primary_state = InterfaceState.DOWN
+                if old_state != InterfaceState.DOWN:
+                    logger.error(
+                        "[MultiInterfaceClient] PRIMARY FAILURE | "
+                        "failing over to %s",
+                        self.config.secondary.name,
+                    )
+                    self._active_interface = self.config.secondary.name
+
+    @property
+    def active_session(self) -> Optional[httpx.AsyncClient]:
+        """Return the currently active httpx session based on interface state."""
+        if self._active_interface == self.config.primary.name:
+            return self._primary_session
+        return self._secondary_session
+
+    @property
+    def active_interface(self) -> str:
+        """Name of the currently active interface."""
+        return self._active_interface
+
+    @property
+    def primary_state(self) -> InterfaceState:
+        return self._primary_state
+
+    @property
+    def secondary_state(self) -> InterfaceState:
+        return self._secondary_state
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Make an HTTP request with automatic failover retry.
+
+        On failure, retries the request on the secondary interface.
+        """
+        session = self.active_session
+        if session is None:
+            raise RuntimeError("[MultiInterfaceClient] Not started")
+
+        try:
+            return await session.request(method, url, **kwargs)
+        except httpx.RequestError as exc:
+            logger.warning(
+                "[MultiInterfaceClient] Request failed on %s | "
+                "retrying on %s | url=%s",
+                self._active_interface,
+                self.config.secondary.name,
+                url,
+            )
+            fallback = self._secondary_session
+            if fallback and fallback is not session:
+                for attempt in range(self.config.retry_count):
+                    try:
+                        return await fallback.request(method, url, **kwargs)
+                    except httpx.RequestError:
+                        if attempt == self.config.retry_count - 1:
+                            raise
+                        logger.warning(
+                            "[MultiInterfaceClient] Retry %d/%d failed "
+                            "on secondary | url=%s",
+                            attempt + 1, self.config.retry_count, url,
+                        )
+            raise exc
+
 
 # ---------------------------------------------------------------------------
 # Connection limits & HTTP/2
@@ -413,6 +687,10 @@ __all__ = [
     "REQUEST_TIMEOUT_S",
     "AdaptiveTimeout",
     "FetchTimeoutError",
+    "InterfaceConfig",
+    "InterfaceState",
+    "FailoverConfig",
+    "MultiInterfaceClient",
     "MetricRequest",
     "make_session",
     "fetch_json",
