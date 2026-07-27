@@ -107,6 +107,7 @@ class TelemetryEncoder:
             frame.sequence,
             frame.flags,
             frame.feed_id,
+            0,
         )
 
     @classmethod
@@ -787,6 +788,194 @@ def msgpack_json_size(data: object) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Issue #648 — FlatBuffers metadata schema for Soroban contract state
+# ---------------------------------------------------------------------------
+# FlatBuffers table that allows zero-copy field access on incoming metadata
+# buffers without unpacking steps.  The schema uses a 128-bit integer
+# (split into lo/hi uint64 fields) to represent precise balances and avoids
+# any intermediate deserialisation.
+
+import flatbuffers
+from flatbuffers.builder import Builder
+
+
+def build_contract_metadata_buffer(
+    contract_id: bytes,
+    balance: int,
+    precision: int = 7,
+    version: int = 1,
+) -> bytearray:
+    """Build a FlatBuffers buffer for Soroban contract metadata.
+
+    The *balance* parameter is a 128-bit unsigned integer split into
+    two uint64 fields (lo / hi) for exact precision.  The returned buffer
+    is self-contained and ready for socket / queue transmission with no
+    additional framing.
+
+    Args:
+        contract_id:  32-byte Soroban contract hash (must be exactly 32 bytes).
+        balance:      128-bit unsigned integer.
+        precision:    Decimal precision of the balance (default 7 -> SCALE_7).
+        version:      Metadata format version.
+
+    Returns:
+        A ``bytearray`` containing the FlatBuffers-wrapped buffer.
+    """
+    if len(contract_id) != 32:
+        raise ValueError(f"contract_id must be exactly 32 bytes, got {len(contract_id)}")
+
+    balance_lo: int = balance & 0xFFFFFFFFFFFFFFFF
+    balance_hi: int = (balance >> 64) & 0xFFFFFFFFFFFFFFFF
+
+    builder = Builder(128)
+    builder.ForceDefaults(True)
+
+    cid_vec = builder.CreateByteVector(contract_id)
+
+    table = _meta_start(builder)
+    _meta_add_contract_id(builder, cid_vec)
+    _meta_add_balance_lo(builder, balance_lo)
+    _meta_add_balance_hi(builder, balance_hi)
+    _meta_add_precision(builder, precision)
+    _meta_add_version(builder, version)
+    table = _meta_end(builder, table)
+
+    builder.Finish(table)
+    return builder.Output()
+
+
+def _meta_start(builder: Builder) -> int:
+    """Start a ContractMetadata table in *builder* and return the table offset."""
+    builder.StartObject(5)
+    return 0
+
+
+def _meta_add_contract_id(builder: Builder, contract_id: int) -> None:
+    """Slot 0: contract_id (uoffset vector of 32 bytes)."""
+    builder.PrependUOffsetTRelativeSlot(0, contract_id, 0)
+
+
+def _meta_add_balance_lo(builder: Builder, balance_lo: int) -> None:
+    """Slot 1: balance_lo (uint64)."""
+    builder.PrependUint64Slot(1, balance_lo, 0)
+
+
+def _meta_add_balance_hi(builder: Builder, balance_hi: int) -> None:
+    """Slot 2: balance_hi (uint64)."""
+    builder.PrependUint64Slot(2, balance_hi, 0)
+
+
+def _meta_add_precision(builder: Builder, precision: int) -> None:
+    """Slot 3: precision (uint32)."""
+    builder.PrependUint32Slot(3, precision, 0)
+
+
+def _meta_add_version(builder: Builder, version: int) -> None:
+    """Slot 4: version (uint32)."""
+    builder.PrependUint32Slot(4, version, 0)
+
+
+def _meta_end(builder: Builder, table: int) -> int:
+    """Finalise the ContractMetadata table, returning the table offset."""
+    return builder.EndObject()
+
+
+class ContractMetadata:
+    """Zero-copy reader for a FlatBuffers ContractMetadata buffer.
+
+    Attributes are accessed directly from the underlying buffer without
+    any unpacking or deserialisation step — fields are read on-demand
+    through the FlatBuffers vtable indirection.
+
+    Example::
+
+        buf = build_contract_metadata_buffer(contract_id, balance)
+        meta = ContractMetadata.GetRootAs(buf)
+        bal = meta.balance()       # -> 128-bit int, read on-demand
+        prec = meta.precision()    # -> uint32
+    """
+
+    __slots__ = ("_tab",)
+
+    def __init__(self) -> None:
+        self._tab = flatbuffers.table.Table(b"", 0)
+
+    @classmethod
+    def GetRootAs(cls, buf: bytes, offset: int = 0) -> "ContractMetadata":
+        n = flatbuffers.encode.Get(flatbuffers.packer.uoffset, buf, offset)
+        obj = cls()
+        obj.Init(buf, n + offset)
+        return obj
+
+    def Init(self, buf: bytes, pos: int) -> None:
+        self._tab = flatbuffers.table.Table(buf, pos)
+
+    def ContractId(self, j: int) -> int:
+        """Read byte *j* of the 32-byte contract_id vector (zero-copy)."""
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            a = self._tab.Vector(o)
+            return self._tab.Get(
+                flatbuffers.number_types.Int8Flags,
+                a + flatbuffers.number_types.UOffsetTFlags.py_type(j * 1),
+            )
+        return 0
+
+    def ContractIdAsBytes(self) -> bytes:
+        """Read the full contract_id as a bytes object."""
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            n = self._tab.VectorLen(o)
+            a = self._tab.Vector(o)
+            return bytes(
+                self._tab.Get(
+                    flatbuffers.number_types.Int8Flags,
+                    a + flatbuffers.number_types.UOffsetTFlags.py_type(i * 1),
+                )
+                for i in range(n)
+            )
+        return b""
+
+    def ContractIdLength(self) -> int:
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(4))
+        if o != 0:
+            return self._tab.VectorLen(o)
+        return 0
+
+    def BalanceLo(self) -> int:
+        """Lower 64 bits of the 128-bit balance (zero-copy)."""
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint64Flags, o + self._tab.Pos)
+        return 0
+
+    def BalanceHi(self) -> int:
+        """Upper 64 bits of the 128-bit balance (zero-copy)."""
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(8))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint64Flags, o + self._tab.Pos)
+        return 0
+
+    def balance(self) -> int:
+        """Reconstruct the full 128-bit balance from lo/hi fields."""
+        return (self.BalanceHi() << 64) | self.BalanceLo()
+
+    def Precision(self) -> int:
+        """Decimal precision of the balance (zero-copy)."""
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(10))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return 0
+
+    def Version(self) -> int:
+        """Metadata format version (zero-copy)."""
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(12))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint32Flags, o + self._tab.Pos)
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Public API
 __all__ = [
     "TelemetryFrame",
@@ -826,4 +1015,7 @@ __all__ = [
     "msgpack_encode_backpressure_metric",
     "msgpack_decode_backpressure_metric",
     "msgpack_json_size",
+    # Issue #648 — FlatBuffers metadata for Soroban contracts
+    "build_contract_metadata_buffer",
+    "ContractMetadata",
 ]
