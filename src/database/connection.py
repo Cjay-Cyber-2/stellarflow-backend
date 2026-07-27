@@ -699,6 +699,152 @@ class ConnectionPoolHealthMonitor:
             logger.warning("Failed to discard a broken connection", exc_info=True)
 
 
+class PooledConnectionRecycler:
+    """Wraps a connection pool and validates connections before checkout.
+
+    On each ``getconn()``, runs a lightweight validation query (``SELECT 1``).
+    If the underlying TCP socket is stale (connection reset, broken pipe, or
+    driver-level disconnect error), the connection is recycled via
+    ``putconn(conn, close=True)`` and a fresh connection is obtained and
+    validated. This prevents silent network drops from surfacing as
+    unexpected connection reset errors when the caller issues its first
+    real query.
+
+    The recycler is identity-transparent: it proxies ``getconn`` and
+    ``putconn`` so existing pool consumers require no changes beyond wrapping
+    their pool::
+
+        raw_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=...)
+        recycler = PooledConnectionRecycler(raw_pool)
+        conn = recycler.getconn()
+        try:
+            # conn is guaranteed to have passed a SELECT 1 probe
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO ...")
+        finally:
+            recycler.putconn(conn)
+
+    Thread safety
+    -------------
+    All public methods hold the underlying pool's inherent lock and add no
+    additional contention beyond the validation query itself.
+    """
+
+    def __init__(
+        self,
+        pool: Any,
+        validation_query: str = HEARTBEAT_QUERY,
+        max_retries: int = 1,
+        broken_exceptions: Optional[Tuple[Type[BaseException], ...]] = None,
+    ) -> None:
+        if pool is None:
+            raise ValueError("pool must not be None")
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+
+        self._pool = pool
+        self._query = validation_query
+        self._max_retries = max_retries
+        self._broken = broken_exceptions or _default_broken_exceptions()
+
+    def getconn(self) -> Any:
+        """Obtain a validated connection from the pool.
+
+        The connection is probed with ``validation_query`` before being
+        returned. If the probe fails with a stale-socket error the
+        connection is discarded (``putconn(conn, close=True)``) and a new
+        one is retrieved and validated.  This repeats up to
+        ``max_retries + 1`` attempts.
+
+        Raises
+        ------
+        RuntimeError
+            If every attempt produced a stale connection — the pool is
+            likely entirely dead.
+        """
+        last_error: Optional[BaseException] = None
+        attempts = self._max_retries + 1
+
+        for attempt in range(attempts):
+            conn = self._pool.getconn()
+            try:
+                self._validate(conn)
+            except self._broken as exc:
+                logger.warning(
+                    "Recycler: stale connection detected (attempt %d/%d); "
+                    "discarding and retrying",
+                    attempt + 1,
+                    attempts,
+                )
+                self._return_broken(conn)
+                last_error = exc
+                continue
+            except BaseException:
+                self._return_broken(conn)
+                raise
+
+            logger.debug("Recycler: validated connection from pool")
+            return conn
+
+        raise RuntimeError(
+            f"PooledConnectionRecycler: all {attempts} attempt(s) produced "
+            f"stale connections; the pool may be entirely dead"
+        ) from last_error
+
+    def putconn(self, conn: Any, close: bool = False) -> None:
+        """Return a connection to the pool.
+
+        Delegates to ``self._pool.putconn(conn, close=close)``.
+
+        When *close* is ``True`` the pool discards the connection instead
+        of keeping it idle; use this when *conn* is known to be stale.
+        """
+        try:
+            self._pool.putconn(conn, close=close)
+        except TypeError:
+            try:
+                self._pool.putconn(conn)
+            except Exception:
+                logger.warning("Recycler: failed to return connection", exc_info=True)
+
+    def closeall(self) -> None:
+        """Close all connections managed by the underlying pool."""
+        closeall = getattr(self._pool, "closeall", None)
+        if callable(closeall):
+            closeall()
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _validate(self, conn: Any) -> None:
+        """Run the validation query against *conn*.
+
+        Raises on failure; the caller classifies the exception against
+        ``self._broken`` to decide whether to retry.
+        """
+        cursor = conn.cursor()
+        try:
+            cursor.execute(self._query)
+            cursor.fetchone()
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+
+    def _return_broken(self, conn: Any) -> None:
+        """Discard a broken connection."""
+        try:
+            self._pool.putconn(conn, close=True)
+        except TypeError:
+            try:
+                self._pool.putconn(conn)
+            except Exception:
+                logger.warning("Recycler: failed to discard broken connection", exc_info=True)
+        except Exception:
+            logger.warning("Recycler: failed to discard broken connection", exc_info=True)
+
+
 class AdaptiveTimeoutController:
     """Dynamically calculates database query timeout boundaries at runtime.
 
