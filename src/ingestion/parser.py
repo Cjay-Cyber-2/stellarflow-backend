@@ -18,14 +18,51 @@ If the native extension is not available the module falls back silently to
 ``json.loads``, keeping the pipeline functional in any environment.  The
 :data:`SIMDJSON_AVAILABLE` flag is exported so callers can introspect which
 path is active at runtime.
+
+Pre-compiled Binary Layout Decoder
+-----------------------------------
+In addition to JSON-based parsing, this module provides a
+:class:`BinaryFrameLayout` — a ``ctypes.Structure`` subclass — that decodes
+pre-packed 40-byte telemetry frames directly from raw bytes without any
+dynamic dictionary construction.  This eliminates the per-frame allocation
+and field-lookup overhead that JSON parsing incurs, making it suitable for
+high-frequency socket ingestion paths.
+
+The binary layout matches the 40-byte frame format defined in
+:mod:`src.serialization.encoders`:
+
+    ┌─────────────┬────────┬──────────────────────────────────────────────┐
+    │ Field        │ Format │ Description                                  │
+    ├─────────────┼────────┼──────────────────────────────────────────────┤
+    │ asset_id    │  8s    │ 8-byte ASCII asset pair (e.g. b"NGN/XLM\\x00")│
+    │ price       │   q    │ int64 scaled price (fixed-point 10⁷)         │
+    │ volume      │   Q    │ uint64 24-h rolling volume (scaled 10⁷)      │
+    │ timestamp   │   Q    │ uint64 Unix epoch milliseconds               │
+    │ sequence    │   I    │ uint32 monotonic sequence / nonce counter     │
+    │ flags       │   H    │ uint16 status-flag bitmask                   │
+    │ feed_id     │   B    │ uint8  originating data-feed identifier       │
+    │ _reserved   │   B    │ uint8  reserved byte (always 0x00)           │
+    └─────────────┴────────┴──────────────────────────────────────────────┘
+    Total frame size: 40 bytes
+
+Use :func:`decode_binary_packet` to decode a single 40-byte frame, or
+:func:`decode_binary_batch` to decode a concatenated bundle of frames.
 """
 
 from __future__ import annotations
 
+import ctypes
 import json
 import threading
 from collections.abc import Iterable, Iterator, Mapping
-from typing import TypeAlias, cast
+from typing import Union, cast
+
+# TypeAlias polyfill for Python < 3.10
+try:
+    from typing import TypeAlias  # type: ignore[attr-defined]
+except ImportError:
+    # typing_extensions not available either — define a no-op alias
+    TypeAlias = type  # type: ignore[misc,assignment]
 
 # ---------------------------------------------------------------------------
 # SIMD-accelerated JSON back-end (optional)
@@ -109,9 +146,142 @@ except ImportError:  # pragma: no cover — exercised by test_parser_fallback_pa
 TelemetryTuple: TypeAlias = tuple[str, float, int, int, int]
 TelemetrySegment: TypeAlias = tuple[TelemetryTuple, ...]
 TelemetrySegmentBatch: TypeAlias = tuple[TelemetrySegment, ...]
-SequencePayload: TypeAlias = list[object] | tuple[object, ...]
+SequencePayload: TypeAlias = Union[list[object], tuple[object, ...]]
 
 DEFAULT_SEGMENT_SIZE = 256
+
+# ---------------------------------------------------------------------------
+# Pre-compiled binary layout decoder (ctypes.Structure)
+# ---------------------------------------------------------------------------
+# Matches the 40-byte TelemetryFrame layout from src/serialization/encoders.py.
+# Using ctypes.Structure avoids dynamic dictionary construction and per-field
+# attribute lookups — the C-level struct is mapped directly over the raw bytes.
+
+class BinaryFrameLayout(ctypes.Structure):
+    """Pre-compiled ctypes layout for a 40-byte telemetry frame.
+
+    Fields are ordered to match the little-endian, tightly-packed format
+    defined in :mod:`src.serialization.encoders`:
+
+    * ``asset_id``  — 8-byte ASCII asset pair (zero-padded)
+    * ``price``     — int64 scaled price (fixed-point 10⁷)
+    * ``volume``    — uint64 24-h rolling volume (scaled 10⁷)
+    * ``timestamp`` — uint64 Unix epoch milliseconds
+    * ``sequence``  — uint32 monotonic counter
+    * ``flags``     — uint16 status bitmask
+    * ``feed_id``   — uint8 data-feed source identifier
+    * ``_reserved`` — uint8 padding (always 0x00)
+
+    Usage::
+
+        buf = BinaryFrameLayout.from_buffer_copy(raw_bytes)
+        asset = buf.asset_id.rstrip(b"\\x00").decode("ascii")
+        price = buf.price / 10_000_000.0
+    """
+
+    _pack_ = 1  # tightly-packed, no implicit C padding
+
+    _fields_: list[tuple[str, type[ctypes._CData]]] = [
+        ("asset_id", ctypes.c_char * 8),
+        ("price", ctypes.c_int64),
+        ("volume", ctypes.c_uint64),
+        ("timestamp", ctypes.c_uint64),
+        ("sequence", ctypes.c_uint32),
+        ("flags", ctypes.c_uint16),
+        ("feed_id", ctypes.c_uint8),
+        ("_reserved", ctypes.c_uint8),
+    ]
+
+    FRAME_SIZE: int = ctypes.sizeof(ctypes.c_char * 8) + ctypes.sizeof(ctypes.c_int64) + ctypes.sizeof(ctypes.c_uint64) + ctypes.sizeof(ctypes.c_uint64) + ctypes.sizeof(ctypes.c_uint32) + ctypes.sizeof(ctypes.c_uint16) + ctypes.sizeof(ctypes.c_uint8) + ctypes.sizeof(ctypes.c_uint8)  # 40 bytes
+
+    @classmethod
+    def frame_size(cls) -> int:
+        """Return the fixed byte size of one binary frame (40 bytes)."""
+        return cls.FRAME_SIZE
+
+
+# Verify compile-time size matches expected 40-byte layout
+assert BinaryFrameLayout.FRAME_SIZE == 40, (
+    f"BinaryFrameLayout size mismatch: expected 40, got {BinaryFrameLayout.FRAME_SIZE}"
+)
+
+
+def decode_binary_packet(data: bytes) -> TelemetryTuple:
+    """Decode a single 40-byte binary frame into a :data:`TelemetryTuple`.
+
+    This function uses :class:`BinaryFrameLayout` (a ``ctypes.Structure``)
+    to map the raw bytes directly onto typed C fields, avoiding any dynamic
+    dictionary construction or per-field attribute lookups.
+
+    Parameters
+    ----------
+    data:
+        Exactly 40 bytes of packed binary data in the TelemetryFrame layout.
+
+    Returns
+    -------
+    TelemetryTuple
+        ``(asset_id, price, timestamp, sequence, flags)`` where *asset_id*
+        is a decoded uppercase string, *price* is a float (unscaled from
+        fixed-point 10⁷), and *timestamp*, *sequence*, *flags* are integers.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` is shorter than 40 bytes.
+    """
+    if len(data) < BinaryFrameLayout.FRAME_SIZE:
+        raise ValueError(
+            f"Binary packet too short: expected {BinaryFrameLayout.FRAME_SIZE} bytes, "
+            f"got {len(data)}"
+        )
+
+    buf = BinaryFrameLayout.from_buffer_copy(data[: BinaryFrameLayout.FRAME_SIZE])
+
+    asset = buf.asset_id.rstrip(b"\x00").decode("ascii", errors="replace").strip().upper()
+    if not asset:
+        raise ValueError("decoded asset identifier is empty")
+
+    # Unscale price from fixed-point 10⁷ back to float
+    price = buf.price / 10_000_000.0
+
+    return (
+        asset,
+        price,
+        buf.timestamp,
+        buf.sequence,
+        buf.flags,
+    )
+
+
+def decode_binary_batch(data: bytes) -> TelemetrySegment:
+    """Decode a concatenated bundle of 40-byte binary frames.
+
+    The input is expected to be a contiguous byte string of one or more
+    40-byte frames (as produced by ``TelemetryEncoder.pack_bundle()`` in
+    :mod:`src.serialization.encoders`).  Trailing bytes that do not form a
+    complete frame are silently discarded.
+
+    Parameters
+    ----------
+    data:
+        Raw bytes containing one or more concatenated 40-byte frames.
+
+    Returns
+    -------
+    TelemetrySegment
+        An immutable tuple of :data:`TelemetryTuple` records.
+    """
+    size = BinaryFrameLayout.FRAME_SIZE
+    count = len(data) // size
+    frames: list[TelemetryTuple] = [None] * count  # type: ignore[list-item]
+
+    for i in range(count):
+        offset = i * size
+        frames[i] = decode_binary_packet(data[offset : offset + size])
+
+    return tuple(frames)
+
 
 # ---------------------------------------------------------------------------
 # Field-name look-up tables (ordered by likelihood of appearance)
@@ -226,7 +396,7 @@ def _flatten_frame(mapping: Mapping[str, object]) -> TelemetryTuple:
     )
 
 
-def _as_sequence(value: object) -> SequencePayload | None:
+def _as_sequence(value: object) -> Union[SequencePayload, None]:
     if isinstance(value, _NON_STRING_SEQUENCES):
         return cast(SequencePayload, value)
     return None
@@ -427,7 +597,7 @@ def _parse_frame_dict(
     frame: dict[str, object],
     *,
     drop_invalid: bool,
-) -> TelemetryTuple | None:
+) -> Union[TelemetryTuple, None]:
     """Attempt to parse *frame* as a ticker frame dict.
 
     Returns a :data:`TelemetryTuple` on success, or ``None`` when the mapping
@@ -446,7 +616,7 @@ def _parse_frame_dict(
 
 
 def iter_price_events_from_stream(
-    source: BinaryIO | bytes,
+    source: Union[BinaryIO, bytes],
     *,
     drop_invalid: bool = False,
 ) -> Iterator[TelemetryTuple]:
@@ -549,7 +719,7 @@ def iter_price_events_from_stream(
 
 
 def build_segments_from_stream(
-    source: BinaryIO | bytes,
+    source: Union[BinaryIO, bytes],
     *,
     segment_size: int = DEFAULT_SEGMENT_SIZE,
     drop_invalid: bool = False,
@@ -594,6 +764,7 @@ def build_segments_from_stream(
 
 
 __all__ = [
+    "BinaryFrameLayout",
     "DEFAULT_SEGMENT_SIZE",
     "SIMDJSON_AVAILABLE",
     "TelemetrySegment",
@@ -601,9 +772,9 @@ __all__ = [
     "TelemetryTuple",
     "build_segments_from_stream",
     "build_telemetry_segments",
-    "build_telemetry_segments_from_raw",
+    "decode_binary_batch",
+    "decode_binary_packet",
     "flatten_telemetry_frames",
-    "flatten_telemetry_frames_from_raw",
     "iter_flat_ticker_tuples",
     "parse_raw_pack",
     "simd_utf8_decode",

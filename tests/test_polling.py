@@ -156,3 +156,40 @@ def test_poll_price_checks_exits_after_current_interval_when_stopped() -> None:
         assert cycles == 1
 
     asyncio.run(exercise())
+
+
+def test_multiplexed_heartbeats() -> None:
+    """Issue #637 — registry/multiplexed iteration over active client sockets."""
+    from network.polling import (
+        HeartbeatClient,
+        MultiplexedHeartbeatLoop,
+        get_heartbeat_loop,
+    )
+
+    sent: List[str] = []
+
+    async def fake_send(payload: bytes) -> None:
+        sent.append(payload.decode())
+
+    async def exercise() -> None:
+        loop = MultiplexedHeartbeatLoop(interval_s=0.01)
+        try:
+            for i in range(5):
+                client = HeartbeatClient(name=f"c{i}", send=fake_send)
+                loop.register(client)
+
+            async def run_loop() -> None:
+                await loop.run()
+
+            task = asyncio.create_task(run_loop())
+            await asyncio.sleep(0.05)
+            await loop.stop()
+            await task
+        finally:
+            loop = get_heartbeat_loop()
+            loop._clients.clear()
+
+    asyncio.run(exercise())
+
+    assert len(sent) >= 1
+    assert all(p == '{"type":"ping"}' for p in sent)
