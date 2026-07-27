@@ -35,6 +35,7 @@ import asyncio
 import logging
 import os
 import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -178,7 +179,8 @@ class MultiInterfaceClient:
         """Create an httpx client bound to the primary interface."""
         kwargs = dict(self._session_kwargs)
         if self.config.primary.bind_ip:
-            transport = AsyncHTTPTransport(
+            # Use our _KeepAliveTransport even for bound interfaces to keep TCP keep-alive and buffer tuning
+            transport = _KeepAliveTransport(
                 local_address=self.config.primary.bind_ip,
             )
             kwargs.setdefault("transport", transport)
@@ -188,7 +190,8 @@ class MultiInterfaceClient:
         """Create an httpx client bound to the secondary interface."""
         kwargs = dict(self._session_kwargs)
         if self.config.secondary.bind_ip:
-            transport = AsyncHTTPTransport(
+            # Use our _KeepAliveTransport even for bound interfaces to keep TCP keep-alive and buffer tuning
+            transport = _KeepAliveTransport(
                 local_address=self.config.secondary.bind_ip,
             )
             kwargs.setdefault("transport", transport)
@@ -595,6 +598,12 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     client will negotiate HTTP/2 frame multiplexing when the server supports it,
     falling back to HTTP/1.1 gracefully when HTTP/2 is not available.
 
+    TLS session resumption (session tickets) is enabled to allow abbreviated
+    handshakes on reconnection, reducing CPU usage and latency.
+
+    Uses the custom ``_KeepAliveTransport`` which applies TCP keep-alive and
+    dynamic buffer tuning to all new sockets.
+
     Parameters
     ----------
     **kwargs:
@@ -610,11 +619,30 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     kwargs["limits"] = _LIMITS
     kwargs.setdefault("http2", True)
     
+    # Create shared SSL context with TLS session resumption enabled
+    ssl_context = ssl.create_default_context()
+    # Enable client-side TLS session caching to support session resumption
+    ssl_context.set_session_cache_mode(ssl.SESS_CACHE_CLIENT)
+    # Ensure session tickets are enabled (don't set OP_NO_TICKET which disables them)
+    ssl_context.options &= ~ssl.OP_NO_TICKET
+    
+    # If a transport is already provided (e.g., with local_address set for interface binding),
+    # update its SSL context to use our TLS resumption-enabled context
+    if "transport" in kwargs:
+        transport = kwargs["transport"]
+        if hasattr(transport, "_ssl_context"):
+            transport._ssl_context = ssl_context
+    else:
+        # Use our custom keep-alive transport by default, with our SSL context
+        kwargs["transport"] = _KeepAliveTransport(ssl_context=ssl_context)
+    
     # Explicitly configure ALPN for HTTP/2 protocol negotiation
     # httpx handles ALPN automatically when http2=True, but we ensure
     # the verification is logged for monitoring purposes
     if kwargs.get("http2"):
         logger.debug("[HttpClient] HTTP/2 with ALPN protocol negotiation enabled")
+    
+    logger.debug("[HttpClient] TLS session resumption enabled for reduced handshake latency")
     
     return httpx.AsyncClient(**kwargs)
 
