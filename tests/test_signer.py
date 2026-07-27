@@ -29,6 +29,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import subprocess
 import sys
 import unittest.mock as mock
 
@@ -39,13 +40,19 @@ import pytest
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from crypto.signer import (
+from crypto.signer import (  # noqa: E402
     SecureKeyHandle,
     SecureSessionCredentials,
+    SecureVariableWrapper,
     SigningError,
+    MemorySecurityError,
+    GuardPageError,
+    IsolatedMemoryHeap,
     _zero_wipe,
     _configure_openssl_hardware_acceleration,
-)  # noqa: E402
+    _get_page_size,
+    _round_up_to_page,
+)
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -657,3 +664,248 @@ class TestHardwareAccelerationFlags:
         assert "OPENSSL_ia32cap" in os.environ, (
             "OPENSSL_ia32cap environment variable should be set for hardware acceleration"
         )
+
+
+# ---------------------------------------------------------------------------
+# test_protected_memory_heaps (Issue #660: Secure Memory Allocation Pools)
+# ---------------------------------------------------------------------------
+
+
+def _protmem_payload_32() -> bytes:
+    return bytes(range(32))
+
+
+def _run_python_subprocess(script, timeout=20):
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _protmem_src_path() -> str:
+    return os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "src")
+    )
+
+
+class TestProtectedMemoryHeaps:
+    """IsolatedMemoryHeap layout and lifecycle (issue #660)."""
+
+    def test_protected_memory_heaps_allocates_data_view(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        try:
+            view = heap.data_view
+            assert view is not None
+            assert len(view) >= len(_protmem_payload_32())
+            assert len(view) % heap.page_size == 0
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_layout_has_guard_pages(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        try:
+            assert heap.has_guard_pages is True
+            page = heap.page_size
+            assert (
+                heap.right_guard_address
+                == heap.data_address + heap.data_size
+            )
+            assert heap.left_guard_address + page == heap.data_address
+            assert heap.requested_size == len(_protmem_payload_32())
+            assert heap.data_size >= len(_protmem_payload_32())
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_pages_align_to_system_page_size(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        try:
+            page = heap.page_size
+            assert page > 0
+            assert heap.data_size % page == 0
+            assert heap.left_guard_address % page == 0
+            assert heap.data_address % page == 0
+            assert heap.right_guard_address % page == 0
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_starts_with_payload(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        try:
+            view = heap.data_view
+            assert (
+                bytes(view[: len(_protmem_payload_32())])
+                == _protmem_payload_32()
+            )
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_data_is_writable(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        try:
+            view = heap.data_view
+            view[0] = 0xAA
+            assert heap.data_view[0] == 0xAA
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_wipe_zeroes_data_region(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        try:
+            heap.wipe()
+            view = heap.data_view
+            assert all(b == 0 for b in view), (
+                "wipe() must zero the data region."
+            )
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_close_disables_data_view(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        heap.close()
+        assert heap.is_closed is True
+        with pytest.raises(GuardPageError):
+            _ = heap.data_view
+
+    def test_protected_memory_heaps_close_is_idempotent(self):
+        heap = IsolatedMemoryHeap(_protmem_payload_32())
+        heap.close()
+        heap.close()
+        assert heap.is_closed is True
+
+    def test_protected_memory_heaps_context_manager_releases(self):
+        with IsolatedMemoryHeap(_protmem_payload_32()) as heap:
+            assert heap.is_closed is False
+            assert heap.data_view is not None
+        assert heap.is_closed is True
+
+    def test_protected_memory_heaps_exit_on_exception_still_releases(self):
+        heap_cm = IsolatedMemoryHeap(_protmem_payload_32())
+        with pytest.raises(RuntimeError):
+            with heap_cm as heap:
+                raise RuntimeError("simulated failure")
+        assert heap_cm.is_closed is True
+
+    def test_protected_memory_heaps_empty_payload_allocates_full_page(self):
+        heap = IsolatedMemoryHeap(b"")
+        try:
+            assert heap.requested_size == 0
+            assert heap.data_size >= heap.page_size
+            assert heap.has_guard_pages is True
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_tiny_payload_rounds_up(self):
+        heap = IsolatedMemoryHeap(b"\x42")
+        try:
+            assert heap.requested_size == 1
+            assert heap.data_size >= heap.page_size
+            assert heap.data_size % heap.page_size == 0
+        finally:
+            heap.close()
+
+    def test_protected_memory_heaps_rejects_non_bytes(self):
+        with pytest.raises(TypeError):
+            IsolatedMemoryHeap("not bytes")  # type: ignore[arg-type]
+
+
+class TestProtectedMemoryHeapsGuardCrash:
+    """Touching a guard page must fault the process (SIGSEGV/SIGBUS)."""
+
+    def test_protected_memory_heaps_left_guard_causes_fatal_signal(self):
+        if os.name != "posix":
+            pytest.skip("POSIX-only: signal-based exit semantics.")
+        proc = _run_python_subprocess(self._scratch("left"))
+        self._assert_fault(proc, "left guard page")
+
+    def test_protected_memory_heaps_right_guard_causes_fatal_signal(self):
+        if os.name != "posix":
+            pytest.skip("POSIX-only: signal-based exit semantics.")
+        proc = _run_python_subprocess(self._scratch("right"))
+        self._assert_fault(proc, "right guard page")
+
+    def _assert_fault(self, proc, label):
+        assert proc.returncode is not None and proc.returncode < 0, (
+            "Touching %s must fault; child exited normally with rc=%d."
+            "STDOUT=%r STDERR=%r"
+            % (label, proc.returncode, proc.stdout, proc.stderr)
+        )
+        signal_num = -proc.returncode
+        assert signal_num in (11, 7), (
+            "Faulting %s should produce SIGSEGV(11) or SIGBUS(7); got %d."
+            "STDOUT=%r STDERR=%r"
+            % (label, signal_num, proc.stdout, proc.stderr)
+        )
+
+    def _scratch(self, side):
+        addr_attr = (
+            "left_guard_address" if side == "left"
+            else "right_guard_address"
+        )
+        return (
+            "import sys, ctypes\n"
+            "sys.path.insert(0, %r)\n"
+            "from crypto.signer import IsolatedMemoryHeap\n"
+            "h = IsolatedMemoryHeap(bytes(range(32)))\n"
+            "ctypes.memset(ctypes.c_void_p(h.%s), 0xAA, 1)\n"
+            "h.close()\n"
+            "sys.exit(0)\n"
+        ) % (_protmem_src_path(), addr_attr)
+
+
+class TestProtectedMemoryHeapsDataRegionSafe:
+    """Sanity: working inside the data region never crashes the process."""
+
+    def test_protected_memory_heaps_data_access_does_not_crash(self):
+        if os.name != "posix":
+            pytest.skip("POSIX sanity check.")
+        script = (
+            "import sys\n"
+            "sys.path.insert(0, %r)\n"
+            "from crypto.signer import IsolatedMemoryHeap\n"
+            "h = IsolatedMemoryHeap(bytes(range(32)))\n"
+            "v = h.data_view\n"
+            "v[0] = 0xAA\n"
+            "assert v[0] == 0xAA\n"
+            "h.wipe()\n"
+            "h.close()\n"
+        ) % _protmem_src_path()
+        proc = _run_python_subprocess(script)
+        assert proc.returncode == 0, (
+            "Data-region access must not crash. rc=%d STDOUT=%r STDERR=%r"
+            % (proc.returncode, proc.stdout, proc.stderr)
+        )
+
+
+class TestProtectedMemoryHeapsHelpers:
+    """Direct tests for the page-size helpers."""
+
+    def test_protected_memory_heaps_get_page_size_positive(self):
+        assert _get_page_size() > 0
+        assert isinstance(_get_page_size(), int)
+
+    def test_protected_memory_heaps_round_up_to_page(self):
+        page = 4096
+        assert _round_up_to_page(0, page) == page
+        assert _round_up_to_page(1, page) == page
+        assert _round_up_to_page(page, page) == page
+        assert _round_up_to_page(page + 1, page) == 2 * page
+        with pytest.raises(ValueError):
+            _round_up_to_page(10, 0)
+
+
+class TestSecureKeyHandleUsesIsolatedHeap:
+    """End-to-end: SecureKeyHandle wires through IsolatedMemoryHeap."""
+
+    def test_secure_key_handle_exposes_isolated_heap_with_guard_pages(self):
+        pytest.importorskip("nacl")
+        with SecureKeyHandle(_DUMMY_KEY, key_id="isolated_test") as handle:
+            heap = getattr(handle, "_heap", None)
+            assert heap is not None, (
+                "SecureKeyHandle must allocate an IsolatedMemoryHeap."
+            )
+            assert heap.has_guard_pages is True, (
+                "SecureKeyHandle's heap must have PROT_NONE guard pages."
+            )
+            assert heap.requested_size == len(_DUMMY_KEY)
+        # After the scope, the heap was torn down.
+        assert getattr(handle, "_heap").is_closed is True
