@@ -39,7 +39,13 @@ import pytest
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from crypto.signer import SecureKeyHandle, SecureSessionCredentials, SigningError, _zero_wipe  # noqa: E402
+from crypto.signer import (
+    SecureKeyHandle,
+    SecureSessionCredentials,
+    SigningError,
+    _zero_wipe,
+    _configure_openssl_hardware_acceleration,
+)  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -629,3 +635,25 @@ class TestSecureSessionCredentialsLogging:
             assert record.levelno <= logging.DEBUG, (
                 f"Unexpected log level {record.levelname}: {record.getMessage()}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Hardware Acceleration Configuration
+# ---------------------------------------------------------------------------
+
+
+class TestHardwareAccelerationFlags:
+    def test_openssl_hardware_acceleration_configured(self):
+        """Verify that OpenSSL hardware acceleration configuration runs without error."""
+        # The function should not raise any exceptions
+        _configure_openssl_hardware_acceleration()
+
+    def test_openssl_environment_variable_set(self, caplog):
+        """Verify that OPENSSL_ia32cap environment variable is configured."""
+        with caplog.at_level(logging.DEBUG, logger="crypto.signer"):
+            _configure_openssl_hardware_acceleration()
+        
+        # Check that the environment variable was set
+        assert "OPENSSL_ia32cap" in os.environ, (
+            "OPENSSL_ia32cap environment variable should be set for hardware acceleration"
+        )

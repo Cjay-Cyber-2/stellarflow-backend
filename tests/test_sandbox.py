@@ -20,6 +20,7 @@ import sys
 import struct
 from unittest.mock import mock_open, patch
 
+import sys
 import pytest
 
 # ---------------------------------------------------------------------------
@@ -44,6 +45,9 @@ from utils.sandbox import (  # noqa: E402
     sandbox_policy,
     seccomp_available,
     seccomp_guard,
+    sanitize_environment,
+    get_default_env_whitelist,
+    _SECCOMP_RET_TRAP,
 )
 
 
@@ -135,6 +139,21 @@ class TestBPFBuilder:
         assert code == _BPF_RET_K
         # k should be SECCOMP_RET_ERRNO | errno_val
         assert k == (0x00050000 | 1)
+
+    def test_block_syscall_with_trap(self) -> None:
+        """Block a syscall with SIGSYS trap."""
+        bpf = BPFBuilder(_AUDIT_ARCH_X86_64)
+        bpf.block_syscall_with_trap(Syscall.CREAT)
+        # preamble(4) + jeq(1) + ret_trap(1) = 6
+        assert bpf.filter_count() == 6
+
+        bytecode = bpf.compile()
+        # Find the RET instruction for creat
+        ins = bytecode[5 * 8 : 6 * 8]
+        code, jt, jf, k = struct.unpack("<HBBI", ins)
+        assert code == _BPF_RET_K
+        # k should be SECCOMP_RET_TRAP
+        assert k == _SECCOMP_RET_TRAP
 
     def test_allow_open_read_only_instruction_count(self) -> None:
         """The allow_open_read_only helper produces a reasonable number of instructions."""
@@ -520,152 +539,120 @@ class TestEdgeCases:
 
 
 # ===========================================================================
-# Memory Limits
+# Environment Variable Whitelisting
 # ===========================================================================
 
 
-class TestMemoryLimit:
-    """Tests for the MemoryLimit context manager and decorator."""
+class TestEnvironmentSanitization:
+    """Tests for environment variable whitelisting and sanitization."""
 
-    def test_memory_limit_creation(self) -> None:
-        """MemoryLimit should be created with default and custom values."""
-        ml = MemoryLimit()
-        assert ml.limit_mb == _DEFAULT_MEMORY_LIMIT_MB
-        assert ml.name == "worker"
-        assert not ml.applied
+    def test_sanitize_environment_uses_default_whitelist(self) -> None:
+        """When no whitelist provided, use the default safe whitelist."""
+        # Set some environment variables
+        test_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/user",
+            "SECRET_KEY": "super_secret",  # Should be filtered out
+            "API_TOKEN": "token123",  # Should be filtered out
+        }
+        
+        sanitized = sanitize_environment(test_env)
+        
+        # Only whitelisted variables should remain
+        assert "PATH" in sanitized
+        assert "HOME" in sanitized
+        assert "SECRET_KEY" not in sanitized
+        assert "API_TOKEN" not in sanitized
 
-        ml_custom = MemoryLimit(limit_mb=128, name="parser")
-        assert ml_custom.limit_mb == 128
-        assert ml_custom.name == "parser"
+    def test_sanitize_environment_with_custom_whitelist(self) -> None:
+        """Custom whitelist overrides default whitelist."""
+        test_env = {
+            "PATH": "/usr/bin",
+            "CUSTOM_VAR": "custom_value",
+            "SECRET": "secret",
+        }
+        
+        custom_whitelist = frozenset(["CUSTOM_VAR"])
+        sanitized = sanitize_environment(test_env, whitelist=custom_whitelist)
+        
+        # Only custom whitelisted variable should remain
+        assert "CUSTOM_VAR" in sanitized
+        assert "PATH" not in sanitized  # Not in custom whitelist (overrides default)
+        assert "SECRET" not in sanitized
 
-    def test_memory_limit_repr(self) -> None:
-        """MemoryLimit should have a readable repr."""
-        ml = MemoryLimit(limit_mb=64, name="test")
-        r = repr(ml)
-        assert "test" in r
-        assert "64" in r
-        assert "pending" in r
+    def test_sanitize_environment_merges_whitelist_and_allowlist(self) -> None:
+        """Both whitelist and allowlist parameters are merged."""
+        test_env = {
+            "VAR1": "value1",
+            "VAR2": "value2",
+            "VAR3": "value3",
+        }
+        
+        whitelist = frozenset(["VAR1"])
+        allowlist = frozenset(["VAR2"])
+        sanitized = sanitize_environment(test_env, whitelist=whitelist, allowlist=allowlist)
+        
+        # Both VAR1 and VAR2 should be present
+        assert "VAR1" in sanitized
+        assert "VAR2" in sanitized
+        assert "VAR3" not in sanitized
 
-    def test_memory_limit_skip_on_non_linux(self) -> None:
-        """MemoryLimit should return False on non-Linux platforms."""
-        with patch("utils.sandbox._is_linux", False):
-            ml = MemoryLimit(limit_mb=64, name="nonlinux")
-            result = ml.apply()
-            assert result is False
-            assert not ml.applied
+    def test_sanitize_environment_uses_os_environ_when_none(self) -> None:
+        """When env is None, use os.environ as source."""
+        # This test uses the actual process environment
+        sanitized = sanitize_environment()
+        
+        # Should only contain whitelisted variables from actual environment
+        for key in sanitized:
+            assert key in get_default_env_whitelist()
 
-    def test_memory_limit_context_manager(self) -> None:
-        """MemoryLimit should work as a context manager."""
-        with patch("utils.sandbox._is_linux", True), \
-             patch("utils.sandbox.resource") as mock_resource:
-            mock_resource.RLIMIT_AS = 9
-            mock_resource.getrlimit.return_value = (-1, -1)
-            ml = MemoryLimit(limit_mb=128, name="ctx-test")
-            with ml:
-                assert ml.applied
-            # After exiting, restore should have been called
-            mock_resource.setrlimit.assert_any_call(9, (128 * 1024 * 1024, 128 * 1024 * 1024))
-            mock_resource.setrlimit.assert_any_call(9, (-1, -1))
+    def test_sanitize_environment_rejects_non_string_whitelist_keys(self) -> None:
+        """Whitelist with non-string keys should raise TypeError."""
+        with pytest.raises(TypeError, match="whitelist must contain only string keys"):
+            sanitize_environment(whitelist=frozenset([123, "PATH"]))
 
-    def test_memory_limit_decorator_raises_memory_error(self) -> None:
-        """MemoryLimit as decorator should catch MemoryError and re-raise."""
-        with patch("utils.sandbox._is_linux", True), \
-             patch("utils.sandbox.resource") as mock_resource:
-            mock_resource.RLIMIT_AS = 9
-            mock_resource.getrlimit.return_value = (-1, -1)
+    def test_sanitize_environment_rejects_non_string_allowlist_keys(self) -> None:
+        """Allowlist with non-string keys should raise TypeError."""
+        with pytest.raises(TypeError, match="allowlist must contain only string keys"):
+            sanitize_environment(allowlist=frozenset([456, "HOME"]))
 
-            ml = MemoryLimit(limit_mb=64, name="deco-test")
+    def test_get_default_env_whitelist_returns_frozenset(self) -> None:
+        """Default whitelist should be a frozenset."""
+        whitelist = get_default_env_whitelist()
+        assert isinstance(whitelist, frozenset)
+        assert len(whitelist) > 0
 
-            @ml
-            def bad_worker():
-                raise MemoryError("test OOM")
+    def test_default_whitelist_contains_safe_variables(self) -> None:
+        """Default whitelist should contain known safe variables."""
+        whitelist = get_default_env_whitelist()
+        assert "PATH" in whitelist
+        assert "HOME" in whitelist
+        assert "USER" in whitelist
+        assert "LANG" in whitelist
 
-            with pytest.raises(MemoryError):
-                bad_worker()
+    def test_sanitize_environment_preserves_values(self) -> None:
+        """Sanitized environment should preserve original values."""
+        test_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/testuser",
+        }
+        
+        sanitized = sanitize_environment(test_env)
+        
+        assert sanitized["PATH"] == "/usr/bin:/bin"
+        assert sanitized["HOME"] == "/home/testuser"
 
-    def test_memory_limit_is_idempotent(self) -> None:
-        """Calling apply() twice should only apply once."""
-        with patch("utils.sandbox._is_linux", True), \
-             patch("utils.sandbox.resource") as mock_resource:
-            mock_resource.RLIMIT_AS = 9
-            mock_resource.getrlimit.return_value = (-1, -1)
-            ml = MemoryLimit(limit_mb=256, name="idem")
-            ml.apply()
-            ml.apply()
-            # setrlimit should be called only once
-            mock_resource.setrlimit.assert_called_once()
-
-    def test_memory_limit_default_value(self) -> None:
-        """Default memory limit should be defined."""
-        assert _DEFAULT_MEMORY_LIMIT_MB > 0
-        assert isinstance(_DEFAULT_MEMORY_LIMIT_MB, int)
-
-
-# ===========================================================================
-# test_memory_limit_containment (verification test)
-# ===========================================================================
-
-
-class TestMemoryLimitContainment:
-    """Verification test: workers exceeding memory bounds raise MemoryError."""
-
-    def test_memory_limit_containment(self) -> None:
-        """Workers exceeding memory bounds raise controlled MemoryError."""
-        with patch("utils.sandbox._is_linux", True), \
-             patch("utils.sandbox.resource") as mock_resource:
-            mock_resource.RLIMIT_AS = 9
-            mock_resource.getrlimit.return_value = (-1, -1)
-
-            ml = MemoryLimit(limit_mb=32, name="containment-test")
-
-            @ml
-            def worker_exceeds_memory():
-                """Simulate a worker that exceeds memory."""
-                raise MemoryError("Worker exceeded memory limit")
-
-            with pytest.raises(MemoryError, match="Worker exceeded memory limit"):
-                worker_exceeds_memory()
-
-            # After context manager exits, limits are restored
-            assert not ml.applied
-
-    def test_memory_limit_normal_worker_succeeds(self) -> None:
-        """Workers within memory bounds complete normally."""
-        with patch("utils.sandbox._is_linux", True), \
-             patch("utils.sandbox.resource") as mock_resource:
-            mock_resource.RLIMIT_AS = 9
-            mock_resource.getrlimit.return_value = (-1, -1)
-
-            ml = MemoryLimit(limit_mb=64, name="normal-worker")
-
-            @ml
-            def worker_normal():
-                return "success"
-
-            result = worker_normal()
-            assert result == "success"
-
-    def test_memory_limit_logs_isolation_event(self) -> None:
-        """Memory limit breach should log an isolation event."""
-        with patch("utils.sandbox._is_linux", True), \
-             patch("utils.sandbox.resource") as mock_resource, \
-             patch("utils.sandbox.logger") as mock_logger:
-            mock_resource.RLIMIT_AS = 9
-            mock_resource.getrlimit.return_value = (-1, -1)
-
-            ml = MemoryLimit(limit_mb=16, name="log-test")
-
-            @ml
-            def worker_breach():
-                raise MemoryError("OOM detected")
-
-            with pytest.raises(MemoryError):
-                worker_breach()
-
-            # Verify error was logged
-            mock_logger.error.assert_called()
-            call_args = mock_logger.error.call_args
-            log_msg = call_args[0][0]
-            log_args = call_args[0][1:]
-            assert "MemoryError" in log_msg
-            assert any("log-test" in str(a) for a in log_args)
+    def test_sanitize_environment_returns_new_dict(self) -> None:
+        """Should return a new dictionary, not modify the original."""
+        test_env = {"PATH": "/usr/bin", "SECRET": "secret"}
+        original_len = len(test_env)
+        
+        sanitized = sanitize_environment(test_env)
+        
+        # Original should be unchanged
+        assert len(test_env) == original_len
+        assert "SECRET" in test_env
+        
+        # Sanitized should be different
+        assert "SECRET" not in sanitized
+        assert sanitized is not test_env

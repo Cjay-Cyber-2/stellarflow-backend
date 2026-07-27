@@ -16,6 +16,7 @@ from analytics.math_scaler import (
     pack_rate,
     scale_down,
     scale_up,
+    sqrt_scaled,
 )
 
 
@@ -91,6 +92,11 @@ def test_cross_feed_multiply_identity():
     # rate_a=1, rate_b=1 → result should equal SCALE_7
     assert cross_feed_multiply(1, 1) == SCALE_7
 
+def test_cross_feed_multiply_uses_integer_flooring_for_string_inputs():
+    result = cross_feed_multiply("1.00000001", "1.00000001")
+    expected = scale_up("1.00000001") * scale_up("1.00000001") // (SCALE_14 // SCALE_7)
+    assert result == expected
+
 
 # ---------------------------------------------------------------------------
 # floor_divide
@@ -117,3 +123,27 @@ def test_pack_rate_equivalence():
 def test_pack_rate_deterministic():
     # Float and string representations must produce identical integers
     assert pack_rate(0.00065) == pack_rate("0.00065")
+
+
+# ---------------------------------------------------------------------------
+# sqrt_scaled (integer-only Newton-Raphson)
+# ---------------------------------------------------------------------------
+
+
+def test_integer_sqrt():
+    """Verify integer-only Newton-Raphson square root returns exact scaled integer results."""
+    # Test perfect squares: sqrt(4) = 2, scaled -> 2 * SCALE_7
+    assert sqrt_scaled(scale_up(4)) == scale_up(2)
+    assert sqrt_scaled(scale_up(9)) == scale_up(3)
+    assert sqrt_scaled(scale_up(16)) == scale_up(4)
+    
+    # Test non-perfect squares (floor behavior)
+    # sqrt_scaled(scale_up(2)) = floor(sqrt(2)) * SCALE_7 = 1 * SCALE_7
+    result = sqrt_scaled(scale_up(2))
+    assert result == scale_up(1)
+    
+    # Test zero
+    assert sqrt_scaled(0) == 0
+    
+    # Test with custom scale: floor(sqrt(100/10)) * 10 = floor(sqrt(10)) * 10 = 3 * 10 = 30
+    assert sqrt_scaled(100, scale=10) == 30

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from database.writer import PartitionedTelemetryWriter
+from database.writer import PartitionedTelemetryWriter, DynamicQueryTimeout
 
 
 # ---------------------------------------------------------------------------
@@ -367,3 +367,59 @@ class TestPartitionRegression:
         partitions = writer.known_partitions
         assert "telemetry_2024_W01" in partitions
         assert "telemetry_2024_W02" in partitions
+
+
+# ---------------------------------------------------------------------------
+# Dynamic query timeout tests (Issue #664)
+# ---------------------------------------------------------------------------
+
+
+class TestDynamicQueryTimeouts:
+    """Test suite for dynamic timeout escalation based on query complexity."""
+
+    def test_dynamic_query_timeouts(self):
+        """Primary entry-point: timeout scales with query complexity.
+
+        Named to match the Issue #664 verification filter:
+        ``pytest -k test_dynamic_query_timeouts``.
+        """
+        dqt = DynamicQueryTimeout()
+
+        # 1. Timeout for a trivial single-table query
+        base = dqt.calculate(row_count=0, table_count=1, is_aggregation=False)
+        expected_base = dqt.base_timeout + 1 * 5.0  # base + per_table_ms for 1 table
+        assert base == expected_base, f"Expected {expected_base}, got {base}"
+
+        # 2. More rows → longer timeout
+        small = dqt.calculate(row_count=100, table_count=1, is_aggregation=False)
+        large = dqt.calculate(row_count=10_000, table_count=1, is_aggregation=False)
+        assert small < large, "Timeout must increase with row count"
+
+        # 3. More tables → longer timeout
+        multi_table = dqt.calculate(row_count=100, table_count=5, is_aggregation=False)
+        assert multi_table > small, "Timeout must increase with table count"
+
+        # 4. Aggregation queries get a longer timeout
+        agg = dqt.calculate(row_count=10_000, table_count=3, is_aggregation=True)
+        non_agg = dqt.calculate(row_count=10_000, table_count=3, is_aggregation=False)
+        assert agg > non_agg, "Aggregation queries must receive escalated timeout"
+
+        # 5. Timeout is clamped to max
+        huge = dqt.calculate(row_count=10_000_000, table_count=100, is_aggregation=True)
+        assert huge == dqt.max_timeout, "Timeout must not exceed max_timeout"
+
+        # 6. Timeout never drops below min
+        tiny_dqt = DynamicQueryTimeout(base_timeout=1.0, min_timeout=5.0)
+        tiny = tiny_dqt.calculate(row_count=0, table_count=1, is_aggregation=False)
+        assert tiny >= tiny_dqt.min_timeout, "Timeout must never drop below min_timeout"
+
+        # 7. Custom parameters are honoured
+        custom = DynamicQueryTimeout(
+            base_timeout=10.0,
+            per_row_ms=0.5,
+            per_table_ms=10.0,
+            aggregation_multiplier=3.0,
+        )
+        custom_timeout = custom.calculate(row_count=100, table_count=2, is_aggregation=True)
+        expected = (10.0 + 100 * 0.5 + 2 * 10.0) * 3.0  # = 100.0
+        assert custom_timeout == expected, f"Expected {expected}, got {custom_timeout}"

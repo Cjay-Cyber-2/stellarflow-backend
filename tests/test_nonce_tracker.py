@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
@@ -926,4 +928,32 @@ def test_gap_report_stale_equals_current_is_not_a_gap() -> None:
         current_nonce=105,
     )
     assert not report.has_gaps
+
+
+# ===========================================================================
+# Transaction latency tracking  —  Issue #671
+# ===========================================================================
+
+
+def test_transaction_latency_tracking(caplog: pytest.LogCaptureFixture) -> None:
+    """Latency is computed and logged on both confirm and fail paths."""
+    tracker = NonceTracker.create_standalone()
+
+    caplog.set_level(logging.INFO)
+
+    # Confirm path
+    tracker.get_next_nonce("GA", seed=100)
+    time.sleep(0.01)
+    tracker.confirm("GA", 100)
+
+    # Fail path
+    tracker.get_next_nonce("GA")
+    time.sleep(0.01)
+    tracker.fail("GA", 101)
+
+    # Both outcomes logged with latency
+    assert "Confirmed nonce 100" in caplog.text
+    assert "Failed nonce 101" in caplog.text
+    assert "latency=" in caplog.text
+    assert "latency=0.0ms" not in caplog.text
 

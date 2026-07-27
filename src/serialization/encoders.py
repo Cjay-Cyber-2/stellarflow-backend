@@ -247,7 +247,8 @@ def decode_asset_id(asset_bytes: bytes) -> str:
 # └──────────────────┴───────┴──────────────────────────────────────────────┘
 # Total: 10 × 8 = 80 bytes
 _RBM_FMT: str = ">QQqQQQQqqQ"
-_RBM_SIZE: int = struct.calcsize(_RBM_FMT)  # 80 bytes
+_RBM_STRUCT: struct.Struct = struct.Struct(_RBM_FMT)
+_RBM_SIZE: int = _RBM_STRUCT.size  # 80 bytes
 
 # BackpressureMetric layout (big-endian, no padding):
 # ┌──────────────────────┬───────┬──────────────────────────────────────────┐
@@ -262,7 +263,8 @@ _RBM_SIZE: int = struct.calcsize(_RBM_FMT)  # 80 bytes
 # └──────────────────────┴───────┴──────────────────────────────────────────┘
 # Total: 6 × 8 = 48 bytes
 _BPM_FMT: str = ">QQqQQq"
-_BPM_SIZE: int = struct.calcsize(_BPM_FMT)  # 48 bytes
+_BPM_STRUCT: struct.Struct = struct.Struct(_BPM_FMT)
+_BPM_SIZE: int = _BPM_STRUCT.size  # 48 bytes
 
 # IPCHeader layout — prepended to every channel write for framing:
 # ┌──────────────────┬───────┬──────────────────────────────────────────────┐
@@ -277,7 +279,8 @@ _BPM_SIZE: int = struct.calcsize(_BPM_FMT)  # 48 bytes
 # └──────────────────┴───────┴──────────────────────────────────────────────┘
 # Total: 2 + 1 + 1 + 4 + 8 + 8 = 24 bytes
 _HDR_FMT: str = ">HBBIQQ"
-_HDR_SIZE: int = struct.calcsize(_HDR_FMT)  # 24 bytes
+_HDR_STRUCT: struct.Struct = struct.Struct(_HDR_FMT)
+_HDR_SIZE: int = _HDR_STRUCT.size  # 24 bytes
 _HDR_MAGIC: int = 0xBEEF
 
 # Payload-type identifiers (uint8, stored in header.payload_type)
@@ -414,8 +417,7 @@ class StructPackEncoder:
         Returns:
             A 24-byte ``bytes`` object.
         """
-        return struct.pack(
-            _HDR_FMT,
+        return _HDR_STRUCT.pack(
             _HDR_MAGIC,
             payload_type,
             _WIRE_VERSION,
@@ -469,8 +471,7 @@ class StructPackEncoder:
         Returns:
             A 104-byte raw binary buffer (24-byte header + 80-byte payload).
         """
-        payload = struct.pack(
-            _RBM_FMT,
+        payload = _RBM_STRUCT.pack(
             metric.size,
             metric.capacity,
             metric.utilization,
@@ -493,8 +494,7 @@ class StructPackEncoder:
         Returns:
             A 72-byte raw binary buffer (24-byte header + 48-byte payload).
         """
-        payload = struct.pack(
-            _BPM_FMT,
+        payload = _BPM_STRUCT.pack(
             metric.queue_length,
             metric.max_capacity,
             metric.saturation,
@@ -541,8 +541,8 @@ class StructPackEncoder:
             ValueError:    If the magic marker is absent (corrupt frame).
             struct.error:  If ``data`` is shorter than ``_HDR_SIZE``.
         """
-        magic, payload_type, version, payload_len, sequence, timestamp_ms = struct.unpack(
-            _HDR_FMT, data[:_HDR_SIZE]
+        magic, payload_type, version, payload_len, sequence, timestamp_ms = _HDR_STRUCT.unpack(
+            data[:_HDR_SIZE]
         )
         if magic != _HDR_MAGIC:
             raise ValueError(
@@ -564,7 +564,7 @@ class StructPackEncoder:
         Raises:
             struct.error: If ``data`` is shorter than ``_RBM_SIZE``.
         """
-        fields = struct.unpack(_RBM_FMT, data[:_RBM_SIZE])
+        fields = _RBM_STRUCT.unpack(data[:_RBM_SIZE])
         return RingBufferMetric(*fields)
 
     @staticmethod
@@ -580,7 +580,7 @@ class StructPackEncoder:
         Raises:
             struct.error: If ``data`` is shorter than ``_BPM_SIZE``.
         """
-        fields = struct.unpack(_BPM_FMT, data[:_BPM_SIZE])
+        fields = _BPM_STRUCT.unpack(data[:_BPM_SIZE])
         return BackpressureMetric(*fields)
 
 
