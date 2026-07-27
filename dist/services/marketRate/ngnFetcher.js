@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout.js";
 import { filterOutliers, } from "./types";
 import { withRetry } from "../../utils/retryUtil.js";
@@ -52,12 +52,11 @@ export class NGNRateFetcher {
         const headers = this.vtpassHeaders();
         if (!headers)
             return null;
-        const response = await withRetry(() => axios.get(`${this.vtpassBase()}/service-variations`, {
+        const response = await withRetry(() => httpClient.get(`${this.vtpassBase()}/service-variations`, {
             params: { serviceID: serviceId },
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
             headers: {
                 ...headers,
-                "User-Agent": "StellarFlow-Oracle/1.0",
             },
         }), { maxRetries: 3, retryDelay: 1000 });
         if (response.data.response_description !== "000") {
@@ -90,11 +89,8 @@ export class NGNRateFetcher {
                     payload: vt.rawResponse,
                     receivedAt: new Date(),
                 });
-                const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
+                const coinGeckoResponse = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                     timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                    headers: {
-                        "User-Agent": "StellarFlow-Oracle/1.0",
-                    },
                 }), { maxRetries: 3, retryDelay: 1000 });
                 rawResponses.push({
                     provider: "CoinGecko",
@@ -122,11 +118,8 @@ export class NGNRateFetcher {
             });
         }
         try {
-            const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
+            const coinGeckoResponse = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                 timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                headers: {
-                    "User-Agent": "StellarFlow-Oracle/1.0",
-                },
             }), { maxRetries: 3, retryDelay: 1000 });
             rawResponses.push({
                 provider: "CoinGecko",
@@ -154,11 +147,8 @@ export class NGNRateFetcher {
             });
         }
         try {
-            const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
+            const coinGeckoResponse = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                 timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                headers: {
-                    "User-Agent": "StellarFlow-Oracle/1.0",
-                },
             }), { maxRetries: 3, retryDelay: 1000 });
             rawResponses.push({
                 provider: "CoinGecko",
@@ -170,11 +160,8 @@ export class NGNRateFetcher {
             if (stellarPrice &&
                 typeof stellarPrice.usd === "number" &&
                 stellarPrice.usd > 0) {
-                const fxResponse = await withRetry(() => axios.get(this.usdToNgnUrl, {
+                const fxResponse = await withRetry(() => httpClient.get(this.usdToNgnUrl, {
                     timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                    headers: {
-                        "User-Agent": "StellarFlow-Oracle/1.0",
-                    },
                 }), { maxRetries: 3, retryDelay: 1000 });
                 rawResponses.push({
                     provider: "ExchangeRate API",

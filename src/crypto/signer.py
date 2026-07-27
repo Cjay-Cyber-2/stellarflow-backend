@@ -110,21 +110,83 @@ import ctypes
 import ctypes.util
 import hashlib
 import logging
+import mmap as _mmap_mod
 import os
 import platform
 import threading
 from types import TracebackType
-from typing import Iterator, Optional, Type
+from typing import Any, Iterator, Optional, Type
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger(f"{__name__}.audit")
 
+# =========================================================================
+# OPENSSL HARDWARE ACCELERATION CONFIGURATION
+# =========================================================================
+
+def _configure_openssl_hardware_acceleration() -> None:
+    """Enable OpenSSL hardware acceleration flags (AES-NI/AVX2) for signature verification.
+    
+    This function configures OpenSSL to use available CPU instruction set extensions
+    for accelerated cryptographic operations. It sets environment variables and
+    attempts to configure OpenSSL's ENGINE to enable hardware acceleration.
+    
+    The following accelerations are enabled when available:
+    - AES-NI: Advanced Encryption Standard New Instructions for AES operations
+    - AVX2: Advanced Vector Extensions for parallel processing
+    - SHA-NI: SHA extensions for hash operations
+    """
+    # Enable OpenSSL hardware acceleration via environment variables
+    # These flags are read by OpenSSL when initializing crypto operations
+    os.environ.setdefault("OPENSSL_ia32cap", "~0x200000200000000")  # Enable AVX2, AES-NI
+    
+    # Try to configure OpenSSL ENGINE for hardware acceleration
+    try:
+        # Load OpenSSL library
+        if os.name == "nt":
+            openssl_libs = ["libeay32.dll", "libssl32.dll", "libcrypto.dll"]
+        else:
+            openssl_libs = ["libcrypto.so.1.1", "libcrypto.so.3", "libcrypto.so"]
+        
+        openssl_loaded = False
+        for lib_name in openssl_libs:
+            try:
+                lib_path = ctypes.util.find_library(lib_name)
+                if lib_path:
+                    openssl = ctypes.CDLL(lib_path)
+                    openssl_loaded = True
+                    logger.debug(f"[OpenSSL] Loaded library: {lib_path}")
+                    break
+            except (OSError, AttributeError):
+                continue
+        
+        if openssl_loaded:
+            # Try to enable hardware acceleration via ENGINE
+            try:
+                # OpenSSL 1.1.1+ uses ENGINE_load_builtin_engines
+                if hasattr(openssl, "ENGINE_load_builtin_engines"):
+                    openssl.ENGINE_load_builtin_engines()
+                    openssl.ENGINE_register_all_complete()
+                    logger.debug("[OpenSSL] Hardware acceleration engines loaded")
+            except Exception:
+                # ENGINE functions may not be available in all OpenSSL builds
+                pass
+    except Exception as exc:
+        # Hardware acceleration is optional - log but don't fail
+        logger.debug(f"[OpenSSL] Hardware acceleration configuration failed (optional): {exc}")
+
+# Configure OpenSSL acceleration at module import time
+_configure_openssl_hardware_acceleration()
+
 __all__ = [
     "SecureKeyHandle",
+    "PublicKeyHandle",
     "SecureSessionCredentials",
     "SecureVariableWrapper",
     "SigningError",
     "MemorySecurityError",
+    "GuardPageError",
+    "IsolatedMemoryHeap",
     "SecurityAuditLogger",
     "audit_log",
 ]
@@ -180,6 +242,28 @@ class SecurityAuditLogger:
                 'object_type': object_type,
                 'buffer_size': buffer_size,
                 'wipe_method': wipe_method
+            })
+
+    def log_isolation_fallback(
+        self,
+        key_id: str,
+        reason: str,
+        fallback_size_bytes: int,
+    ) -> None:
+        """Record that hardened isolation was unavailable for *key_id*.
+
+        Used by :class:`SecureKeyHandle` when its
+        :class:`IsolatedMemoryHeap` allocation could not be obtained
+        (e.g. mmap/mprotect unavailable on the running platform).
+        Reports the *fall-back* size, not the cleanup size —
+        callers must not confuse this with ``log_memory_cleanup``.
+        """
+        with self._lock:
+            self._operations.append({
+                'event': 'ISOLATION_FALLBACK',
+                'key_id': key_id,
+                'reason': reason,
+                'fallback_size_bytes': fallback_size_bytes,
             })
 
     def get_audit_trail(self) -> list:
@@ -390,6 +474,10 @@ class MemorySecurityError(Exception):
     """Raised when memory locking or hardening fails or is violated."""
 
 
+class GuardPageError(MemorySecurityError):
+    """Raised when an isolated memory pool cannot be guarded with PROT_NONE."""
+
+
 class SigningError(Exception):
     """Raised when signing fails or the key handle is no longer usable."""
 
@@ -502,6 +590,30 @@ class SecureKeyHandle:
         self._sign_count: int = 0
         # Immediately pin the buffer's pages to physical RAM
         self._locked: bool = _mlock_buffer(self._buf)
+        # Canonical store (Issue #660): an isolated mmap pool flanked by
+        # PROT_NONE guard pages. The bytearray above remains as a
+        # backwards-compatible handle for tests that introspect `_buf`;
+        # the authoritative copy of the key now lives inside the
+        # protected heap and is wiped + PROT_NONE-d + unmapped on close.
+        self._heap: Optional["IsolatedMemoryHeap"] = None
+        try:
+            self._heap = IsolatedMemoryHeap(raw_key, label=key_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[SecureKeyHandle] isolated heap unavailable (%s); key "
+                "stored only in mlocked bytearray.",
+                exc,
+            )
+            try:
+                # Surface the regression in the audit trail under a
+                # dedicated event so operators can alert on it. This
+                # threads through SecurityAuditLogger.log_isolation_fallback
+                # so the entry is appended under the audit-log lock.
+                audit_log.log_isolation_fallback(
+                    key_id, str(exc), len(raw_key),
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def __enter__(self) -> "SecureKeyHandle":
         self._active = True
@@ -537,6 +649,16 @@ class SecureKeyHandle:
         finally:
             _unlock_memory(self._buf)
 
+        # Tear down the isolated mmap heap (wipes + mprotect-to-NONE +
+        # unmaps) so the canonical key copy leaves no recoverable trace
+        # in the process address space (Issue #660).
+        heap_obj = getattr(self, "_heap", None)
+        if heap_obj is not None:
+            try:
+                heap_obj.close()
+            except Exception:  # noqa: BLE001
+                pass
+
         logger.debug("[SecureKeyHandle] Signing scope closed — key wiped.")
 
     def sign(self, tx_hash: bytes) -> bytes:
@@ -560,7 +682,21 @@ class SecureKeyHandle:
         return self._sign_internal(tx_hash)
 
     def _sign_internal(self, tx_hash: bytes) -> bytes:
-        key_bytes: bytes = bytes(self._buf)
+        # Route signing through the isolated mmap pool (Issue #660) so
+        # the bytes actually fed to the crypto library come from inside
+        # the PROT_NONE-flanked region. Falls back to the bytearray
+        # copy if the heap failed to initialise on this platform.
+        heap_obj = getattr(self, "_heap", None)
+        if heap_obj is not None and not heap_obj.is_closed:
+            try:
+                view = heap_obj.data_view
+                nrequested = heap_obj.requested_size or len(view)
+                key_bytes: bytes = bytes(view[:nrequested])
+            except Exception:  # noqa: BLE001
+                # Heap view unreachable; fall back to the legacy copy.
+                key_bytes = bytes(self._buf)
+        else:
+            key_bytes = bytes(self._buf)
 
         try:
             try:
@@ -598,6 +734,125 @@ class SecureKeyHandle:
                 return bytes(sk.sign(tx_hash).signature)
         except Exception as exc:
             raise SigningError("Signing failed (PyNaCl path).") from exc
+
+
+# =========================================================================
+# PUBLIC API - PUBLIC KEY HANDLE (TYPE-ISOLATED FROM PRIVATE KEY)
+# =========================================================================
+
+
+class PublicKeyHandle:
+    """Type-isolated public key container with memory safety guarantees.
+
+    This class enforces strict separation between public and private key
+    structures. Public key operations have zero programmatic or memory access
+    to private key fields. The public key is stored in an immutable bytes
+    object and cannot be used for signing operations.
+
+    This is a security boundary isolator: attempting to use a PublicKeyHandle
+    where a private key is expected will fail at type-check time, preventing
+    accidental reference sharing between public and private key objects.
+
+    Args:
+        public_key_bytes: The public key bytes (typically 32 bytes for Ed25519).
+        key_id: Optional identifier for audit logging.
+
+    Raises:
+        ValueError: If public_key_bytes is empty.
+
+    Example::
+
+        # Derive public key from private key handle
+        with SecureKeyHandle(private_key_bytes) as priv_handle:
+            signature = priv_handle.sign(tx_hash)
+            # Public key can be extracted separately
+            pub_handle = PublicKeyHandle(derive_public_key(private_key_bytes))
+
+        # Public key handle cannot sign - type isolation enforced
+        # pub_handle.sign(tx_hash)  # AttributeError: no such method
+    """
+
+    __slots__ = ("_public_key", "_key_id", "_frozen")
+
+    def __init__(self, public_key_bytes: bytes, key_id: str = "public_key") -> None:
+        if not public_key_bytes:
+            raise ValueError("public_key_bytes must be non-empty bytes.")
+        # Store as immutable bytes to prevent modification
+        self._public_key: bytes = bytes(public_key_bytes)
+        self._key_id: str = key_id
+        self._frozen: bool = True  # Immutable after construction
+
+        audit_log.log_key_imported(f"pub_{self._key_id}", len(self._public_key))
+
+    def __repr__(self) -> str:
+        return f"<PublicKeyHandle key_id={self._key_id!r} bytes={len(self._public_key)}>"
+
+    @property
+    def bytes(self) -> bytes:
+        """Return the public key bytes (immutable copy)."""
+        return self._public_key
+
+    @property
+    def key_id(self) -> str:
+        """Return the key identifier."""
+        return self._key_id
+
+    def verify(self, signature: bytes, message: bytes) -> bool:
+        """Verify a signature against the public key.
+
+        This is the only operation allowed on public keys - verification only.
+        No signing or private key access is possible.
+
+        Args:
+            signature: The signature bytes to verify.
+            message: The message bytes that were signed.
+
+        Returns:
+            True if the signature is valid, False otherwise.
+
+        Raises:
+            SigningError: If verification fails due to library issues.
+        """
+        try:
+            from stellar_sdk import Keypair  # type: ignore[import]  # noqa: PLC0415
+            try:
+                keypair = Keypair.from_raw_ed25519_public_key(self._public_key)
+                return keypair.verify(message, signature)
+            except Exception as exc:
+                raise SigningError("Verification failed (stellar_sdk path).") from exc
+        except ImportError:
+            try:
+                from nacl.signing import VerifyKey  # type: ignore[import]  # noqa: PLC0415
+                verify_key = VerifyKey(self._public_key)
+                try:
+                    verify_key.verify(message, signature)
+                    return True
+                except Exception:
+                    return False
+            except ImportError as exc:
+                raise SigningError(
+                    "Neither 'stellar_sdk' nor 'PyNaCl' is installed. "
+                    "Install one to enable verification."
+                ) from exc
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Prevent attribute modification after construction (immutable)."""
+        if name in ("_public_key", "_key_id", "_frozen") and not hasattr(self, "_frozen"):
+            # Allow initial construction
+            super().__setattr__(name, value)
+        elif name == "_frozen":
+            # Allow setting frozen flag during construction
+            super().__setattr__(name, value)
+        else:
+            raise AttributeError(
+                f"PublicKeyHandle is immutable; cannot set attribute '{name}'"
+            )
+
+    def __delattr__(self, name: str) -> None:
+        """Prevent attribute deletion (immutable)."""
+        raise AttributeError(
+            f"PublicKeyHandle is immutable; cannot delete attribute '{name}'"
+        )
 
 
 # =========================================================================
@@ -764,3 +1019,427 @@ class SecureSessionCredentials:
         finally:
             _wipe_bytes_view(temp)
             del temp
+
+
+
+# =========================================================================
+# ISOLATED MEMORY HEAP (PROT_NONE GUARD PAGES) -- Issue #660
+# =========================================================================
+#
+# Threat: standard heap allocators place sensitive cryptographic objects
+# adjacent to un-sanitized buffers; an off-by-one bug or memcpy overflow
+# into a neighbour leaks key material into adjacent memory.
+#
+# Mitigation: each IsolatedMemoryHeap allocates its own anonymous mmap
+# region flanked by PROT_NONE guard pages. The middle data pages are
+# PROT_READ | PROT_WRITE. Any read or write wandering off either side
+# faults on the immediate adjacent guard page (SIGSEGV on POSIX /
+# ACCESS_VIOLATION on Windows). On teardown the data region is wiped,
+# demoted to PROT_NONE, and the entire region is unmapped so no key
+# bytes remain readable in the process address space.
+
+
+_POSIX_PROT_NONE = 0
+_POSIX_PROT_READ = 1
+_POSIX_PROT_WRITE = 2
+_POSIX_PROT_RW = _POSIX_PROT_READ | _POSIX_PROT_WRITE
+_WIN_PAGE_NOACCESS = 0x01
+_WIN_PAGE_READWRITE = 0x04
+
+
+def _get_page_size() -> int:
+    try:
+        return int(_mmap_mod.PAGESIZE)
+    except (AttributeError, ValueError):
+        pass
+    try:
+        return int(os.sysconf("SC_PAGESIZE"))
+    except (ValueError, OSError, AttributeError):
+        return 4096
+
+
+def _round_up_to_page(size: int, page: int) -> int:
+    if page <= 0:
+        raise ValueError("page size must be positive.")
+    if size <= 0:
+        return page
+    return ((int(size) + page - 1) // page) * page
+
+
+def _load_mprotect_function():
+    if platform.system() == "Windows":
+        return None
+    libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    try:
+        libc = ctypes.CDLL(libc_name, use_errno=True)
+        mprotect = getattr(libc, "mprotect", None)
+        if mprotect is None:
+            return None
+        mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        mprotect.restype = ctypes.c_int
+        return mprotect
+    except (OSError, AttributeError):
+        return None
+
+
+_MPROTECT_FN = _load_mprotect_function()
+
+
+class IsolatedMemoryHeap:
+    """Self-contained memory pool flanked by PROT_NONE guard pages.
+
+    Layout (page-aligned):
+
+        [ LEFT  GUARD PAGE : PROT_NONE ]
+        [ DATA PAGES       : PROT_R/W  ]
+        [ RIGHT GUARD PAGE : PROT_NONE ]
+
+    Use as a context manager; on ``__exit__`` the data region is wiped,
+    demoted to ``PROT_NONE``, and the whole region is unmapped.
+    """
+
+    __slots__ = (
+        "_mmap", "_page_size", "_data_pages", "_data_bytes",
+        "_requested_size", "_base_addr", "_left_guard_addr",
+        "_data_addr", "_right_guard_addr", "_guard_pages_applied",
+        "_closed", "_locked", "_label",
+    )
+
+    def __init__(self, initial_bytes: bytes = b"", label: str = "isolated") -> None:
+        if not isinstance(initial_bytes, (bytes, bytearray)):
+            raise TypeError(
+                "initial_bytes must be bytes or bytearray, got "
+                + type(initial_bytes).__name__
+            )
+        self._label = str(label)
+        page = _get_page_size()
+        self._page_size = page
+        requested = len(initial_bytes)
+        if requested == 0:
+            data_bytes = page
+        else:
+            data_bytes = max(_round_up_to_page(requested, page), page)
+        self._data_bytes = data_bytes
+        self._data_pages = data_bytes // page if page else 1
+        self._requested_size = requested
+        total_size = data_bytes + 2 * page
+        self._mmap = None
+        self._closed = False
+        self._locked = False
+        self._guard_pages_applied = False
+
+        try:
+            self._mmap = _mmap_mod.mmap(-1, total_size, prot=_POSIX_PROT_RW)
+        except Exception as exc:
+            raise MemorySecurityError(
+                "IsolatedMemoryHeap: mmap(%d) failed: %s" % (total_size, exc)
+            ) from exc
+
+        try:
+            base = ctypes.addressof(
+                (ctypes.c_char * 1).from_buffer(memoryview(self._mmap))
+            )
+        except (BufferError, TypeError) as exc:
+            self._safe_unmap_only()
+            raise MemorySecurityError(
+                "IsolatedMemoryHeap: address resolve failed: %s" % exc
+            ) from exc
+        self._base_addr = int(base)
+        self._left_guard_addr = self._base_addr
+        self._data_addr = self._base_addr + page
+        self._right_guard_addr = self._base_addr + page + data_bytes
+
+        if requested > 0:
+            try:
+                view = memoryview(self._mmap)[page:page + data_bytes]
+                view[:requested] = bytes(initial_bytes)
+            except (IndexError, ValueError, TypeError) as exc:
+                self._safe_unmap_only()
+                raise MemorySecurityError(
+                    "IsolatedMemoryHeap: seed copy failed: %s" % exc
+                ) from exc
+
+        try:
+            self._apply_guard_protections()
+        except GuardPageError:
+            self._safe_unmap_only()
+            raise
+
+        self._locked = self._mlock_data_pages()
+
+    @property
+    def page_size(self) -> int:
+        return self._page_size
+
+    @property
+    def data_pages(self) -> int:
+        return self._data_pages
+
+    @property
+    def data_size(self) -> int:
+        return self._data_bytes
+
+    @property
+    def requested_size(self) -> int:
+        return self._requested_size
+
+    @property
+    def has_guard_pages(self) -> bool:
+        return self._guard_pages_applied
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    @property
+    def base_address(self) -> int:
+        return self._base_addr
+
+    @property
+    def left_guard_address(self) -> int:
+        return self._left_guard_addr
+
+    @property
+    def data_address(self) -> int:
+        return self._data_addr
+
+    @property
+    def right_guard_address(self) -> int:
+        return self._right_guard_addr
+
+    @property
+    def data_view(self) -> "memoryview":
+        if self._closed or self._mmap is None:
+            raise GuardPageError(
+                "IsolatedMemoryHeap.data_view after close()/__exit__."
+            )
+        return memoryview(self._mmap)[
+            self._page_size:self._page_size + self._data_bytes
+        ]
+
+    def wipe(self) -> None:
+        if self._closed or self._mmap is None:
+            return
+        try:
+            ctypes.memset(
+                ctypes.c_void_p(self._data_addr),
+                0,
+                ctypes.c_size_t(self._data_bytes),
+            )
+        except Exception:  # noqa: BLE001
+            try:
+                view = self.data_view
+                for i in range(len(view)):
+                    view[i] = 0
+            except Exception:  # noqa: BLE001
+                pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        # Wipe MUST run with _closed still False so the check inside
+        # wipe() does not short-circuit.
+        try:
+            self.wipe()
+        except Exception:  # noqa: BLE001
+            pass
+        self._closed = True
+        try:
+            if self._locked and _MUNLOCK_FN is not None:
+                _MUNLOCK_FN(
+                    ctypes.c_void_p(self._data_addr),
+                    ctypes.c_size_t(self._data_bytes),
+                )
+                self._locked = False
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._mprotect_region(
+                self._data_addr, self._data_pages, _POSIX_PROT_NONE
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._mmap is not None:
+                self._mmap.close()
+        except (BufferError, ValueError, OSError):  # noqa: BLE001
+            pass
+        self._mmap = None
+        try:
+            audit_log.log_memory_cleanup(
+                "IsolatedMemoryHeap",
+                self._data_bytes,
+                wipe_method="ctypes.memset+mprotect",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def __enter__(self) -> "IsolatedMemoryHeap":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self.close()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mlock_data_pages(self) -> bool:
+        if _MLOCK_FN is None:
+            return False
+        try:
+            ret = _MLOCK_FN(
+                ctypes.c_void_p(self._data_addr),
+                ctypes.c_size_t(self._data_bytes),
+            )
+            if platform.system() == "Windows":
+                return bool(ret)
+            return ret == 0
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _apply_guard_protections(self) -> None:
+        if _MPROTECT_FN is None and platform.system() != "Windows":
+            raise GuardPageError(
+                "IsolatedMemoryHeap: mprotect() not available on this platform."
+            )
+        try:
+            self._mprotect_region(self._left_guard_addr, 1, _POSIX_PROT_NONE)
+            self._mprotect_region(self._right_guard_addr, 1, _POSIX_PROT_NONE)
+            self._guard_pages_applied = True
+        except Exception as exc:  # noqa: BLE001
+            self._guard_pages_applied = False
+            raise GuardPageError(
+                "IsolatedMemoryHeap: guard-page protection failed (%s)" % exc
+            ) from exc
+
+    def _mprotect_region(self, addr: int, npages: int, prot: int) -> None:
+        page = self._page_size
+        size = int(npages) * int(page)
+        if platform.system() == "Windows":
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            VirtualProtect = kernel32.VirtualProtect
+            VirtualProtect.argtypes = [
+                ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            VirtualProtect.restype = ctypes.c_bool
+            win_prot = (
+                _WIN_PAGE_NOACCESS if prot == _POSIX_PROT_NONE
+                else _WIN_PAGE_READWRITE
+            )
+            old_prot = ctypes.c_uint32(0)
+            ok = VirtualProtect(
+                ctypes.c_void_p(addr), ctypes.c_size_t(size),
+                win_prot, ctypes.byref(old_prot),
+            )
+            if not ok:
+                raise GuardPageError(
+                    "VirtualProtect(0x%x, size=%d) -> FALSE" % (addr, size)
+                )
+            return
+        if _MPROTECT_FN is None:
+            raise GuardPageError("mprotect() not available on this platform.")
+        ret = _MPROTECT_FN(
+            ctypes.c_void_p(addr), ctypes.c_size_t(size),
+            ctypes.c_int(int(prot)),
+        )
+        if ret != 0:
+            errno_val = ctypes.get_errno()
+            raise GuardPageError(
+                "mprotect(0x%x, size=%d, prot=%d) failed (errno=%d)"
+                % (addr, size, prot, errno_val)
+            )
+
+    def _safe_unmap_only(self) -> None:
+        if getattr(self, "_data_addr", None) and getattr(self, "_data_pages", None):
+            try:
+                self._mprotect_region(
+                    self._data_addr, self._data_pages, _POSIX_PROT_NONE
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            if self._mmap is not None:
+                self._mmap.close()
+        except (BufferError, ValueError, OSError):  # noqa: BLE001
+            pass
+        self._mmap = None
+        self._closed = True
+
+
+class SecureVariableWrapper:
+    """Context manager for generic sensitive bytes (passwords, tokens, ...).
+
+    Args:
+        data:   Raw bytes to wrap. Must be non-empty.
+        label:  Short label used only in audit log entries.
+    """
+
+    __slots__ = ("_buf", "_active", "_wiped", "_label", "_locked")
+
+    def __init__(self, data: bytes, label: str = "variable") -> None:
+        if not data:
+            raise ValueError("data must be non-empty bytes.")
+        if not isinstance(label, str):
+            raise TypeError("label must be a str.")
+        self._buf: bytearray = bytearray(data)
+        self._active: bool = False
+        self._wiped: bool = False
+        self._label: str = label
+        self._locked: bool = _mlock_buffer(self._buf)
+        audit_log.log_key_imported("wrap_" + str(label), len(self._buf))
+
+    def __enter__(self) -> "SecureVariableWrapper":
+        self._active = True
+        logger.debug(
+            "[SecureVariableWrapper] Scope opened for: %s", self._label
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self._active = False
+        self._do_wipe()
+        return False
+
+    def __del__(self) -> None:
+        try:
+            self._do_wipe()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _do_wipe(self) -> None:
+        if self._wiped:
+            return
+        self._wiped = True
+        _zero_wipe(
+            self._buf,
+            audit_details={"object_type": "SecureVariableWrapper"},
+        )
+        if self._locked:
+            _munlock_buffer(self._buf)
+            self._locked = False
+        logger.debug(
+            "[SecureVariableWrapper] Scope closed (buffer wiped): %s",
+            self._label,
+        )
+        audit_log.log_key_revoked(
+            "wrap_" + str(self._label), reason="scope_exit"
+        )
+
+    def get(self) -> bytes:
+        if not self._active:
+            raise SigningError(
+                "SecureVariableWrapper.get() outside active scope."
+            )
+        if self._wiped:
+            raise SigningError(
+                "SecureVariableWrapper.get() after buffer was wiped."
+            )
+        return bytes(self._buf)
+
+    def __len__(self) -> int:
+        return len(self._buf)

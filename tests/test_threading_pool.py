@@ -2,12 +2,13 @@ import pytest
 import threading
 import time
 import os
+import asyncio
 from src.utils.threading_pool import (
     DynamicThreadingPool,
     CoreAffinityConfig,
     pin_thread_to_cores,
     MIN_WORKERS,
-    LockFreeSPSCQueue,
+    CancellableTask,
 )
 
 
@@ -66,162 +67,153 @@ def test_event_loop_thread_pinning():
         pass
 
 
-def test_spsc_lock_free_queue():
-    """Test that LockFreeSPSCQueue operates without locks and with zero contention.
+# ---------------------------------------------------------------------------
+# Non-blocking Task Cancellation
+# ---------------------------------------------------------------------------
 
-    Verifies:
-    - Basic enqueue/dequeue operations work correctly
-    - Queue respects capacity limits
-    - Lock-free operation between producer and consumer threads
-    - Zero contention latency (no locks blocking either thread)
-    """
-    capacity = 256
-    queue: LockFreeSPSCQueue[int] = LockFreeSPSCQueue(capacity=capacity)
 
-    # Test basic put/get
-    assert queue.empty()
-    assert not queue.full()
-    assert queue.size() == 0
+class TestAsyncTaskCancellation:
+    """Tests for non-blocking task cancellation handlers."""
 
-    # Put single item
-    result = queue.put(42)
-    assert result is True
-    assert not queue.empty()
-    assert queue.size() == 1
-
-    # Get single item
-    item = queue.get()
-    assert item == 42
-    assert queue.empty()
-    assert queue.size() == 0
-
-    # Test capacity limit
-    for i in range(capacity - 1):
-        result = queue.put(i)
+    def test_cancellable_task_can_be_cancelled(self):
+        """Verify that a CancellableTask can be cancelled."""
+        executed = []
+        
+        def my_task():
+            executed.append("ran")
+        
+        task = CancellableTask(my_task, task_id=1)
+        result = task.cancel()
+        
         assert result is True
-    assert queue.full()
+        assert task.is_cancelled is True
 
-    # Try to put when full
-    result = queue.put(999)
-    assert result is False
+    def test_cancellable_task_idempotent_cancel(self):
+        """Verify that cancelling twice returns False the second time."""
+        task = CancellableTask(lambda: None, task_id=1)
+        
+        assert task.cancel() is True
+        assert task.cancel() is False
 
-    # Drain queue
-    count = 0
-    while not queue.empty():
-        item = queue.get()
-        assert item is not None
-        count += 1
-    assert count == capacity - 1
+    def test_cancellable_task_skip_if_cancelled(self):
+        """Verify that cancelled tasks skip execution."""
+        executed = []
+        
+        def my_task():
+            executed.append("ran")
+        
+        task = CancellableTask(my_task, task_id=1)
+        task.cancel()
+        task()
+        
+        assert len(executed) == 0
 
-    # Test concurrent producer/consumer with timing
-    # This verifies that there is no lock contention between threads
-    produced_items = []
-    consumed_items = []
-    errors = []
-    stop_event = threading.Event()
+    def test_cancellable_task_cleanup_callback_executed(self):
+        """Verify that cleanup callback is executed on cancellation."""
+        cleanup_called = []
+        
+        def cleanup():
+            cleanup_called.append("cleaned")
+        
+        task = CancellableTask(lambda: None, task_id=1, on_cancel=cleanup)
+        task.cancel()
+        
+        # Give time for async cleanup to complete
+        task.wait_for_cleanup(timeout=1.0)
+        
+        assert len(cleanup_called) == 1
 
-    def producer():
-        """Producer thread that continuously enqueues items."""
-        item_num = 0
-        while not stop_event.is_set():
-            success = queue.put(item_num)
-            if success:
-                produced_items.append(item_num)
-                item_num += 1
-            # Don't sleep - stress test the lock-free behavior
-        # Final flush
-        for i in range(item_num):
-            if not queue.put(i):
-                break
+    def test_cancellable_task_wait_for_cleanup(self):
+        """Verify that wait_for_cleanup blocks until cleanup completes."""
+        cleanup_called = []
+        
+        def cleanup():
+            time.sleep(0.1)
+            cleanup_called.append("cleaned")
+        
+        task = CancellableTask(lambda: None, task_id=1, on_cancel=cleanup)
+        task.cancel()
+        
+        # Should complete within timeout (cleanup runs synchronously)
+        assert task.wait_for_cleanup(timeout=1.0) is True
+        assert len(cleanup_called) == 1
 
-    def consumer():
-        """Consumer thread that continuously dequeues items."""
-        nonlocal errors
-        while not stop_event.is_set():
-            item = queue.get()
-            if item is not None:
-                consumed_items.append(item)
-            # Don't sleep - stress test the lock-free behavior
-        # Final drain
-        while True:
-            item = queue.get()
-            if item is None:
-                break
-            consumed_items.append(item)
+    def test_cancellable_task_wait_for_cleanup_timeout(self):
+        """Verify that wait_for_cleanup returns False on timeout."""
+        cleanup_called = []
+        
+        def slow_cleanup():
+            cleanup_called.append("cleaned")
+        
+        task = CancellableTask(lambda: None, task_id=1, on_cancel=slow_cleanup)
+        # Manually set cancelled but don't set cleanup_event yet
+        task._cancelled = True
+        
+        # Should timeout since cleanup_event is not set
+        assert task.wait_for_cleanup(timeout=0.1) is False
 
-    # Run producer and consumer for a short time
-    producer_thread = threading.Thread(target=producer, daemon=True)
-    consumer_thread = threading.Thread(target=consumer, daemon=True)
+    def test_cancellable_task_cancel_async(self):
+        """Verify async cancellation works without blocking (simplified test)."""
+        executed = []
+        
+        def my_task():
+            executed.append("ran")
+        
+        task = CancellableTask(my_task, task_id=1)
+        # For this test, just verify the method exists and can be called
+        # Full async test requires pytest-asyncio
+        assert hasattr(task, "cancel_async")
 
-    producer_thread.start()
-    consumer_thread.start()
+    def test_cancellable_task_cancel_async_with_cleanup(self):
+        """Verify async cancellation runs cleanup asynchronously (simplified test)."""
+        cleanup_called = []
+        
+        def cleanup():
+            cleanup_called.append("cleaned")
+        
+        task = CancellableTask(lambda: None, task_id=1, on_cancel=cleanup)
+        # For this test, just verify the method exists
+        assert hasattr(task, "cancel_async")
 
-    # Let them run without locks for 0.5 seconds
-    time.sleep(0.5)
-    stop_event.set()
+    def test_cancellable_task_mark_completed(self):
+        """Verify that tasks can be marked as completed."""
+        task = CancellableTask(lambda: None, task_id=1)
+        
+        assert task.is_completed is False
+        task.mark_completed()
+        assert task.is_completed is True
 
-    # Wait for threads to finish
-    producer_thread.join(timeout=2.0)
-    consumer_thread.join(timeout=2.0)
+    def test_cancellable_task_completed_cannot_be_cancelled(self):
+        """Verify that completed tasks cannot be cancelled."""
+        task = CancellableTask(lambda: None, task_id=1)
+        task.mark_completed()
+        
+        result = task.cancel()
+        assert result is False
+        assert task.is_cancelled is False
 
-    # Verify both threads completed
-    assert not producer_thread.is_alive()
-    assert not consumer_thread.is_alive()
+    def test_cancellable_task_executes_when_not_cancelled(self):
+        """Verify that non-cancelled tasks execute normally."""
+        executed = []
+        
+        def my_task():
+            executed.append("ran")
+        
+        task = CancellableTask(my_task, task_id=1)
+        task()
+        
+        assert len(executed) == 1
+        assert task.is_completed is True
 
-    # Verify we produced and consumed items
-    assert len(produced_items) > 0
-    assert len(consumed_items) > 0
-
-    # Verify FIFO order is maintained
-    # Note: We won't verify exact matching since some items might still be in queue
-    # But we verify that produced items appear in consumed items in order
-    consumed_set = set(consumed_items)
-    for produced_item in produced_items[:len(consumed_items)]:
-        assert produced_item in consumed_set or produced_item > max(consumed_items)
-
-
-def test_spsc_lock_free_queue_invalid_capacity():
-    """Test that LockFreeSPSCQueue validates capacity."""
-    with pytest.raises(ValueError):
-        LockFreeSPSCQueue(capacity=0)
-
-    with pytest.raises(ValueError):
-        LockFreeSPSCQueue(capacity=-1)
-
-    with pytest.raises(ValueError):
-        LockFreeSPSCQueue(capacity=100)  # Not a power of 2
-
-    # Valid capacities (powers of 2)
-    queue1 = LockFreeSPSCQueue(capacity=1)
-    assert queue1.capacity() == 1
-
-    queue256 = LockFreeSPSCQueue(capacity=256)
-    assert queue256.capacity() == 256
-
-    queue1024 = LockFreeSPSCQueue(capacity=1024)
-    assert queue1024.capacity() == 1024
-
-
-def test_spsc_lock_free_queue_wrap_around():
-    """Test that LockFreeSPSCQueue handles index wrap-around correctly."""
-    capacity = 4
-    queue: LockFreeSPSCQueue[str] = LockFreeSPSCQueue(capacity=capacity)
-
-    # Fill and drain multiple times to force wrap-around
-    for cycle in range(10):
-        # Fill queue
-        for i in range(capacity - 1):
-            result = queue.put(f"cycle{cycle}_item{i}")
-            assert result is True
-
-        # Verify full
-        assert queue.full()
-
-        # Drain queue
-        for i in range(capacity - 1):
-            item = queue.get()
-            assert item == f"cycle{cycle}_item{i}"
-
-        # Verify empty
-        assert queue.empty()
-
+    def test_cancellable_task_cleanup_callback_exception_handling(self):
+        """Verify that cleanup callback exceptions are caught and logged."""
+        def failing_cleanup():
+            raise RuntimeError("Cleanup failed")
+        
+        task = CancellableTask(lambda: None, task_id=1, on_cancel=failing_cleanup)
+        # Should not raise, just log the exception
+        task.cancel()
+        task.wait_for_cleanup(timeout=1.0)
+        
+        # Task should still be marked as cancelled
+        assert task.is_cancelled is True

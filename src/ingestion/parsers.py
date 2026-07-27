@@ -13,17 +13,21 @@ callers using either import path gain access to the full API.
 from ingestion.parser import (
     DEFAULT_SEGMENT_SIZE,
     SIMDJSON_AVAILABLE,
+    BinaryFrameLayout,
     TelemetrySegment,
     TelemetrySegmentBatch,
     TelemetryTuple,
     build_segments_from_stream,
     build_telemetry_segments,
+    decode_binary_batch,
+    decode_binary_packet,
     flatten_telemetry_frames,
     iter_flat_ticker_tuples,
     parse_raw_pack,
 )
 
 __all__ = [
+    "BinaryFrameLayout",
     "DEFAULT_SEGMENT_SIZE",
     "SIMDJSON_AVAILABLE",
     "TelemetrySegment",
@@ -31,6 +35,8 @@ __all__ = [
     "TelemetryTuple",
     "build_segments_from_stream",
     "build_telemetry_segments",
+    "decode_binary_batch",
+    "decode_binary_packet",
     "flatten_telemetry_frames",
     "iter_flat_ticker_tuples",
     "parse_raw_pack",

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
-from typing import Union
+from typing import NamedTuple, Union, Sequence
 from fractions import Fraction
+from typing import NamedTuple, Sequence, Union
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +29,15 @@ Number = Union[int, float, Decimal]
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _validate_positive_int(value: int, name: str) -> int:
+    """Reject non-integer or non-positive values for fixed-point scaling."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive.")
+    return value
+
 
 def _to_decimal(value: Number, name: str = "value") -> Decimal:
     """Coerce *value* to a finite Decimal using its string representation.
@@ -68,11 +78,13 @@ def _shift_scale_int(value: int, shift_levels: int) -> int:
 
 
 def _multiply_hop_chain(hops: tuple[int, ...]) -> int:
-    """Fold a corridor hop chain into a single ``SCALE_7`` rate integer."""
+    """Fold a corridor hop chain into a single ``SCALE_14`` rate integer."""
+    if not hops:
+        return SCALE_14
     product = 1
     for hop in hops:
         product *= hop
-    return _shift_scale_int(product, -(len(hops) - 1))
+    return _shift_scale_int(product, -(len(hops) - 2))
 
 
 def _apply_route_weight(scaled_rate: int, weight: int) -> int:
@@ -81,10 +93,10 @@ def _apply_route_weight(scaled_rate: int, weight: int) -> int:
 
 
 def _normalize_weighted_sum(weighted_sum: int, weight_total: int) -> int:
-    """Collapse a ``SCALE_14`` weighted sum back to ``SCALE_7`` precision."""
+    """Collapse a ``SCALE_21`` weighted sum back to ``SCALE_14`` precision."""
     if weight_total == 0:
         raise ZeroDivisionError("Total route weight scales to zero at SCALE_7.")
-    return weighted_sum // weight_total // SCALE_7
+    return weighted_sum // weight_total
 
 
 class ArbitrageRouteMatrix(NamedTuple):
@@ -121,10 +133,44 @@ def scale_up(value: Number, factor: int = SCALE_7) -> int:
     int
         The deterministic integer representation ready for payload packing.
     """
+    factor = _validate_positive_int(factor, "factor")
     d = _to_decimal(value) * Decimal(factor)
     # ROUND_DOWN truncates toward zero — equivalent to math.floor for positives
     # but deterministic regardless of platform FPU behaviour.
     return int(d.to_integral_value(rounding=ROUND_DOWN))
+
+
+def to_fixed(value: Number) -> int:
+    """Convert a numeric input into a ``SCALE_7`` fixed-point integer."""
+    return scale_up(value, SCALE_7)
+
+
+def from_fixed(value: int) -> float:
+    """Convert a ``SCALE_7`` fixed-point integer back into a float."""
+    return float(scale_down(value, SCALE_7))
+
+
+def fixed_point_sqrt(value: int) -> int:
+    """Compute the fixed-point square root using integer-only arithmetic."""
+    if isinstance(value, bool):
+        raise TypeError("value must be an integer, not bool.")
+    if not isinstance(value, int):
+        raise TypeError("value must be a scaled integer.")
+    if value < 0:
+        raise ValueError("Cannot compute the fixed-point square root of a negative value.")
+    if value == 0:
+        return 0
+    return sqrt_scaled(value, SCALE_7)
+
+
+def calculate_slippage_variance(current_price: int, expected_price: int) -> int:
+    """Calculate slippage variance while preserving integer-only fixed-point math."""
+    if expected_price <= 0:
+        raise ValueError("Expected price must be greater than zero for variance analytics.")
+
+    delta = ((current_price - expected_price) * SCALE_7) // expected_price
+    variance_input = (delta * delta) // SCALE_7
+    return fixed_point_sqrt(variance_input)
 
 
 def scale_down(value: int, factor: int = SCALE_7) -> Decimal:
@@ -140,6 +186,7 @@ def scale_down(value: int, factor: int = SCALE_7) -> Decimal:
     factor:
         The base that was used when scaling up.  Defaults to ``SCALE_7``.
     """
+    factor = _validate_positive_int(factor, "factor")
     return Decimal(value) / Decimal(factor)
 
 
@@ -183,6 +230,7 @@ def cross_feed_multiply(
     int
         A deterministic integer at *output_scale* precision.
     """
+    output_scale = _validate_positive_int(output_scale, "output_scale")
     product_14 = multiply_rates(rate_a, rate_b)
     return product_14 // (SCALE_14 // output_scale)
 
@@ -212,15 +260,21 @@ def floor_divide(scaled_value: int, divisor: Number) -> int:
 
 
 def sqrt_scaled(value: int, scale: int = SCALE_7) -> int:
-    """Return the fixed-point square root of a scaled integer.
+    """Return the fixed-point square root of a scaled integer using Newton-Raphson.
 
     ``value`` is expected to be scaled by *scale*, and the returned integer uses
     the same scale.  The calculation is strictly integer-only:
 
-    ``sqrt(value / scale) * scale == sqrt(value * scale)``
+    ``floor(sqrt(value / scale)) * scale``
 
-    The final square root is calculated with binary search and floors toward
-    zero, matching the truncation behavior used across this module.
+    The square root is calculated using the Newton-Raphson method (also known as
+    Heron's method) with integer arithmetic only. The iteration formula is:
+
+        x_{n+1} = (x_n + S / x_n) // 2
+
+    Where S is the radicand (value // scale) and x_n is the current estimate. This
+    converges quadratically and floors toward zero, matching the truncation behavior
+    used across this module.
     """
     if isinstance(value, bool):
         raise TypeError("value must be an integer, not bool.")
@@ -233,24 +287,26 @@ def sqrt_scaled(value: int, scale: int = SCALE_7) -> int:
     if scale <= 0:
         raise ValueError("scale must be positive.")
 
-    radicand = value * scale
+    # Calculate the unscaled radicand: value // scale
+    radicand = value // scale
     if radicand < 2:
-        return radicand
+        return radicand * scale
 
-    low = 0
-    high = radicand
-    answer = 0
+    # Initial estimate using bit length for faster convergence
+    # For a number with bit length n, sqrt is approximately 2^(n/2)
+    x = 1 << ((radicand.bit_length() + 1) // 2)
+    
+    # Newton-Raphson iteration with integer arithmetic
+    # x_{n+1} = (x_n + S // x_n) // 2
+    while True:
+        next_x = (x + radicand // x) // 2
+        if next_x >= x:
+            # Converged: next estimate is not smaller, so x is the floor sqrt
+            break
+        x = next_x
 
-    while low <= high:
-        mid = (low + high) // 2
-        square = mid * mid
-        if square <= radicand:
-            answer = mid
-            low = mid + 1
-        else:
-            high = mid - 1
-
-    return answer
+    # Scale the result back
+    return x * scale
 
 
 def build_arbitrage_route_matrix(
@@ -394,6 +450,10 @@ __all__ = [
     "Number",
     "ConversionMatrix",
     "scale_up",
+    "to_fixed",
+    "from_fixed",
+    "fixed_point_sqrt",
+    "calculate_slippage_variance",
     "scale_down",
     "multiply_rates",
     "cross_feed_multiply",
