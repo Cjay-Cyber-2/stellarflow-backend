@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import NamedTuple, Union, Sequence
 from fractions import Fraction
+from typing import NamedTuple, Sequence, Union
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +29,15 @@ Number = Union[int, float, Decimal]
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _validate_positive_int(value: int, name: str) -> int:
+    """Reject non-integer or non-positive values for fixed-point scaling."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive.")
+    return value
+
 
 def _to_decimal(value: Number, name: str = "value") -> Decimal:
     """Coerce *value* to a finite Decimal using its string representation.
@@ -121,10 +131,44 @@ def scale_up(value: Number, factor: int = SCALE_7) -> int:
     int
         The deterministic integer representation ready for payload packing.
     """
+    factor = _validate_positive_int(factor, "factor")
     d = _to_decimal(value) * Decimal(factor)
     # ROUND_DOWN truncates toward zero — equivalent to math.floor for positives
     # but deterministic regardless of platform FPU behaviour.
     return int(d.to_integral_value(rounding=ROUND_DOWN))
+
+
+def to_fixed(value: Number) -> int:
+    """Convert a numeric input into a ``SCALE_7`` fixed-point integer."""
+    return scale_up(value, SCALE_7)
+
+
+def from_fixed(value: int) -> float:
+    """Convert a ``SCALE_7`` fixed-point integer back into a float."""
+    return float(scale_down(value, SCALE_7))
+
+
+def fixed_point_sqrt(value: int) -> int:
+    """Compute the fixed-point square root using integer-only arithmetic."""
+    if isinstance(value, bool):
+        raise TypeError("value must be an integer, not bool.")
+    if not isinstance(value, int):
+        raise TypeError("value must be a scaled integer.")
+    if value < 0:
+        raise ValueError("Cannot compute the fixed-point square root of a negative value.")
+    if value == 0:
+        return 0
+    return sqrt_scaled(value, SCALE_7)
+
+
+def calculate_slippage_variance(current_price: int, expected_price: int) -> int:
+    """Calculate slippage variance while preserving integer-only fixed-point math."""
+    if expected_price <= 0:
+        raise ValueError("Expected price must be greater than zero for variance analytics.")
+
+    delta = ((current_price - expected_price) * SCALE_7) // expected_price
+    variance_input = (delta * delta) // SCALE_7
+    return fixed_point_sqrt(variance_input)
 
 
 def scale_down(value: int, factor: int = SCALE_7) -> Decimal:
@@ -140,6 +184,7 @@ def scale_down(value: int, factor: int = SCALE_7) -> Decimal:
     factor:
         The base that was used when scaling up.  Defaults to ``SCALE_7``.
     """
+    factor = _validate_positive_int(factor, "factor")
     return Decimal(value) / Decimal(factor)
 
 
@@ -183,6 +228,7 @@ def cross_feed_multiply(
     int
         A deterministic integer at *output_scale* precision.
     """
+    output_scale = _validate_positive_int(output_scale, "output_scale")
     product_14 = multiply_rates(rate_a, rate_b)
     return product_14 // (SCALE_14 // output_scale)
 
@@ -402,6 +448,10 @@ __all__ = [
     "Number",
     "ConversionMatrix",
     "scale_up",
+    "to_fixed",
+    "from_fixed",
+    "fixed_point_sqrt",
+    "calculate_slippage_variance",
     "scale_down",
     "multiply_rates",
     "cross_feed_multiply",
