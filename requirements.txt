@@ -14,3 +14,6 @@ aiohttp>=3.9.0
 
 # Async PostgreSQL driver for high-performance bulk inserts
 asyncpg>=0.28.0
+
+# MsgPack binary serialisation with C-extensions for Redis cache payloads
+msgpack>=1.0.0

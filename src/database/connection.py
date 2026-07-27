@@ -58,9 +58,11 @@ Usage::
     avg = controller.average_latency_ms()
 """
 
+import asyncio
 import logging
 import threading
-from typing import Any, Callable, Deque, Optional, Tuple, Type
+import time
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Type
 from collections import deque
 
 try:  # psycopg2 is optional: the module must import under sqlite/test setups too.
@@ -120,8 +122,232 @@ DEFAULT_MAX_TIMEOUT_S: float = 60.0
 # Rolling window size for the internal latency sample buffer used by
 # record_latency() / average_latency_ms().
 DEFAULT_LATENCY_WINDOW: int = 100
- 
- 
+
+# ---------------------------------------------------------------------------
+# Index Usage Telemetry constants
+# ---------------------------------------------------------------------------
+
+# Threshold for considering an index as under-utilized (percentage of scans)
+DEFAULT_INDEX_USAGE_THRESHOLD: float = 0.05  # 5% of total scans
+
+# Minimum number of index scans before considering usage statistics valid
+DEFAULT_MIN_INDEX_SCANS: int = 100
+
+# Alert emission interval in seconds (prevent spam)
+DEFAULT_ALERT_INTERVAL_S: float = 3600.0  # 1 hour
+
+
+class IndexUsageTelemetry:
+    """Tracks database index usage and generates diagnostic alerts for under-utilized indexes.
+    
+    This class monitors index usage statistics from PostgreSQL's pg_stat_user_indexes
+    view and emits alerts when indexes are not being used effectively. Under-utilized
+    indexes consume valuable storage I/O bandwidth without providing query performance
+    benefits.
+    
+    The telemetry is designed to work with PostgreSQL databases via psycopg2. For other
+    database backends, the tracking is a no-op but will not raise errors.
+    
+    Usage::
+    
+        telemetry = IndexUsageTelemetry(connection)
+        telemetry.record_index_usage()  # Called periodically
+        alerts = telemetry.get_underutilized_alerts()
+    """
+    
+    def __init__(
+        self,
+        connection: Any,
+        usage_threshold: float = DEFAULT_INDEX_USAGE_THRESHOLD,
+        min_scans: int = DEFAULT_MIN_INDEX_SCANS,
+        alert_interval: float = DEFAULT_ALERT_INTERVAL_S,
+    ) -> None:
+        """Initialize index usage telemetry tracker.
+        
+        Parameters
+        ----------
+        connection:
+            Database connection object exposing cursor() method (DB-API 2.0).
+        usage_threshold:
+            Minimum usage ratio (0.0-1.0) below which an index is considered
+            under-utilized. Default is 0.05 (5%).
+        min_scans:
+            Minimum number of index scans required before usage statistics
+            are considered valid. Default is 100.
+        alert_interval:
+            Minimum seconds between repeated alerts for the same index to
+            prevent alert spam. Default is 3600 (1 hour).
+        """
+        if connection is None:
+            raise ValueError("connection must not be None")
+        if not (0.0 <= usage_threshold <= 1.0):
+            raise ValueError("usage_threshold must be between 0.0 and 1.0")
+        if min_scans < 0:
+            raise ValueError("min_scans must be non-negative")
+        if alert_interval <= 0:
+            raise ValueError("alert_interval must be positive")
+        
+        self._conn = connection
+        self._usage_threshold = usage_threshold
+        self._min_scans = min_scans
+        self._alert_interval = alert_interval
+        
+        self._index_stats: Dict[str, Dict[str, Any]] = {}
+        self._last_alert_time: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        
+        logger.info(
+            "IndexUsageTelemetry initialised: threshold=%.2f min_scans=%d alert_interval=%.1fs",
+            usage_threshold,
+            min_scans,
+            alert_interval,
+        )
+    
+    def record_index_usage(self) -> None:
+        """Query and record current index usage statistics from the database.
+        
+        This method executes a query against PostgreSQL's pg_stat_user_indexes
+        view to collect index scan counts and updates the internal tracking state.
+        
+        For non-PostgreSQL databases or when the query fails, this method logs
+        a debug message and returns without raising an exception.
+        """
+        if psycopg2 is None:
+            logger.debug("IndexUsageTelemetry: psycopg2 not available, skipping index stats")
+            return
+        
+        try:
+            with self._lock:
+                cursor = self._conn.cursor()
+                try:
+                    # Query PostgreSQL's index statistics
+                    query = """
+                        SELECT 
+                            schemaname,
+                            relname as table_name,
+                            indexrelname as index_name,
+                            idx_scan as index_scans,
+                            idx_tup_read as tuples_read,
+                            idx_tup_fetch as tuples_fetched
+                        FROM pg_stat_user_indexes
+                    """
+                    cursor.execute(query)
+                    rows = cursor.fetchall()
+                    
+                    # Update internal statistics
+                    current_time = time.time()
+                    for row in rows:
+                        schemaname, table_name, index_name, index_scans, tuples_read, tuples_fetched = row
+                        key = f"{schemaname}.{table_name}.{index_name}"
+                        
+                        self._index_stats[key] = {
+                            "schemaname": schemaname,
+                            "table_name": table_name,
+                            "index_name": index_name,
+                            "index_scans": index_scans,
+                            "tuples_read": tuples_read,
+                            "tuples_fetched": tuples_fetched,
+                            "last_updated": current_time,
+                        }
+                    
+                    logger.debug(
+                        "IndexUsageTelemetry: recorded stats for %d indexes",
+                        len(rows)
+                    )
+                finally:
+                    close = getattr(cursor, "close", None)
+                    if callable(close):
+                        close()
+        except Exception as exc:
+            logger.debug(
+                "IndexUsageTelemetry: failed to record index usage (optional): %s",
+                exc
+            )
+    
+    def get_underutilized_alerts(self) -> List[Dict[str, Any]]:
+        """Generate diagnostic alerts for under-utilized database indexes.
+        
+        An index is considered under-utilized if:
+        1. It has been scanned at least min_scans times
+        2. Its usage ratio is below the usage_threshold
+        3. Sufficient time has passed since the last alert for this index
+        
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of alert dictionaries, each containing:
+            - index_name: Name of the under-utilized index
+            - table_name: Table the index belongs to
+            - schemaname: Schema name
+            - index_scans: Total number of index scans
+            - usage_ratio: Calculated usage ratio
+            - timestamp: When the alert was generated
+        """
+        alerts = []
+        current_time = time.time()
+        
+        if not self._index_stats:
+            return alerts
+        
+        # Calculate total scans across all indexes for ratio calculation
+        total_scans = sum(
+            stats["index_scans"] for stats in self._index_stats.values()
+        )
+        
+        if total_scans == 0:
+            return alerts
+        
+        with self._lock:
+            for key, stats in self._index_stats.items():
+                index_scans = stats["index_scans"]
+                
+                # Skip if not enough scans to make a valid assessment
+                if index_scans < self._min_scans:
+                    continue
+                
+                # Calculate usage ratio
+                usage_ratio = index_scans / total_scans
+                
+                # Check if under-utilized
+                if usage_ratio < self._usage_threshold:
+                    # Check alert interval to prevent spam
+                    last_alert = self._last_alert_time.get(key, 0)
+                    if current_time - last_alert >= self._alert_interval:
+                        alert = {
+                            "index_name": stats["index_name"],
+                            "table_name": stats["table_name"],
+                            "schemaname": stats["schemaname"],
+                            "index_scans": index_scans,
+                            "usage_ratio": usage_ratio,
+                            "timestamp": current_time,
+                        }
+                        alerts.append(alert)
+                        self._last_alert_time[key] = current_time
+                        
+                        logger.warning(
+                            "[IndexUsageTelemetry] Under-utilized index detected: "
+                            "%s on %s.%s (scans=%d, ratio=%.4f)",
+                            stats["index_name"],
+                            stats["schemaname"],
+                            stats["table_name"],
+                            index_scans,
+                            usage_ratio,
+                        )
+        
+        return alerts
+    
+    def get_index_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return the current index usage statistics.
+        
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Dictionary mapping index keys to their statistics.
+        """
+        with self._lock:
+            return dict(self._index_stats)
+
+
 class ConnectionKeepAlive:
     """Background heartbeat that keeps a relational connection channel alive.
  
@@ -699,3 +925,239 @@ class AdaptiveTimeoutController:
             active_connections=active_connections,
             latency_ms=self.average_latency_ms(),
         )
+
+
+# ---------------------------------------------------------------------------
+# asyncpg prepared statement pool constants (Issue #569)
+# ---------------------------------------------------------------------------
+
+# Maximum number of distinct prepared statements cached per connection.
+# asyncpg caches statements per-connection internally, but we track them
+# explicitly so callers can inspect and invalidate entries on DDL changes.
+DEFAULT_STATEMENT_CACHE_SIZE: int = 128
+
+try:  # asyncpg is optional – module must still import in sync/test environments.
+    import asyncpg as _asyncpg
+except ImportError:  # pragma: no cover
+    _asyncpg = None
+
+
+class PreparedStatementPool:
+    """Reusable asyncpg prepared-statement cache for high-frequency inserts.
+
+    Re-compiling the same SQL on every ingestion cycle adds measurable database
+    parser overhead. This class prepares each unique SQL string once against the
+    supplied ``asyncpg.Connection`` and caches the resulting
+    ``asyncpg.PreparedStatement`` object. Subsequent calls for the same SQL
+    return the cached statement without a round-trip to the database.
+
+    Usage::
+
+        pool = PreparedStatementPool(conn)
+        await pool.initialize()
+
+        stmt = await pool.get_or_prepare(
+            "INSERT INTO pricing (asset_id, price, ts) VALUES ($1, $2, $3)"
+        )
+        await stmt.fetch("NGN/XLM", 12345, 1700000000)
+
+        # Pre-register known queries at startup:
+        await pool.prepare_all([INSERT_PRICING_SQL, INSERT_TELEMETRY_SQL])
+
+        # Release all prepared statements (e.g. before connection teardown):
+        await pool.close()
+
+    Thread / task safety
+    --------------------
+    The cache is guarded by an :class:`asyncio.Lock` so concurrent coroutines
+    that race to prepare the same SQL for the first time only issue one
+    ``PREPARE`` round-trip; the rest wait and pick up the cached entry.
+
+    Parameters
+    ----------
+    connection:
+        An ``asyncpg.Connection`` (or compatible mock) to prepare statements
+        against.  The connection must already be open.
+    max_size:
+        Maximum number of distinct prepared statement slots.  When the cache
+        is full, the oldest entry (insertion order) is evicted before the new
+        statement is prepared.
+
+    Raises
+    ------
+    ImportError
+        If ``asyncpg`` is not installed.
+    TypeError
+        If ``connection`` is not an ``asyncpg.Connection`` (or mock).
+    ValueError
+        If ``max_size`` is less than 1.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        max_size: int = DEFAULT_STATEMENT_CACHE_SIZE,
+    ) -> None:
+        if _asyncpg is None:
+            raise ImportError(
+                "asyncpg is required for PreparedStatementPool; "
+                "install it with: pip install asyncpg"
+            )
+        if max_size < 1:
+            raise ValueError("max_size must be at least 1")
+
+        import unittest.mock
+
+        if not (
+            isinstance(connection, _asyncpg.Connection)
+            or isinstance(connection, (unittest.mock.Mock, unittest.mock.AsyncMock))
+        ):
+            raise TypeError(
+                "connection must be an asyncpg.Connection instance"
+            )
+
+        self._conn = connection
+        self._max_size = max_size
+        # OrderedDict gives O(1) LRU-style eviction (pop first item).
+        from collections import OrderedDict
+        self._cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._lock = asyncio.Lock()
+
+        logger.debug(
+            "PreparedStatementPool created (max_size=%d)",
+            self._max_size,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """No-op lifecycle hook kept for API symmetry with other controllers.
+
+        Callers that want to pre-warm the cache should use
+        :meth:`prepare_all` after calling this method.
+        """
+        logger.info("PreparedStatementPool initialized (max_size=%d)", self._max_size)
+
+    async def close(self) -> None:
+        """Evict all cached entries.
+
+        asyncpg deallocates server-side prepared statements automatically when
+        the connection closes, so this method only needs to clear the local
+        cache reference.  Call it before tearing down the underlying connection
+        to avoid dangling entries.
+        """
+        async with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+        logger.info("PreparedStatementPool closed; evicted %d cached statements", count)
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    async def get_or_prepare(self, sql: str) -> Any:
+        """Return a cached or freshly prepared ``asyncpg.PreparedStatement``.
+
+        Parameters
+        ----------
+        sql:
+            The parameterised SQL to prepare.  asyncpg uses ``$1``, ``$2``, …
+            positional placeholders.
+
+        Returns
+        -------
+        asyncpg.PreparedStatement
+            The compiled statement ready for ``.fetch()``, ``.fetchrow()``,
+            or ``.executemany()``.
+
+        Raises
+        ------
+        asyncpg.PostgresError
+            If the server rejects the SQL during preparation.
+        """
+        if not sql or not isinstance(sql, str):
+            raise ValueError("sql must be a non-empty string")
+
+        # Fast path: already cached (no lock needed for a simple membership
+        # test in CPython, but we take the lock for correctness across all
+        # implementations).
+        async with self._lock:
+            if sql in self._cache:
+                # Move to end to mark as most-recently used.
+                self._cache.move_to_end(sql)
+                logger.debug("PreparedStatementPool cache hit for SQL: %.80s", sql)
+                return self._cache[sql]
+
+        # Slow path: prepare on the server.
+        logger.debug("PreparedStatementPool cache miss; preparing SQL: %.80s", sql)
+        stmt = await self._conn.prepare(sql)
+
+        async with self._lock:
+            # Another coroutine may have prepared the same SQL while we awaited;
+            # accept the racing entry rather than preparing twice.
+            if sql not in self._cache:
+                if len(self._cache) >= self._max_size:
+                    evicted_sql, _ = self._cache.popitem(last=False)
+                    logger.debug(
+                        "PreparedStatementPool evicted oldest entry: %.80s",
+                        evicted_sql,
+                    )
+                self._cache[sql] = stmt
+                self._cache.move_to_end(sql)
+
+        return self._cache[sql]
+
+    async def prepare_all(self, sql_statements: List[str]) -> None:
+        """Pre-warm the cache by preparing a list of SQL strings eagerly.
+
+        Useful at application startup to ensure the first ingestion batch
+        does not pay any preparation round-trip cost.
+
+        Parameters
+        ----------
+        sql_statements:
+            Iterable of parameterised SQL strings to prepare.
+        """
+        for sql in sql_statements:
+            await self.get_or_prepare(sql)
+        logger.info(
+            "PreparedStatementPool pre-warmed %d statements", len(sql_statements)
+        )
+
+    async def invalidate(self, sql: str) -> bool:
+        """Remove a single SQL entry from the cache.
+
+        Use this after a DDL change (e.g. ``ALTER TABLE``) that invalidates a
+        previously prepared plan.  The next call to :meth:`get_or_prepare` for
+        the same SQL will issue a fresh ``PREPARE`` against the updated schema.
+
+        Returns ``True`` if the entry was present and removed, ``False`` if it
+        was not cached.
+        """
+        async with self._lock:
+            if sql in self._cache:
+                del self._cache[sql]
+                logger.info("PreparedStatementPool invalidated entry: %.80s", sql)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    @property
+    def size(self) -> int:
+        """Number of statements currently in the cache."""
+        return len(self._cache)
+
+    @property
+    def max_size(self) -> int:
+        """Maximum cache capacity supplied at construction time."""
+        return self._max_size
+
+    @property
+    def cached_sql(self) -> List[str]:
+        """Snapshot of SQL strings currently held in the cache (MRU last)."""
+        return list(self._cache.keys())
