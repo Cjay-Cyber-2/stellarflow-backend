@@ -2,8 +2,13 @@
 
 The register maintains a mapping from arbitrary string identifiers (e.g. ``asset_pair``
 or ``worker_name``) to boolean flags that indicate whether a particular worker is
-currently active.  All operations are protected by a :class:`multiprocessing.Lock`
-ensuring safe concurrent access from multiple ingestion processes.
+currently active.  All operations are protected by an inter-process file lock
+(:func:`fcntl.flock`) ensuring safe concurrent access from multiple forked worker
+processes.
+
+On platforms without :func:`fcntl` (e.g. Windows), a module-level
+:class:`multiprocessing.Lock` is used as a fallback — this prevents thread-level
+races within a single process but does **not** guarantee cross-process exclusion.
 
 Typical usage::
 
@@ -35,53 +40,86 @@ try:
 except ImportError:
     fcntl = None
 
+# Fallback lock for platforms without fcntl — module-level so it survives forking.
+_PROCESS_LOCK: Optional[multiprocessing.Lock] = multiprocessing.Lock() if fcntl is None else None
+
 
 class StateRegister:
     """Process‑safe registry for boolean activity flags.
 
+    Synchronisation uses :func:`fcntl.flock` on the lock file (``<filepath>.lock``),
+    which works correctly across forked child processes on Linux.  On platforms
+    without ``fcntl``, a module-level :class:`multiprocessing.Lock` fallback
+    prevents intra-process thread races.
+
     Attributes:
         _filepath: Filepath to the local operational metadata file layout.
-        _lock: Inter-process mutex guarding all modifications and reads of the state file.
     """
 
     def __init__(self, filepath: str = "state_register.json") -> None:
         self._filepath = filepath
         self._lock_filepath = filepath + ".lock"
-        self._lock = multiprocessing.Lock()
-        with self._lock:
-            dir_name = os.path.dirname(self._filepath) or "."
-            if dir_name and not os.path.exists(dir_name):
-                os.makedirs(dir_name, exist_ok=True)
-            self._execute_with_file_lock(self._init_file)
+        dir_name = os.path.dirname(self._filepath) or "."
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name, exist_ok=True)
+        self._run_locked(self._init_file)
+
+    # ------------------------------------------------------------------
+    # Internal lock helpers
+    # ------------------------------------------------------------------
+
+    def _acquire_lock(self) -> Optional[object]:
+        """Acquire the inter-process lock.
+
+        Uses ``fcntl.flock`` on the lock file when available (Linux/macOS),
+        falling back to the module-level ``multiprocessing.Lock``.
+
+        Returns a context-manager-like *token* that must be passed to
+        :meth:`_release_lock`, or ``None`` if no locking is available.
+        """
+        if fcntl is not None:
+            lock_file = open(self._lock_filepath, "w")
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            return lock_file
+        if _PROCESS_LOCK is not None:
+            _PROCESS_LOCK.acquire()
+            return _PROCESS_LOCK
+        return None
+
+    def _release_lock(self, token: Optional[object]) -> None:
+        """Release the lock acquired by :meth:`_acquire_lock`."""
+        if token is None:
+            return
+        if isinstance(token, multiprocessing.Lock):
+            token.release()
+        else:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(token, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                token.close()
+            except Exception:
+                pass
+
+    def _run_locked(self, func, *args, **kwargs):
+        """Execute *func* while holding the inter-process lock."""
+        token = self._acquire_lock()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            self._release_lock(token)
 
     def _init_file(self) -> None:
         if not os.path.exists(self._filepath):
-            self._write_state_unlocked({})
+            self._write_state_unsafe({})
 
-    def _execute_with_file_lock(self, func, *args, **kwargs):
-        """Execute a function while holding an advisory file lock on Linux."""
-        if fcntl is None:
-            return func(*args, **kwargs)
-        with open(self._lock_filepath, "w") as lock_file:
-            try:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
-                return func(*args, **kwargs)
-            finally:
-                try:
-                    fcntl.flock(lock_file, fcntl.LOCK_UN)
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------
+    # State I/O (callers must hold the lock)
+    # ------------------------------------------------------------------
 
-    def _load_state(self) -> Dict[str, bool]:
-        """Load state map from the file.
-
-        Complexity:
-        Time: O(S) where S is the size of the JSON file (de-serialization).
-        Space: O(S) memory footprint to hold the parsed state map.
-        """
-        return self._execute_with_file_lock(self._load_state_unlocked)
-
-    def _load_state_unlocked(self) -> Dict[str, bool]:
+    def _load_state_unsafe(self) -> Dict[str, bool]:
         if not os.path.exists(self._filepath):
             return {}
         try:
@@ -93,16 +131,7 @@ class StateRegister:
         except Exception:
             return {}
 
-    def _write_state(self, flags: Dict[str, bool]) -> None:
-        """Atomically persist state map to the file using a temporary file.
-
-        Complexity:
-        Time: O(S) where S is the size of the JSON file (serialization).
-        Space: O(S) for temporary buffers.
-        """
-        self._execute_with_file_lock(self._write_state_unlocked, flags)
-
-    def _write_state_unlocked(self, flags: Dict[str, bool]) -> None:
+    def _write_state_unsafe(self, flags: Dict[str, bool]) -> None:
         dir_name = os.path.dirname(self._filepath) or "."
         fd, temp_path = tempfile.mkstemp(
             dir=dir_name,
@@ -123,24 +152,33 @@ class StateRegister:
                     pass
             raise
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def is_active(self, key: str) -> bool:
         """Return ``True`` if the flag for *key* is set, ``False`` otherwise.
 
-        This method acquires the internal lock to guarantee a consistent view.
+        This method acquires the inter-process lock to guarantee a consistent view
+        across all worker processes.
         """
-        with self._lock:
-            flags = self._load_state()
-            return flags.get(key, False)
+        return self._run_locked(self._is_active_unsafe, key)
+
+    def _is_active_unsafe(self, key: str) -> bool:
+        flags = self._load_state_unsafe()
+        return flags.get(key, False)
 
     def activate(self, key: str) -> None:
         """Mark the flag for *key* as active (``True``).
 
         If the key does not yet exist, it is created.
         """
-        with self._lock:
-            flags = self._load_state()
-            flags[key] = True
-            self._write_state(flags)
+        self._run_locked(self._activate_unsafe, key)
+
+    def _activate_unsafe(self, key: str) -> None:
+        flags = self._load_state_unsafe()
+        flags[key] = True
+        self._write_state_unsafe(flags)
 
     def try_acquire(self, key: str) -> bool:
         """Atomically check if *key* is inactive and, if so, activate it.
@@ -149,13 +187,14 @@ class StateRegister:
         worker was running for the same ``key``). Returns ``False`` if the flag was
         already ``True``.
         """
-        with self._lock:
-            flags = self._load_state()
+        def _try_acquire_unsafe() -> bool:
+            flags = self._load_state_unsafe()
             if flags.get(key, False):
                 return False
             flags[key] = True
-            self._write_state(flags)
+            self._write_state_unsafe(flags)
             return True
+        return self._run_locked(_try_acquire_unsafe)
 
     def deactivate(self, key: str) -> None:
         """Mark the flag for *key* as inactive (``False``).
@@ -163,10 +202,12 @@ class StateRegister:
         The key is retained in the mapping to allow future ``is_active`` checks
         without raising ``KeyError``.
         """
-        with self._lock:
-            flags = self._load_state()
-            flags[key] = False
-            self._write_state(flags)
+        self._run_locked(self._deactivate_unsafe, key)
+
+    def _deactivate_unsafe(self, key: str) -> None:
+        flags = self._load_state_unsafe()
+        flags[key] = False
+        self._write_state_unsafe(flags)
 
     # Alias for clarity when releasing a worker lock
     def release(self, key: str) -> None:
@@ -181,10 +222,12 @@ class StateRegister:
 
         After removal, ``is_active`` will return ``False`` for the key.
         """
-        with self._lock:
-            flags = self._load_state()
-            flags.pop(key, None)
-            self._write_state(flags)
+        self._run_locked(self._clear_unsafe, key)
+
+    def _clear_unsafe(self, key: str) -> None:
+        flags = self._load_state_unsafe()
+        flags.pop(key, None)
+        self._write_state_unsafe(flags)
 
     def snapshot(self) -> Dict[str, bool]:
         """Return a shallow copy of the current flags mapping.
@@ -192,8 +235,7 @@ class StateRegister:
         The copy is taken under lock to avoid race conditions; callers can safely
         iterate over the result without further synchronization.
         """
-        with self._lock:
-            return self._load_state()
+        return self._run_locked(self._load_state_unsafe)
 
     # Optional convenience context manager for safe activation/deactivation
     def guard(self, key: str):
