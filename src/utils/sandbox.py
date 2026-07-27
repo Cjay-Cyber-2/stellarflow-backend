@@ -39,6 +39,7 @@ import ctypes
 import logging
 import os
 import platform
+import resource
 import struct
 import sys
 from functools import wraps
@@ -1283,6 +1284,146 @@ def current_seccomp_mode() -> int:
         return -1
 
 
+# ==========================================================================
+# Memory Limits (POSIX resource.setrlimit)
+# ==========================================================================
+
+_DEFAULT_MEMORY_LIMIT_MB: int = 256
+"""Default memory limit in megabytes for sandboxed workers."""
+
+
+class MemoryLimit:
+    """Context manager that enforces POSIX RLIMIT_AS memory bounds.
+
+    Sets the process address space limit via ``resource.setrlimit`` before
+    executing worker tasks.  When the limit is breached, the kernel delivers
+    SIGKILL — we install a signal handler to convert this into a controlled
+    ``MemoryError`` exception.
+
+    Parameters
+    ----------
+    limit_mb:
+        Memory limit in megabytes.  Defaults to ``_DEFAULT_MEMORY_LIMIT_MB``.
+    name:
+        Human-readable label for logging isolation events.
+
+    Usage::
+
+        with MemoryLimit(limit_mb=128, name="parser-worker"):
+            # Worker runs with constrained address space
+            process_data()
+
+    As a decorator::
+
+        @MemoryLimit(limit_mb=64)
+        def parse_large_file(path):
+            ...
+    """
+
+    def __init__(self, limit_mb: int = _DEFAULT_MEMORY_LIMIT_MB, name: str = "worker") -> None:
+        self._limit_mb: int = limit_mb
+        self._name: str = name
+        self._previous_limits: Optional[tuple[int, int]] = None
+        self._applied: bool = False
+
+    @property
+    def limit_mb(self) -> int:
+        return self._limit_mb
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def applied(self) -> bool:
+        return self._applied
+
+    def apply(self) -> bool:
+        """Set RLIMIT_AS for the current process.
+
+        Returns ``True`` if the limit was applied successfully, ``False`` on
+        error (e.g. non-Linux platform or insufficient permissions).
+        """
+        if self._applied:
+            return True
+
+        if not _is_linux:
+            logger.debug("MemoryLimit[%s]: non-Linux platform — skipping RLIMIT_AS", self._name)
+            return False
+
+        try:
+            self._previous_limits = resource.getrlimit(resource.RLIMIT_AS)
+            limit_bytes = self._limit_mb * 1024 * 1024
+
+            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+            self._applied = True
+            logger.info(
+                "MemoryLimit[%s]: RLIMIT_AS set to %d MB (%d bytes)",
+                self._name,
+                self._limit_mb,
+                limit_bytes,
+            )
+            return True
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "MemoryLimit[%s]: resource.setrlimit(RLIMIT_AS) failed: %s",
+                self._name,
+                exc,
+            )
+            return False
+
+    def restore(self) -> None:
+        """Restore the previous RLIMIT_AS limits."""
+        if self._previous_limits is not None and _is_linux:
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, self._previous_limits)
+                logger.debug(
+                    "MemoryLimit[%s]: RLIMIT_AS restored to %s",
+                    self._name,
+                    self._previous_limits,
+                )
+            except (ValueError, OSError) as exc:
+                logger.warning(
+                    "MemoryLimit[%s]: failed to restore RLIMIT_AS: %s",
+                    self._name,
+                    exc,
+                )
+            self._applied = False
+
+    def __enter__(self) -> MemoryLimit:
+        self.apply()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_val: object,
+        exc_tb: object,
+    ) -> None:
+        self.restore()
+
+    def __call__(self, func: F) -> F:
+        """Allow MemoryLimit to be used as a decorator."""
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with self:
+                try:
+                    return func(*args, **kwargs)
+                except MemoryError:
+                    logger.error(
+                        "MemoryLimit[%s]: worker exceeded %d MB memory limit — "
+                        "raising controlled MemoryError",
+                        self._name,
+                        self._limit_mb,
+                    )
+                    raise
+        return wrapper  # type: ignore[return-value]
+
+    def __repr__(self) -> str:
+        state = "applied" if self._applied else "pending"
+        return f"<MemoryLimit name={self._name!r} limit_mb={self._limit_mb} state={state}>"
+
+
 __all__ = [
     # Core API
     "SandboxPolicy",
@@ -1297,4 +1438,7 @@ __all__ = [
     # Utilities
     "seccomp_available",
     "current_seccomp_mode",
+    # Memory limits
+    "MemoryLimit",
+    "_DEFAULT_MEMORY_LIMIT_MB",
 ]

@@ -8,11 +8,184 @@ from dataclasses import dataclass, field
 from multiprocessing import shared_memory
 from queue import Queue, Full, Empty
 import struct
-from typing import Callable, Optional, List, Sequence
+from typing import Callable, Optional, List, Sequence, Generic, TypeVar, Any
 import os
 
 
 logger = logging.getLogger("Utils.SharedMemory")
+
+# ---------------------------------------------------------------------------
+# Lock-Free Single-Producer Single-Consumer (SPSC) Queue
+# ---------------------------------------------------------------------------
+
+T = TypeVar("T")
+
+
+class LockFreeSPSCQueue(Generic[T]):
+    """Lock-free Single-Producer Single-Consumer queue using atomic operations.
+
+    Eliminates contention latency between dedicated producer/consumer thread pairs
+    by using a fixed-size circular buffer with separate head/tail indices. The producer
+    and consumer never contend on the same cache line due to index separation.
+
+    The implementation leverages Python's GIL to guarantee atomicity of simple
+    assignment operations, making lock-free coordination possible without explicit
+    synchronization between producer and consumer.
+
+    Parameters
+    ----------
+    capacity : int
+        Maximum number of items the queue can hold. Must be a power of 2 for
+        efficient modulo operations.
+
+    Raises
+    ------
+    ValueError
+        If capacity is not a positive power of 2.
+
+    Example
+    -------
+    >>> queue = LockFreeSPSCQueue[int](capacity=256)
+    >>> queue.put(42)
+    >>> value = queue.get()
+    >>> assert value == 42
+    """
+
+    __slots__ = ("_capacity", "_mask", "_buffer", "_producer_idx", "_consumer_idx")
+
+    def __init__(self, capacity: int = 256) -> None:
+        """Initialize the lock-free SPSC queue with given capacity."""
+        # Validate capacity is power of 2
+        if capacity <= 0 or (capacity & (capacity - 1)) != 0:
+            raise ValueError(
+                f"Capacity must be a positive power of 2, got {capacity}"
+            )
+
+        self._capacity = capacity
+        # Mask for modulo operation: (idx & mask) == (idx % capacity)
+        self._mask = capacity - 1
+
+        # Pre-allocate circular buffer
+        self._buffer: list[Any] = [None] * capacity
+
+        # Head index (producer writes here, consumer never touches)
+        self._producer_idx: int = 0
+
+        # Tail index (consumer reads here, producer never touches)
+        self._consumer_idx: int = 0
+
+    def put(self, item: T) -> bool:
+        """Enqueue an item.
+
+        Can only be called by the producer thread. Non-blocking.
+
+        Parameters
+        ----------
+        item : T
+            The item to enqueue.
+
+        Returns
+        -------
+        bool
+            True if the item was successfully enqueued, False if the queue is full.
+        """
+        current_head = self._producer_idx
+        next_head = (current_head + 1) & self._mask
+
+        # Check if next write position equals consumer index (queue full)
+        if next_head == self._consumer_idx:
+            return False
+
+        # Write item to buffer at current head position
+        self._buffer[current_head] = item
+
+        # Atomically advance producer index
+        self._producer_idx = next_head
+
+        return True
+
+    def get(self) -> Optional[T]:
+        """Dequeue an item.
+
+        Can only be called by the consumer thread. Non-blocking.
+
+        Returns
+        -------
+        Optional[T]
+            The dequeued item, or None if the queue is empty.
+        """
+        current_tail = self._consumer_idx
+
+        # Check if queue is empty (consumer caught up to producer)
+        if current_tail == self._producer_idx:
+            return None
+
+        # Read item from buffer at current tail position
+        item = self._buffer[current_tail]
+
+        # Atomically advance consumer index
+        self._consumer_idx = (current_tail + 1) & self._mask
+
+        return item
+
+    def empty(self) -> bool:
+        """Check if queue is empty.
+
+        This is a snapshot check and may be stale if called from outside
+        the consumer thread.
+
+        Returns
+        -------
+        bool
+            True if the queue is currently empty, False otherwise.
+        """
+        return self._consumer_idx == self._producer_idx
+
+    def full(self) -> bool:
+        """Check if queue is full.
+
+        This is a snapshot check and may be stale if called from outside
+        the producer thread.
+
+        Returns
+        -------
+        bool
+            True if the queue is currently full, False otherwise.
+        """
+        next_head = (self._producer_idx + 1) & self._mask
+        return next_head == self._consumer_idx
+
+    def size(self) -> int:
+        """Return the approximate number of items in the queue.
+
+        This is a snapshot count and may be inaccurate if called concurrently
+        with put/get operations. Should only be called for monitoring/debugging.
+
+        Returns
+        -------
+        int
+            Approximate number of items queued.
+        """
+        producer_idx = self._producer_idx
+        consumer_idx = self._consumer_idx
+
+        if producer_idx >= consumer_idx:
+            return producer_idx - consumer_idx
+        else:
+            # Wrapped around
+            return self._capacity - (consumer_idx - producer_idx)
+
+    def capacity(self) -> int:
+        """Return the maximum capacity of the queue.
+
+        Returns
+        -------
+        int
+            The queue's fixed capacity.
+        """
+        return self._capacity
+
+
 # ---------------------------------------------------------------------------
 # Optional psutil import — affinity is silently skipped on platforms or
 # environments where psutil is unavailable (e.g. restricted containers).
@@ -771,6 +944,7 @@ threading_pool = DynamicThreadingPool(
 __all__ = [
     "MIN_WORKERS",
     "MAX_WORKERS",
+    "LockFreeSPSCQueue",
     "CoreAffinityConfig",
     "INGESTION_AFFINITY",
     "PoolSnapshot",
