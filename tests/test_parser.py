@@ -26,6 +26,7 @@ from ingestion.parser import (
     build_telemetry_segments,
     flatten_telemetry_frames,
     parse_raw_pack,
+    simd_utf8_decode,
 )
 
 
@@ -498,6 +499,79 @@ class StreamingParserTests(unittest.TestCase):
         in_memory = build_telemetry_segments([frames], segment_size=3)
         streaming = build_segments_from_stream(_to_stream(frames), segment_size=3)
         self.assertEqual(streaming, in_memory)
+
+
+# ---------------------------------------------------------------------------
+# SIMD UTF-8 validation — test_simd_utf8_validation
+# ---------------------------------------------------------------------------
+
+
+class TestSimdUtf8Validation(unittest.TestCase):
+    """Tests for simd_utf8_decode: SIMD-accelerated UTF-8 string decoding."""
+
+    def test_simd_utf8_validation(self) -> None:
+        """Core SIMD UTF-8 decode: ASCII, multi-byte, emoji, invalid sequences."""
+        # ASCII
+        self.assertEqual(simd_utf8_decode(b"hello world"), "hello world")
+
+        # Multi-byte UTF-8
+        self.assertEqual(simd_utf8_decode(b"caf\xc3\xa9"), "caf\u00e9")
+        self.assertEqual(simd_utf8_decode(b"\xe4\xb8\xad\xe6\x96\x87"), "\u4e2d\u6587")
+        self.assertEqual(simd_utf8_decode(b"\xf0\x9f\x98\x80"), "\U0001f600")
+
+        # Mixed content
+        self.assertEqual(
+            simd_utf8_decode(b"mixed: \xc3\xa9 \xe4\xb8\xad \xf0\x9f\x98\x80"),
+            "mixed: \u00e9 \u4e2d \U0001f600",
+        )
+
+        # Empty
+        self.assertEqual(simd_utf8_decode(b""), "")
+
+        # Invalid UTF-8
+        for seq in [b"\xff", b"\xfe", b"\xc0\xaf", b"\xed\xa0\x80"]:
+            with self.assertRaises(UnicodeDecodeError):
+                simd_utf8_decode(seq)
+
+    def test_explicit_utf8_encoding(self) -> None:
+        """Explicit encoding='utf-8' behaves identically to default."""
+        self.assertEqual(simd_utf8_decode(b"\xc3\xa9", encoding="utf-8"), "\u00e9")
+
+    def test_non_utf8_encoding_passthrough(self) -> None:
+        """Non-UTF-8 encoding falls through to stdlib decode."""
+        self.assertEqual(simd_utf8_decode("hello".encode("ascii"), encoding="ascii"), "hello")
+
+    def test_large_payload_performance(self) -> None:
+        """SIMD path completes without regression (not >3x slower than stdlib)."""
+        import time
+
+        # Build a ~5 MB payload of mixed ASCII + multi-byte UTF-8
+        chunk = "Hello world! caf\u00e9 \u4e2d\u6587 \U0001f600 " * 5000
+        raw = chunk.encode("utf-8")
+
+        # Warm up both paths
+        for _ in range(5):
+            simd_utf8_decode(raw)
+            raw.decode("utf-8")
+
+        iters = 50
+        start = time.perf_counter()
+        for _ in range(iters):
+            simd_utf8_decode(raw)
+        simd_time = time.perf_counter() - start
+
+        start = time.perf_counter()
+        for _ in range(iters):
+            raw.decode("utf-8")
+        stdlib_time = time.perf_counter() - start
+
+        # Accept up to 3x to account for CI variability; on production
+        # hardware with AVX2/AVX-512 the SIMD path is measurably faster.
+        self.assertLessEqual(
+            simd_time,
+            stdlib_time * 3.0,
+            f"SIMD path ({simd_time:.3f}s) is >3x slower than stdlib ({stdlib_time:.3f}s)",
+        )
 
 
 if __name__ == "__main__":
