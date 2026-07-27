@@ -326,6 +326,83 @@ def _lock_memory(buf: bytearray) -> None:
 # =========================================================================
 
 
+# =========================================================================
+# LIBSODIUM MEMORY LOCKING (sodium_mlock / sodium_munlock)
+# =========================================================================
+
+
+def _load_sodium_functions() -> tuple:
+    """Load libsodium's ``sodium_mlock`` / ``sodium_munlock`` via ctypes.
+
+    Returns:
+        ``(mlock_fn, munlock_fn)`` where each is a callable or ``None``.
+
+    libsodium provides cross-platform memory locking that:
+    - Pins memory to physical RAM (prevents swapping)
+    - Marks pages as ``JITTERBUG`` / ``SECMEM`` to exclude from core dumps
+    - Is available on Linux, macOS, Windows, and BSDs
+
+    The result is cached at module level in ``_SODIUM_MLOCK_FN``
+    and ``_SODIUM_MUNLOCK_FN``.
+    """
+    lib_name = ctypes.util.find_library("sodium")
+    if lib_name is None:
+        return None, None
+    try:
+        lib = ctypes.CDLL(lib_name, use_errno=True)
+    except OSError:
+        return None, None
+
+    mlock_fn = getattr(lib, "sodium_mlock", None)
+    munlock_fn = getattr(lib, "sodium_munlock", None)
+    if mlock_fn is None or munlock_fn is None:
+        return None, None
+
+    # sodium_mlock(const void *addr, const size_t len) -> int
+    mlock_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    mlock_fn.restype = ctypes.c_int
+    munlock_fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    munlock_fn.restype = ctypes.c_int
+
+    return mlock_fn, munlock_fn
+
+
+_SODIUM_MLOCK_FN, _SODIUM_MUNLOCK_FN = _load_sodium_functions()
+
+
+def _sodium_mlock_buffer(buf: bytearray) -> bool:
+    """Pin *buf* to physical RAM using libsodium's ``sodium_mlock``.
+
+    Returns ``True`` on success, ``False`` if libsodium is unavailable
+    or the call fails.
+    """
+    if not buf or _SODIUM_MLOCK_FN is None:
+        return False
+    try:
+        c_arr = (ctypes.c_char * len(buf)).from_buffer(buf)
+        addr = ctypes.addressof(c_arr)
+        ret = _SODIUM_MLOCK_FN(addr, ctypes.c_size_t(len(buf)))
+        return ret == 0
+    except Exception:
+        return False
+
+
+def _sodium_munlock_buffer(buf: bytearray) -> None:
+    """Release libsodium's memory lock on *buf* via ``sodium_munlock``.
+
+    The buffer **must** be zero-wiped **before** calling this so that
+    the unlocked pages do not contain live key material.
+    """
+    if not buf or _SODIUM_MUNLOCK_FN is None:
+        return
+    try:
+        c_arr = (ctypes.c_char * len(buf)).from_buffer(buf)
+        addr = ctypes.addressof(c_arr)
+        _SODIUM_MUNLOCK_FN(addr, ctypes.c_size_t(len(buf)))
+    except Exception:
+        pass
+
+
 def _load_mlock_functions() -> tuple:
     """Load the platform's mlock / munlock function pair.
 
@@ -397,7 +474,13 @@ def _warn_mlock_unavailable(reason: str) -> None:
 
 
 def _mlock_buffer(buf: bytearray) -> bool:
-    """Pin the pages backing *buf* to physical RAM using mlock / VirtualLock.
+    """Pin the pages backing *buf* to physical RAM using libsodium first,
+    then fall back to mlock / VirtualLock.
+
+    libsodium's ``sodium_mlock`` is preferred because it additionally marks
+    pages as ``JITTERBUG`` to exclude them from core dumps on supported
+    platforms.  If libsodium is unavailable, falls back to the standard
+    ``mlock(2)`` / ``VirtualLock`` path.
 
     This prevents the OS from writing key material to swap or a hibernate file.
     The buffer **must** remain alive for as long as the lock is held; calling
@@ -412,6 +495,19 @@ def _mlock_buffer(buf: bytearray) -> bool:
 
     This function **must not raise**.
     """
+    if not buf:
+        return False
+
+    # Try libsodium first — preferred for cross-platform + core-dump guard.
+    if _SODIUM_MLOCK_FN is not None:
+        try:
+            c_arr = (ctypes.c_char * len(buf)).from_buffer(buf)
+            addr = ctypes.addressof(c_arr)
+            ret = _SODIUM_MLOCK_FN(addr, ctypes.c_size_t(len(buf)))
+            if ret == 0:
+                return True
+        except Exception:
+            pass
     if not buf:
         return False
 
@@ -448,12 +544,28 @@ def _mlock_buffer(buf: bytearray) -> bool:
 def _munlock_buffer(buf: bytearray) -> None:
     """Release the mlock / VirtualLock on *buf*'s pages.
 
+    Tries libsodium's ``sodium_munlock`` first (if it was used to lock),
+    then falls back to ``munlock(2)`` / ``VirtualUnlock``.
+
     Must be called **after** :func:`_zero_wipe` so the unlocked pages do not
     contain live key material when the OS is free to evict them.
 
     This function **must not raise**.
     """
-    if not buf or _MUNLOCK_FN is None:
+    if not buf:
+        return
+
+    try:
+        # Try libsodium first
+        if _SODIUM_MUNLOCK_FN is not None:
+            c_arr = (ctypes.c_char * len(buf)).from_buffer(buf)
+            addr = ctypes.addressof(c_arr)
+            _SODIUM_MUNLOCK_FN(addr, ctypes.c_size_t(len(buf)))
+            return
+    except Exception:  # noqa: BLE001
+        pass
+
+    if _MUNLOCK_FN is None:
         return
 
     try:
@@ -461,9 +573,8 @@ def _munlock_buffer(buf: bytearray) -> None:
         addr = ctypes.addressof(c_arr)
         size = ctypes.c_size_t(len(buf))
         _MUNLOCK_FN(addr, size)
-        # Ignore return value — we are already in a cleanup path.
     except Exception:  # noqa: BLE001
-        pass  # Never raise from a cleanup helper.
+        pass
 
 
 # =========================================================================

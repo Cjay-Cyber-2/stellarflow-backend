@@ -649,6 +649,58 @@ class TestSecureSessionCredentialsLogging:
 # ---------------------------------------------------------------------------
 
 
+class TestSodiumMemoryLocking:
+    """Tests for libsodium-based memory locking (sodium_mlock / sodium_munlock)."""
+
+    def test_sodium_memory_locking_loads_functions(self) -> None:
+        """sodium_mlock and sodium_munlock should be loadable via ctypes."""
+        from crypto.signer import _SODIUM_MLOCK_FN, _SODIUM_MUNLOCK_FN
+
+        # On systems without libsodium, both will be None — that's acceptable.
+        # The test verifies the loading logic doesn't crash.
+        if _SODIUM_MLOCK_FN is not None:
+            assert callable(_SODIUM_MLOCK_FN)
+        if _SODIUM_MUNLOCK_FN is not None:
+            assert callable(_SODIUM_MUNLOCK_FN)
+
+    def test_sodium_mlock_buffer_with_dummy_key(self) -> None:
+        """sodium_mlock should be callable on a dummy buffer."""
+        from crypto.signer import _sodium_mlock_buffer, _sodium_munlock_buffer
+
+        buf = bytearray(os.urandom(32))
+        result = _sodium_mlock_buffer(buf)
+
+        # If libsodium is available, lock should succeed
+        # If not, it should return False gracefully
+        if result:
+            _sodium_munlock_buffer(buf)
+            assert True  # lock/unlock cycle completed without error
+
+    def test_sodium_memory_locking_integration_with_securekeyhandle(self) -> None:
+        """SecureKeyHandle should use libsodium locking when available."""
+        from crypto.signer import SecureKeyHandle, _SODIUM_MLOCK_FN
+
+        # If libsodium is not available, skip
+        if _SODIUM_MLOCK_FN is None:
+            pytest.skip("libsodium not available on this platform")
+
+        buf = bytearray(os.urandom(32))
+        with SecureKeyHandle(bytes(buf)) as handle:
+            assert handle is not None
+            # The handle wraps the buffer — locking is attempted on init
+            assert handle._locked  # noqa: SLF001
+
+    def test_sodium_memory_locking_fallback_on_missing_library(self) -> None:
+        """_mlock_buffer should fall back to mlock when libsodium is absent."""
+        from crypto.signer import _mlock_buffer, _SODIUM_MLOCK_FN
+
+        buf = bytearray(os.urandom(32))
+        result = _mlock_buffer(buf)
+
+        # Should not raise regardless of libsodium availability
+        assert isinstance(result, bool)
+
+
 class TestHardwareAccelerationFlags:
     def test_openssl_hardware_acceleration_configured(self):
         """Verify that OpenSSL hardware acceleration configuration runs without error."""

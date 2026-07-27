@@ -1435,6 +1435,10 @@ __all__ = [
     "BPFBuilder",
     # Syscall enumeration
     "Syscall",
+    # Subprocess signal forwarding
+    "register_signal_handlers",
+    "register_child_process",
+    "unregister_child_process",
     # Utilities
     "seccomp_available",
     "current_seccomp_mode",
