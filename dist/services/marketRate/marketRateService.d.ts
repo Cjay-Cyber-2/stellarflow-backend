@@ -38,7 +38,7 @@ export declare class MarketRateService {
     /**
      * Get backpressure metrics for monitoring queue health
      */
-    getBackpressureMetrics(): any;
+    getBackpressureMetrics(): import("../../flow_control/backpressure").BackpressureMetrics;
     /**
      * Reset backpressure metrics (useful for testing)
      */
