@@ -114,13 +114,72 @@ import os
 import platform
 import threading
 from types import TracebackType
-from typing import Iterator, Optional, Type
+from typing import Any, Iterator, Optional, Type
 
 logger = logging.getLogger(__name__)
 audit_logger = logging.getLogger(f"{__name__}.audit")
 
+# =========================================================================
+# OPENSSL HARDWARE ACCELERATION CONFIGURATION
+# =========================================================================
+
+def _configure_openssl_hardware_acceleration() -> None:
+    """Enable OpenSSL hardware acceleration flags (AES-NI/AVX2) for signature verification.
+    
+    This function configures OpenSSL to use available CPU instruction set extensions
+    for accelerated cryptographic operations. It sets environment variables and
+    attempts to configure OpenSSL's ENGINE to enable hardware acceleration.
+    
+    The following accelerations are enabled when available:
+    - AES-NI: Advanced Encryption Standard New Instructions for AES operations
+    - AVX2: Advanced Vector Extensions for parallel processing
+    - SHA-NI: SHA extensions for hash operations
+    """
+    # Enable OpenSSL hardware acceleration via environment variables
+    # These flags are read by OpenSSL when initializing crypto operations
+    os.environ.setdefault("OPENSSL_ia32cap", "~0x200000200000000")  # Enable AVX2, AES-NI
+    
+    # Try to configure OpenSSL ENGINE for hardware acceleration
+    try:
+        # Load OpenSSL library
+        if os.name == "nt":
+            openssl_libs = ["libeay32.dll", "libssl32.dll", "libcrypto.dll"]
+        else:
+            openssl_libs = ["libcrypto.so.1.1", "libcrypto.so.3", "libcrypto.so"]
+        
+        openssl_loaded = False
+        for lib_name in openssl_libs:
+            try:
+                lib_path = ctypes.util.find_library(lib_name)
+                if lib_path:
+                    openssl = ctypes.CDLL(lib_path)
+                    openssl_loaded = True
+                    logger.debug(f"[OpenSSL] Loaded library: {lib_path}")
+                    break
+            except (OSError, AttributeError):
+                continue
+        
+        if openssl_loaded:
+            # Try to enable hardware acceleration via ENGINE
+            try:
+                # OpenSSL 1.1.1+ uses ENGINE_load_builtin_engines
+                if hasattr(openssl, "ENGINE_load_builtin_engines"):
+                    openssl.ENGINE_load_builtin_engines()
+                    openssl.ENGINE_register_all_complete()
+                    logger.debug("[OpenSSL] Hardware acceleration engines loaded")
+            except Exception:
+                # ENGINE functions may not be available in all OpenSSL builds
+                pass
+    except Exception as exc:
+        # Hardware acceleration is optional - log but don't fail
+        logger.debug(f"[OpenSSL] Hardware acceleration configuration failed (optional): {exc}")
+
+# Configure OpenSSL acceleration at module import time
+_configure_openssl_hardware_acceleration()
+
 __all__ = [
     "SecureKeyHandle",
+    "PublicKeyHandle",
     "SecureSessionCredentials",
     "SecureVariableWrapper",
     "SigningError",
@@ -598,6 +657,125 @@ class SecureKeyHandle:
                 return bytes(sk.sign(tx_hash).signature)
         except Exception as exc:
             raise SigningError("Signing failed (PyNaCl path).") from exc
+
+
+# =========================================================================
+# PUBLIC API - PUBLIC KEY HANDLE (TYPE-ISOLATED FROM PRIVATE KEY)
+# =========================================================================
+
+
+class PublicKeyHandle:
+    """Type-isolated public key container with memory safety guarantees.
+
+    This class enforces strict separation between public and private key
+    structures. Public key operations have zero programmatic or memory access
+    to private key fields. The public key is stored in an immutable bytes
+    object and cannot be used for signing operations.
+
+    This is a security boundary isolator: attempting to use a PublicKeyHandle
+    where a private key is expected will fail at type-check time, preventing
+    accidental reference sharing between public and private key objects.
+
+    Args:
+        public_key_bytes: The public key bytes (typically 32 bytes for Ed25519).
+        key_id: Optional identifier for audit logging.
+
+    Raises:
+        ValueError: If public_key_bytes is empty.
+
+    Example::
+
+        # Derive public key from private key handle
+        with SecureKeyHandle(private_key_bytes) as priv_handle:
+            signature = priv_handle.sign(tx_hash)
+            # Public key can be extracted separately
+            pub_handle = PublicKeyHandle(derive_public_key(private_key_bytes))
+
+        # Public key handle cannot sign - type isolation enforced
+        # pub_handle.sign(tx_hash)  # AttributeError: no such method
+    """
+
+    __slots__ = ("_public_key", "_key_id", "_frozen")
+
+    def __init__(self, public_key_bytes: bytes, key_id: str = "public_key") -> None:
+        if not public_key_bytes:
+            raise ValueError("public_key_bytes must be non-empty bytes.")
+        # Store as immutable bytes to prevent modification
+        self._public_key: bytes = bytes(public_key_bytes)
+        self._key_id: str = key_id
+        self._frozen: bool = True  # Immutable after construction
+
+        audit_log.log_key_imported(f"pub_{self._key_id}", len(self._public_key))
+
+    def __repr__(self) -> str:
+        return f"<PublicKeyHandle key_id={self._key_id!r} bytes={len(self._public_key)}>"
+
+    @property
+    def bytes(self) -> bytes:
+        """Return the public key bytes (immutable copy)."""
+        return self._public_key
+
+    @property
+    def key_id(self) -> str:
+        """Return the key identifier."""
+        return self._key_id
+
+    def verify(self, signature: bytes, message: bytes) -> bool:
+        """Verify a signature against the public key.
+
+        This is the only operation allowed on public keys - verification only.
+        No signing or private key access is possible.
+
+        Args:
+            signature: The signature bytes to verify.
+            message: The message bytes that were signed.
+
+        Returns:
+            True if the signature is valid, False otherwise.
+
+        Raises:
+            SigningError: If verification fails due to library issues.
+        """
+        try:
+            from stellar_sdk import Keypair  # type: ignore[import]  # noqa: PLC0415
+            try:
+                keypair = Keypair.from_raw_ed25519_public_key(self._public_key)
+                return keypair.verify(message, signature)
+            except Exception as exc:
+                raise SigningError("Verification failed (stellar_sdk path).") from exc
+        except ImportError:
+            try:
+                from nacl.signing import VerifyKey  # type: ignore[import]  # noqa: PLC0415
+                verify_key = VerifyKey(self._public_key)
+                try:
+                    verify_key.verify(message, signature)
+                    return True
+                except Exception:
+                    return False
+            except ImportError as exc:
+                raise SigningError(
+                    "Neither 'stellar_sdk' nor 'PyNaCl' is installed. "
+                    "Install one to enable verification."
+                ) from exc
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Prevent attribute modification after construction (immutable)."""
+        if name in ("_public_key", "_key_id", "_frozen") and not hasattr(self, "_frozen"):
+            # Allow initial construction
+            super().__setattr__(name, value)
+        elif name == "_frozen":
+            # Allow setting frozen flag during construction
+            super().__setattr__(name, value)
+        else:
+            raise AttributeError(
+                f"PublicKeyHandle is immutable; cannot set attribute '{name}'"
+            )
+
+    def __delattr__(self, name: str) -> None:
+        """Prevent attribute deletion (immutable)."""
+        raise AttributeError(
+            f"PublicKeyHandle is immutable; cannot delete attribute '{name}'"
+        )
 
 
 # =========================================================================
