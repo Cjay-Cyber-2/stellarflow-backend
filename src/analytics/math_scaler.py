@@ -78,11 +78,13 @@ def _shift_scale_int(value: int, shift_levels: int) -> int:
 
 
 def _multiply_hop_chain(hops: tuple[int, ...]) -> int:
-    """Fold a corridor hop chain into a single ``SCALE_7`` rate integer."""
+    """Fold a corridor hop chain into a single ``SCALE_14`` rate integer."""
+    if not hops:
+        return SCALE_14
     product = 1
     for hop in hops:
         product *= hop
-    return _shift_scale_int(product, -(len(hops) - 1))
+    return _shift_scale_int(product, -(len(hops) - 2))
 
 
 def _apply_route_weight(scaled_rate: int, weight: int) -> int:
@@ -91,10 +93,10 @@ def _apply_route_weight(scaled_rate: int, weight: int) -> int:
 
 
 def _normalize_weighted_sum(weighted_sum: int, weight_total: int) -> int:
-    """Collapse a ``SCALE_14`` weighted sum back to ``SCALE_7`` precision."""
+    """Collapse a ``SCALE_21`` weighted sum back to ``SCALE_14`` precision."""
     if weight_total == 0:
         raise ZeroDivisionError("Total route weight scales to zero at SCALE_7.")
-    return weighted_sum // weight_total // SCALE_7
+    return weighted_sum // weight_total
 
 
 class ArbitrageRouteMatrix(NamedTuple):
