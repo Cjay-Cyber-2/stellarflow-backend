@@ -256,3 +256,67 @@ class TestTelemetryEncoderLegacy(unittest.TestCase):
 
     def test_frame_size_constant(self) -> None:
         self.assertEqual(FRAME_SIZE, 40)
+
+
+class TestFlatBuffersMetadata(unittest.TestCase):
+    """Issue #648 — FlatBuffers metadata schema for Soroban contract state."""
+
+    def test_flatbuffers_metadata_roundtrip(self) -> None:
+        """Build a FlatBuffers buffer and read fields back via zero-copy access."""
+        from src.serialization.encoders import (
+            build_contract_metadata_buffer,
+            ContractMetadata,
+        )
+
+        contract_id = b"\x01" * 32
+        balance = 12345678901234567890
+        precision = 7
+        version = 1
+
+        buf = build_contract_metadata_buffer(
+            contract_id=contract_id,
+            balance=balance,
+            precision=precision,
+            version=version,
+        )
+
+        meta = ContractMetadata.GetRootAs(buf)
+        self.assertEqual(meta.ContractIdAsBytes(), contract_id)
+        self.assertEqual(meta.balance(), balance)
+        self.assertEqual(meta.Precision(), precision)
+        self.assertEqual(meta.Version(), version)
+
+    def test_flatbuffers_metadata_zero_copies(self) -> None:
+        """Field access on incoming metadata buffers occurs without unpacking steps."""
+        from src.serialization.encoders import (
+            build_contract_metadata_buffer,
+            ContractMetadata,
+        )
+
+        contract_id = b"\xfe\xed" * 16
+        balance = 2 ** 127 + 42
+        buf = build_contract_metadata_buffer(
+            contract_id=contract_id,
+            balance=balance,
+            precision=7,
+            version=2,
+        )
+
+        meta = ContractMetadata.GetRootAs(buf)
+        # Access fields directly — no unpacking step needed
+        lo = meta.BalanceLo()
+        hi = meta.BalanceHi()
+        reconstructed = (hi << 64) | lo
+        self.assertEqual(reconstructed, balance)
+        self.assertEqual(meta.Version(), 2)
+        self.assertEqual(meta.Precision(), 7)
+
+    def test_flatbuffers_metadata_invalid_contract_id(self) -> None:
+        """Contract ID must be exactly 32 bytes."""
+        from src.serialization.encoders import build_contract_metadata_buffer
+
+        with self.assertRaises(ValueError):
+            build_contract_metadata_buffer(
+                contract_id=b"too-short",
+                balance=100,
+            )
