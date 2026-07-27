@@ -429,11 +429,19 @@ class NonceTracker:
         Time: O(1).
         """
         lock = self._get_lock(address)
+        latency_ms = 0.0
         with lock:
             pending = self._pending.get(address)
             if pending is not None:
-                pending.pop(nonce, None)
-        logger.info("[NonceTracker] Confirmed nonce %d for %s", nonce, address)
+                info = pending.pop(nonce, None)
+                if info is not None:
+                    latency_ms = (time.monotonic() - info.issued_at) * 1000
+        logger.info(
+            "[NonceTracker] Confirmed nonce %d for %s | latency=%.1fms",
+            nonce,
+            address,
+            latency_ms,
+        )
 
     def fail(self, address: str, nonce: int) -> None:
         """Mark *nonce* as failed (rejected or dropped) and stop tracking it.
@@ -446,11 +454,19 @@ class NonceTracker:
         Time: O(1).
         """
         lock = self._get_lock(address)
+        latency_ms = 0.0
         with lock:
             pending = self._pending.get(address)
             if pending is not None:
-                pending.pop(nonce, None)
-        logger.info("[NonceTracker] Failed nonce %d for %s", nonce, address)
+                info = pending.pop(nonce, None)
+                if info is not None:
+                    latency_ms = (time.monotonic() - info.issued_at) * 1000
+        logger.info(
+            "[NonceTracker] Failed nonce %d for %s | latency=%.1fms",
+            nonce,
+            address,
+            latency_ms,
+        )
 
     def get_stale(
         self, address: str, timeout_seconds: float = DEFAULT_STALE_TIMEOUT_SECONDS
