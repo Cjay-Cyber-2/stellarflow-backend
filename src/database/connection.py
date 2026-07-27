@@ -61,7 +61,8 @@ Usage::
 import asyncio
 import logging
 import threading
-from typing import Any, Callable, Deque, List, Optional, Tuple, Type
+import time
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Type
 from collections import deque
 
 try:  # psycopg2 is optional: the module must import under sqlite/test setups too.
@@ -121,8 +122,232 @@ DEFAULT_MAX_TIMEOUT_S: float = 60.0
 # Rolling window size for the internal latency sample buffer used by
 # record_latency() / average_latency_ms().
 DEFAULT_LATENCY_WINDOW: int = 100
- 
- 
+
+# ---------------------------------------------------------------------------
+# Index Usage Telemetry constants
+# ---------------------------------------------------------------------------
+
+# Threshold for considering an index as under-utilized (percentage of scans)
+DEFAULT_INDEX_USAGE_THRESHOLD: float = 0.05  # 5% of total scans
+
+# Minimum number of index scans before considering usage statistics valid
+DEFAULT_MIN_INDEX_SCANS: int = 100
+
+# Alert emission interval in seconds (prevent spam)
+DEFAULT_ALERT_INTERVAL_S: float = 3600.0  # 1 hour
+
+
+class IndexUsageTelemetry:
+    """Tracks database index usage and generates diagnostic alerts for under-utilized indexes.
+    
+    This class monitors index usage statistics from PostgreSQL's pg_stat_user_indexes
+    view and emits alerts when indexes are not being used effectively. Under-utilized
+    indexes consume valuable storage I/O bandwidth without providing query performance
+    benefits.
+    
+    The telemetry is designed to work with PostgreSQL databases via psycopg2. For other
+    database backends, the tracking is a no-op but will not raise errors.
+    
+    Usage::
+    
+        telemetry = IndexUsageTelemetry(connection)
+        telemetry.record_index_usage()  # Called periodically
+        alerts = telemetry.get_underutilized_alerts()
+    """
+    
+    def __init__(
+        self,
+        connection: Any,
+        usage_threshold: float = DEFAULT_INDEX_USAGE_THRESHOLD,
+        min_scans: int = DEFAULT_MIN_INDEX_SCANS,
+        alert_interval: float = DEFAULT_ALERT_INTERVAL_S,
+    ) -> None:
+        """Initialize index usage telemetry tracker.
+        
+        Parameters
+        ----------
+        connection:
+            Database connection object exposing cursor() method (DB-API 2.0).
+        usage_threshold:
+            Minimum usage ratio (0.0-1.0) below which an index is considered
+            under-utilized. Default is 0.05 (5%).
+        min_scans:
+            Minimum number of index scans required before usage statistics
+            are considered valid. Default is 100.
+        alert_interval:
+            Minimum seconds between repeated alerts for the same index to
+            prevent alert spam. Default is 3600 (1 hour).
+        """
+        if connection is None:
+            raise ValueError("connection must not be None")
+        if not (0.0 <= usage_threshold <= 1.0):
+            raise ValueError("usage_threshold must be between 0.0 and 1.0")
+        if min_scans < 0:
+            raise ValueError("min_scans must be non-negative")
+        if alert_interval <= 0:
+            raise ValueError("alert_interval must be positive")
+        
+        self._conn = connection
+        self._usage_threshold = usage_threshold
+        self._min_scans = min_scans
+        self._alert_interval = alert_interval
+        
+        self._index_stats: Dict[str, Dict[str, Any]] = {}
+        self._last_alert_time: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        
+        logger.info(
+            "IndexUsageTelemetry initialised: threshold=%.2f min_scans=%d alert_interval=%.1fs",
+            usage_threshold,
+            min_scans,
+            alert_interval,
+        )
+    
+    def record_index_usage(self) -> None:
+        """Query and record current index usage statistics from the database.
+        
+        This method executes a query against PostgreSQL's pg_stat_user_indexes
+        view to collect index scan counts and updates the internal tracking state.
+        
+        For non-PostgreSQL databases or when the query fails, this method logs
+        a debug message and returns without raising an exception.
+        """
+        if psycopg2 is None:
+            logger.debug("IndexUsageTelemetry: psycopg2 not available, skipping index stats")
+            return
+        
+        try:
+            with self._lock:
+                cursor = self._conn.cursor()
+                try:
+                    # Query PostgreSQL's index statistics
+                    query = """
+                        SELECT 
+                            schemaname,
+                            relname as table_name,
+                            indexrelname as index_name,
+                            idx_scan as index_scans,
+                            idx_tup_read as tuples_read,
+                            idx_tup_fetch as tuples_fetched
+                        FROM pg_stat_user_indexes
+                    """
+                    cursor.execute(query)
+                    rows = cursor.fetchall()
+                    
+                    # Update internal statistics
+                    current_time = time.time()
+                    for row in rows:
+                        schemaname, table_name, index_name, index_scans, tuples_read, tuples_fetched = row
+                        key = f"{schemaname}.{table_name}.{index_name}"
+                        
+                        self._index_stats[key] = {
+                            "schemaname": schemaname,
+                            "table_name": table_name,
+                            "index_name": index_name,
+                            "index_scans": index_scans,
+                            "tuples_read": tuples_read,
+                            "tuples_fetched": tuples_fetched,
+                            "last_updated": current_time,
+                        }
+                    
+                    logger.debug(
+                        "IndexUsageTelemetry: recorded stats for %d indexes",
+                        len(rows)
+                    )
+                finally:
+                    close = getattr(cursor, "close", None)
+                    if callable(close):
+                        close()
+        except Exception as exc:
+            logger.debug(
+                "IndexUsageTelemetry: failed to record index usage (optional): %s",
+                exc
+            )
+    
+    def get_underutilized_alerts(self) -> List[Dict[str, Any]]:
+        """Generate diagnostic alerts for under-utilized database indexes.
+        
+        An index is considered under-utilized if:
+        1. It has been scanned at least min_scans times
+        2. Its usage ratio is below the usage_threshold
+        3. Sufficient time has passed since the last alert for this index
+        
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of alert dictionaries, each containing:
+            - index_name: Name of the under-utilized index
+            - table_name: Table the index belongs to
+            - schemaname: Schema name
+            - index_scans: Total number of index scans
+            - usage_ratio: Calculated usage ratio
+            - timestamp: When the alert was generated
+        """
+        alerts = []
+        current_time = time.time()
+        
+        if not self._index_stats:
+            return alerts
+        
+        # Calculate total scans across all indexes for ratio calculation
+        total_scans = sum(
+            stats["index_scans"] for stats in self._index_stats.values()
+        )
+        
+        if total_scans == 0:
+            return alerts
+        
+        with self._lock:
+            for key, stats in self._index_stats.items():
+                index_scans = stats["index_scans"]
+                
+                # Skip if not enough scans to make a valid assessment
+                if index_scans < self._min_scans:
+                    continue
+                
+                # Calculate usage ratio
+                usage_ratio = index_scans / total_scans
+                
+                # Check if under-utilized
+                if usage_ratio < self._usage_threshold:
+                    # Check alert interval to prevent spam
+                    last_alert = self._last_alert_time.get(key, 0)
+                    if current_time - last_alert >= self._alert_interval:
+                        alert = {
+                            "index_name": stats["index_name"],
+                            "table_name": stats["table_name"],
+                            "schemaname": stats["schemaname"],
+                            "index_scans": index_scans,
+                            "usage_ratio": usage_ratio,
+                            "timestamp": current_time,
+                        }
+                        alerts.append(alert)
+                        self._last_alert_time[key] = current_time
+                        
+                        logger.warning(
+                            "[IndexUsageTelemetry] Under-utilized index detected: "
+                            "%s on %s.%s (scans=%d, ratio=%.4f)",
+                            stats["index_name"],
+                            stats["schemaname"],
+                            stats["table_name"],
+                            index_scans,
+                            usage_ratio,
+                        )
+        
+        return alerts
+    
+    def get_index_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return the current index usage statistics.
+        
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Dictionary mapping index keys to their statistics.
+        """
+        with self._lock:
+            return dict(self._index_stats)
+
+
 class ConnectionKeepAlive:
     """Background heartbeat that keeps a relational connection channel alive.
  

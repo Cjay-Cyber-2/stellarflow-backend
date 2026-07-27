@@ -1,4 +1,4 @@
-import axios, { AxiosError } from "axios";
+import { httpClient } from "../lib/httpClient.js";
 import { withRetry } from "../utils/retryUtil.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../utils/httpTimeout.js";
 
@@ -310,7 +310,7 @@ export class NotificationService {
     try {
       await withRetry(
         () =>
-          axios.post(this.config.discordWebhookUrl!, payload, {
+          httpClient.post(this.config.discordWebhookUrl!, payload, {
             headers: { "Content-Type": "application/json" },
             timeout: this.config.timeoutMs,
           }),
@@ -345,7 +345,7 @@ export class NotificationService {
     try {
       await withRetry(
         () =>
-          axios.post(this.config.slackWebhookUrl!, payload, {
+          httpClient.post(this.config.slackWebhookUrl!, payload, {
             headers: { "Content-Type": "application/json" },
             timeout: this.config.timeoutMs,
           }),
