@@ -81,6 +81,15 @@ _WRAP_OFFSET: int = 16
 # If a frame is larger than this we fall back to a truncated write.
 _MIN_WRITE_UNIT: int = 4096
 
+# ---------------------------------------------------------------------------
+# Zero-copy magic constant
+# ---------------------------------------------------------------------------
+
+# A module-level memoryview over the magic bytes lets _read_header() compare
+# header content directly against the backing buffer's memoryview slice —
+# no temporary bytes object is ever allocated during the comparison.
+_MAGIC_VIEW: memoryview = memoryview(_MAGIC)
+
 
 class MmapLogSink:
     """Pre-allocated memory-mapped ring buffer for zero-copy payload logging.
@@ -164,13 +173,24 @@ class MmapLogSink:
     def _read_header(self) -> tuple[int, int]:
         """Read the write-cursor and wrap-count from the file header.
 
+        Zero-copy implementation: all header field reads operate directly on
+        the memoryview of the backing mmap, without allocating intermediate
+        bytes objects.
+
+        * Magic validation: ``mv[0:8] == _MAGIC_VIEW`` compares the two
+          memoryview slices byte-for-byte in C without creating new bytes.
+        * Field unpacking: ``struct.unpack_from`` reads little-endian uint64
+          values directly from the memoryview at the given offset, bypassing
+          the ``bytes()`` conversion that ``struct.unpack`` would require.
+
         If the magic bytes are absent the header is considered corrupt and
         the cursor is reset to zero (data from a previous run is left intact
         but will be overwritten from the start of the payload region).
         """
         mv = memoryview(self._mm)
-        magic = bytes(mv[0:8])
-        if magic != _MAGIC:
+        # Zero-copy magic validation: compare memoryview slices directly —
+        # no bytes() allocation required.
+        if mv[0:8] != _MAGIC_VIEW:
             logger.warning(
                 "MmapLogSink: header magic mismatch at %s — resetting cursor",
                 self._path,
@@ -181,8 +201,10 @@ class MmapLogSink:
             del mv
             return 0, 0
 
-        cursor = struct.unpack("<Q", bytes(mv[_CURSOR_OFFSET : _CURSOR_OFFSET + 8]))[0]
-        wraps = struct.unpack("<Q", bytes(mv[_WRAP_OFFSET : _WRAP_OFFSET + 8]))[0]
+        # Zero-copy field reads: struct.unpack_from reads directly from the
+        # memoryview buffer at the given offset — no bytes() copy needed.
+        cursor: int = struct.unpack_from("<Q", mv, _CURSOR_OFFSET)[0]
+        wraps: int = struct.unpack_from("<Q", mv, _WRAP_OFFSET)[0]
         del mv
         # Guard against out-of-range cursor from a truncated / partial write.
         if cursor >= self._payload_size:
@@ -612,6 +634,83 @@ def get_default_sink(
 
 
 # ---------------------------------------------------------------------------
+# Zero-copy WebSocket / SFMMAP frame header parser
+# ---------------------------------------------------------------------------
+
+# Total size of the binary frame header: magic (8) + cursor (8) + wrap (8).
+_WS_FRAME_HEADER_SIZE: int = _HEADER_SIZE  # 24 bytes
+
+
+def parse_ws_frame_header(
+    buf: bytes | bytearray | memoryview,
+) -> tuple[int, int]:
+    """Parse an SFMMAP binary frame header without allocating intermediate bytes.
+
+    This function accepts any buffer that supports the Python buffer protocol
+    (``bytes``, ``bytearray``, or ``memoryview``) and returns the
+    ``(cursor, wrap_count)`` pair encoded in the header.
+
+    Zero-copy guarantee
+    -------------------
+    A ``memoryview`` is taken over *buf* exactly once (or reused when *buf* is
+    already a ``memoryview``).  All length checks, magic validation, and field
+    unpacking operate on that view; no temporary ``bytes`` objects are created
+    at any point in the hot path.
+
+    Header layout
+    -------------
+    ``[0:8]``   magic  — ``b"SFMMAP\\x00\\x01"``
+    ``[8:16]``  cursor — uint64 little-endian, next write position
+    ``[16:24]`` wraps  — uint64 little-endian, ring wrap count
+
+    Parameters
+    ----------
+    buf:
+        A buffer of at least :data:`_HEADER_SIZE` (24) bytes whose first 24
+        bytes contain a valid SFMMAP frame header.
+
+    Returns
+    -------
+    tuple[int, int]
+        ``(cursor, wrap_count)`` extracted from the header.
+
+    Raises
+    ------
+    ValueError
+        If *buf* is shorter than :data:`_HEADER_SIZE` bytes (truncated header).
+    ValueError
+        If the magic bytes at ``buf[0:8]`` do not match ``_MAGIC``
+        (invalid or corrupt header).
+    """
+    # Wrap in a memoryview only if necessary — if buf is already a memoryview
+    # we use it directly so callers that hold a long-lived view pay zero cost.
+    mv: memoryview = buf if isinstance(buf, memoryview) else memoryview(buf)
+
+    # Length check before any field access — guards against truncated frames.
+    if len(mv) < _WS_FRAME_HEADER_SIZE:
+        raise ValueError(
+            f"frame header too short: expected {_WS_FRAME_HEADER_SIZE} bytes, "
+            f"got {len(mv)}"
+        )
+
+    # Zero-copy magic validation: compare memoryview slices directly.
+    # mv[0:8] is a sub-view; _MAGIC_VIEW is the module-level view of _MAGIC.
+    # CPython compares these via the C buffer protocol — no bytes() allocation.
+    if mv[0:8] != _MAGIC_VIEW:
+        raise ValueError(
+            "invalid frame header: magic bytes mismatch "
+            f"(got {bytes(mv[0:8])!r}, expected {_MAGIC!r})"
+        )
+
+    # Zero-copy field unpacking: struct.unpack_from reads directly from the
+    # memoryview buffer at the specified offset — no bytes() copy required.
+    cursor: int = struct.unpack_from("<Q", mv, _CURSOR_OFFSET)[0]
+    wraps: int = struct.unpack_from("<Q", mv, _WRAP_OFFSET)[0]
+
+    return cursor, wraps
+
+
+# ---------------------------------------------------------------------------
 # Stream parser
 # ---------------------------------------------------------------------------
 
@@ -700,4 +799,11 @@ class StreamBuffer:
         self._size = 0
 
 
-__all__ = ["SIMDJSON_AVAILABLE", "StreamBuffer", "MmapLogSink", "DirectIOSink", "get_default_sink"]
+__all__ = [
+    "SIMDJSON_AVAILABLE",
+    "StreamBuffer",
+    "MmapLogSink",
+    "DirectIOSink",
+    "get_default_sink",
+    "parse_ws_frame_header",
+]

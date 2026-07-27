@@ -330,17 +330,19 @@ class PartitionedTelemetryWriter:
         table_name = _partition_table_name(self._base_table, iso_year, iso_week)
 
         # Ensure the partition table exists before buffering.
-        # Only one writer thread can hold the lock at a time; the check-
-        # then-create sequence is therefore race-free.
+        # Double-checked locking: the lock guards both the existence
+        # check and the _known_partitions update so ANALYZE (Issue #634)
+        # is never duplicated by concurrent saves to the same new week.
         if table_name not in self._known_partitions:
-            if not self._create_if_missing:
-                raise RuntimeError(
-                    f"Partition table '{table_name}' does not exist and "
-                    "create_if_missing is disabled"
-                )
-            self._create_partition(table_name)
             with self._lock:
-                self._known_partitions.add(table_name)
+                if table_name not in self._known_partitions:
+                    if not self._create_if_missing:
+                        raise RuntimeError(
+                            f"Partition table '{table_name}' does not exist and "
+                            "create_if_missing is disabled"
+                        )
+                    self._create_partition(table_name)
+                    self._known_partitions.add(table_name)
 
         # Rewrite the target table on the fly.  We bypass BatchSink.save
         # because it hard-codes self._table.  Instead we call _flush-like
@@ -368,6 +370,9 @@ class PartitionedTelemetryWriter:
         """Issue ``CREATE TABLE IF NOT EXISTS`` for a child partition.
 
         The DDL mirrors the canonical schema expected in telemetry payloads.
+        After a genuinely new partition is created, ``ANALYZE`` is executed
+        so SQLite refreshes its query-plan statistics immediately
+        (Issue #634).
         """
         schema_columns = self._schema or {
             "asset_id": "TEXT",
@@ -382,8 +387,30 @@ class PartitionedTelemetryWriter:
 
         cursor = self._sink._conn.cursor()
         try:
+            # Determine whether the table already exists so we only
+            # ANALYZE genuinely new partitions (Issue #634).
+            cursor.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name=?",
+                (table_name,),
+            )
+            table_existed = cursor.fetchone() is not None
+
             cursor.execute(create_sql)
             logger.info("Created/verified partition table %s", table_name)
+
+            if not table_existed:
+                try:
+                    cursor.execute(f'ANALYZE "{table_name}"')
+                    logger.info(
+                        "ANALYZE executed on new partition table %s",
+                        table_name,
+                    )
+                except sqlite3.Error:
+                    logger.exception(
+                        "Failed to ANALYZE partition table %s", table_name
+                    )
+                    raise
         except sqlite3.Error:
             logger.exception("Failed to create partition table %s", table_name)
             raise

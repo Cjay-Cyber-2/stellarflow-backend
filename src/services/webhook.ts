@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../lib/httpClient.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../utils/httpTimeout.js";
 import { withRetry } from "../utils/retryUtil.js";
 
@@ -159,7 +159,7 @@ export class WebhookService {
     try {
       await withRetry(
         () =>
-          axios.post(webhookUrl, message, {
+          httpClient.post(webhookUrl, message, {
             headers: { "Content-Type": "application/json" },
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
           }),
