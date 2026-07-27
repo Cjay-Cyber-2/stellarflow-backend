@@ -31,9 +31,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from utils.sandbox import (  # noqa: E402
     BPFBuilder,
     INGESTION_POLICY,
+    MemoryLimit,
     SandboxPolicy,
     Syscall,
     _AUDIT_ARCH_X86_64,
+    _DEFAULT_MEMORY_LIMIT_MB,
     _SECCOMP_RET_ALLOW,
     _SECCOMP_RET_KILL_PROCESS,
     _BPF_LD_W_ABS,
