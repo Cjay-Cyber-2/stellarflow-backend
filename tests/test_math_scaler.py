@@ -29,7 +29,23 @@ def test_scale_up_integer():
 
 def test_scale_up_float_truncates():
     # 1.00000001 → 10_000_000.1 → floor → 10_000_000
-    assert scale_up(1.00000001) == 10_000_000
+    assert scale_up(1.00000001, rounding="ROUND_DOWN") == 10_000_000
+
+
+def test_bankers_rounding_integer():
+    """Verify banker's rounding (ROUND_HALF_EVEN) is correctly applied."""
+    # Test cases where the fractional part is exactly 0.5
+    # 2.5 -> 2 (even)
+    assert scale_up("0.00000025") == 2
+    # 3.5 -> 4 (even)
+    assert scale_up("0.00000035") == 4
+
+    # Test cases where the fractional part is not 0.5
+    # 2.4 -> 2
+    assert scale_up("0.00000024") == 2
+    # 2.6 -> 3
+    assert scale_up("0.00000026") == 3
+
 
 def test_scale_up_custom_factor():
     assert scale_up(2, SCALE_14) == 2 * SCALE_14

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import NamedTuple, Union, Sequence
 from fractions import Fraction
 from typing import NamedTuple, Sequence, Union
@@ -114,12 +114,15 @@ class ArbitrageRouteMatrix(NamedTuple):
 # Public API
 # ---------------------------------------------------------------------------
 
-def scale_up(value: Number, factor: int = SCALE_7) -> int:
+def scale_up(
+    value: Number,
+    factor: int = SCALE_7,
+    rounding: str = ROUND_HALF_EVEN,
+) -> int:
     """Scale *value* to its fixed-integer representation at *factor* precision.
 
-    Uses ``Decimal`` arithmetic and truncates (floor) toward zero via
-    ``ROUND_DOWN`` to guarantee bit-identical results across all Python
-    environments and CPU architectures.
+    Uses ``Decimal`` arithmetic and a selectable rounding mode to guarantee
+    bit-identical results across all Python environments and CPU architectures.
 
     Parameters
     ----------
@@ -127,6 +130,9 @@ def scale_up(value: Number, factor: int = SCALE_7) -> int:
         The raw rate or price to scale (int, float, or Decimal).
     factor:
         The integer base to scale to.  Defaults to ``SCALE_7`` (10^7).
+    rounding:
+        The rounding mode, as defined in the ``decimal`` module. Defaults to
+        ``ROUND_HALF_EVEN`` (banker's rounding).
 
     Returns
     -------
@@ -135,9 +141,7 @@ def scale_up(value: Number, factor: int = SCALE_7) -> int:
     """
     factor = _validate_positive_int(factor, "factor")
     d = _to_decimal(value) * Decimal(factor)
-    # ROUND_DOWN truncates toward zero — equivalent to math.floor for positives
-    # but deterministic regardless of platform FPU behaviour.
-    return int(d.to_integral_value(rounding=ROUND_DOWN))
+    return int(d.to_integral_value(rounding=rounding))
 
 
 def to_fixed(value: Number) -> int:
