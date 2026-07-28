@@ -572,3 +572,46 @@ def test_sliding_window_limiter_reset_all():
     limiter.reset_all()
     assert limiter.remaining("key-a") == 1
     assert limiter.remaining("key-b") == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #649 - Token Bucket Rate Limiter
+# ---------------------------------------------------------------------------
+
+from src.queue.backpressure import TokenBucketRateLimiter, TokenBucketResult
+
+def test_multitenant_token_bucket():
+    """Test that the token bucket rate limiter properly isolates tenants."""
+    limiter = TokenBucketRateLimiter(capacity=10, refill_rate=2.0)
+    
+    # Tenant A consumes all capacity
+    for _ in range(10):
+        res = limiter.allow("tenant_a")
+        assert res.allowed is True
+    
+    # Tenant A should be blocked
+    res_blocked = limiter.allow("tenant_a")
+    assert res_blocked.allowed is False
+    assert res_blocked.retry_after_s > 0
+    
+    # Tenant B should still have full capacity
+    res_b = limiter.allow("tenant_b")
+    assert res_b.allowed is True
+    assert limiter.remaining("tenant_b") == 9
+
+def test_token_bucket_refill():
+    """Test that tokens are refilled at the correct rate."""
+    import time
+    limiter = TokenBucketRateLimiter(capacity=2, refill_rate=10.0) # 10 tokens / sec = 0.1s / token
+    
+    # Consume all
+    limiter.allow("tenant_a", tokens=2)
+    assert limiter.remaining("tenant_a") == 0
+    assert not limiter.allow("tenant_a").allowed
+    
+    # Wait for refill (0.15s should give 1.5 tokens -> 1 token)
+    time.sleep(0.15)
+    
+    assert limiter.remaining("tenant_a") >= 1
+    res = limiter.allow("tenant_a", tokens=1)
+    assert res.allowed is True

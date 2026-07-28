@@ -587,9 +587,114 @@ class QueueCapacityController:
         return self.adjust_capacity()
 
 
+# ---------------------------------------------------------------------------
+# Issue #649 - Token Bucket Rate Limiter (Multitenant)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TokenBucketConfig:
+    capacity: int = 100
+    refill_rate: float = 10.0
+
+
+@dataclass(frozen=True)
+class TokenBucketResult:
+    allowed: bool
+    remaining: int
+    retry_after_s: float
+
+
+class TokenBucketRateLimiter:
+    """Token bucket rate limiter that enforces limits per-tenant.
+
+    Thread-safe via a ``threading.Lock``.
+    """
+
+    __slots__ = ("_capacity", "_refill_rate", "_buckets", "_lock")
+
+    def __init__(self, capacity: int = 100, refill_rate: float = 10.0) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if refill_rate <= 0.0:
+            raise ValueError("refill_rate must be positive")
+
+        self._capacity = capacity
+        self._refill_rate = refill_rate
+        # Maps tenant_id -> (current_tokens, last_refill_timestamp)
+        self._buckets: Dict[str, Tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def config(self) -> TokenBucketConfig:
+        return TokenBucketConfig(
+            capacity=self._capacity,
+            refill_rate=self._refill_rate,
+        )
+
+    def allow(self, tenant_id: str, tokens: int = 1) -> TokenBucketResult:
+        """Check if *tenant_id* is allowed to consume *tokens*."""
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(tenant_id)
+            if bucket is None:
+                current_tokens = float(self._capacity)
+                last_refill = now
+            else:
+                current_tokens, last_refill = bucket
+
+            # Refill tokens based on time elapsed
+            elapsed = now - last_refill
+            new_tokens = min(float(self._capacity), current_tokens + elapsed * self._refill_rate)
+
+            if new_tokens >= tokens:
+                new_tokens -= tokens
+                self._buckets[tenant_id] = (new_tokens, now)
+                return TokenBucketResult(
+                    allowed=True,
+                    remaining=int(new_tokens),
+                    retry_after_s=0.0,
+                )
+            else:
+                # Not enough tokens, calculate retry time
+                self._buckets[tenant_id] = (new_tokens, now)
+                missing = tokens - new_tokens
+                retry_after = missing / self._refill_rate
+                return TokenBucketResult(
+                    allowed=False,
+                    remaining=int(new_tokens),
+                    retry_after_s=retry_after,
+                )
+
+    def remaining(self, tenant_id: str) -> int:
+        """Return the number of currently available tokens for *tenant_id*."""
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(tenant_id)
+            if bucket is None:
+                return self._capacity
+            
+            current_tokens, last_refill = bucket
+            elapsed = now - last_refill
+            new_tokens = min(float(self._capacity), current_tokens + elapsed * self._refill_rate)
+            return int(new_tokens)
+
+    def reset(self, tenant_id: str) -> None:
+        """Clear the token bucket for *tenant_id*."""
+        with self._lock:
+            self._buckets.pop(tenant_id, None)
+
+    def reset_all(self) -> None:
+        """Clear all token buckets."""
+        with self._lock:
+            self._buckets.clear()
+
+
 __all__ = [
     "SlidingWindowConfig",
     "SlidingWindowResult",
     "SlidingWindowRateLimiter",
     "QueueCapacityController",
+    "TokenBucketConfig",
+    "TokenBucketResult",
+    "TokenBucketRateLimiter",
 ]
