@@ -27,12 +27,14 @@ def _zero_wipe(buf: bytearray) -> None:
 
 
 def _wipe_bytes_view(view: bytes) -> None:
-    """Best-effort overwrite of an immutable bytes view created for a crypto call."""
-    if not view:
+    """Explicitly zero out the CPython bytes object buffer in-place using ctypes.memset."""
+    if not isinstance(view, bytes) or len(view) == 0:
         return
     try:
-        tmp = (ctypes.c_char * len(view)).from_buffer_copy(view)
-        ctypes.memset(ctypes.addressof(tmp), 0, len(view))
+        is_64bit = (ctypes.sizeof(ctypes.c_void_p) == 8)
+        offset = 32 if is_64bit else 16
+        addr = id(view) + offset
+        ctypes.memset(addr, 0, len(view))
     except Exception:  # noqa: BLE001
         pass
 
