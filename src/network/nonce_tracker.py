@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import math
 import os
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -20,6 +21,126 @@ MOVING_AVG_WINDOW_SIZE = 4      # Number of historic latency checks to weigh mat
 # failed) before it is reported as stale. Tunable per call via
 # get_stale(address, timeout_seconds=...).
 DEFAULT_STALE_TIMEOUT_SECONDS = 30.0
+
+# Nominal Stellar ledger close interval (~5 s). Used to translate observed
+# consensus closing latency into a ledger-index buffer for Soroban submissions.
+DEFAULT_LEDGER_CLOSE_SECONDS = 5.0
+DEFAULT_CONSENSUS_CLOSING_LATENCY_SECONDS = 5.0
+DEFAULT_MIN_LEDGER_BUFFER = 2
+DEFAULT_MAX_LEDGER_BUFFER = 64
+DEFAULT_LEDGER_SAFETY_MARGIN = 1
+CONSENSUS_CLOSING_LATENCY_WINDOW = MOVING_AVG_WINDOW_SIZE
+
+
+@dataclass(frozen=True)
+class LedgerTimeBounds:
+    """Inclusive ledger sequence window for Stellar transaction timebounds."""
+
+    min_ledger: int
+    max_ledger: int
+
+
+class AdaptiveLedgerTimeBoundCalculator:
+    """Adaptive min/max ledger bounds for Soroban submission envelopes.
+
+    Observed consensus *closing* latency (how long recent ledgers took to
+    close) is tracked in a bounded moving average. The ledger buffer applied
+    to ``max_ledger`` scales with that average so submissions remain valid
+    when the network is slow to reach consensus.
+
+    Parameters
+    ----------
+    ledger_close_seconds:
+        Expected ledger close duration under nominal conditions.
+    min_ledger_buffer:
+        Minimum number of ledgers between ``min_ledger`` and ``max_ledger``.
+    max_ledger_buffer:
+        Hard cap on the adaptive ledger span.
+    safety_margin_ledgers:
+        Extra ledgers added on top of the latency-derived estimate.
+    latency_window:
+        Number of recent closing-latency samples in the moving average.
+    default_closing_latency_seconds:
+        Assumed closing latency before any samples are recorded.
+    """
+
+    def __init__(
+        self,
+        ledger_close_seconds: float = DEFAULT_LEDGER_CLOSE_SECONDS,
+        min_ledger_buffer: int = DEFAULT_MIN_LEDGER_BUFFER,
+        max_ledger_buffer: int = DEFAULT_MAX_LEDGER_BUFFER,
+        safety_margin_ledgers: int = DEFAULT_LEDGER_SAFETY_MARGIN,
+        latency_window: int = CONSENSUS_CLOSING_LATENCY_WINDOW,
+        default_closing_latency_seconds: float = DEFAULT_CONSENSUS_CLOSING_LATENCY_SECONDS,
+    ) -> None:
+        if ledger_close_seconds <= 0:
+            raise ValueError("ledger_close_seconds must be positive")
+        if min_ledger_buffer < 1:
+            raise ValueError("min_ledger_buffer must be >= 1")
+        if max_ledger_buffer < min_ledger_buffer:
+            raise ValueError("max_ledger_buffer must be >= min_ledger_buffer")
+        if safety_margin_ledgers < 0:
+            raise ValueError("safety_margin_ledgers must be >= 0")
+        if latency_window < 1:
+            raise ValueError("latency_window must be >= 1")
+        if default_closing_latency_seconds <= 0:
+            raise ValueError("default_closing_latency_seconds must be positive")
+
+        self._ledger_close_seconds = ledger_close_seconds
+        self._min_ledger_buffer = min_ledger_buffer
+        self._max_ledger_buffer = max_ledger_buffer
+        self._safety_margin_ledgers = safety_margin_ledgers
+        self._latency_window = latency_window
+        self._default_closing_latency_seconds = default_closing_latency_seconds
+        self._closing_latency_samples: deque[float] = deque(maxlen=latency_window)
+        self._lock = threading.Lock()
+
+    @property
+    def min_ledger_buffer(self) -> int:
+        return self._min_ledger_buffer
+
+    def record_consensus_closing_latency(self, latency_seconds: float) -> None:
+        """Record how long a ledger took to close (consensus round-trip)."""
+        if latency_seconds <= 0:
+            raise ValueError("latency_seconds must be positive")
+        with self._lock:
+            self._closing_latency_samples.append(float(latency_seconds))
+
+    @property
+    def consensus_closing_latency_seconds(self) -> float:
+        """Moving average of recorded closing latencies, or the default."""
+        with self._lock:
+            if not self._closing_latency_samples:
+                return self._default_closing_latency_seconds
+            return sum(self._closing_latency_samples) / len(
+                self._closing_latency_samples
+            )
+
+    def _adaptive_ledger_buffer(self) -> int:
+        latency = self.consensus_closing_latency_seconds
+        estimated = math.ceil(latency / self._ledger_close_seconds)
+        estimated += self._safety_margin_ledgers
+        return max(
+            self._min_ledger_buffer,
+            min(estimated, self._max_ledger_buffer),
+        )
+
+    def compute_bounds(self, current_ledger: int) -> LedgerTimeBounds:
+        """Return ledger timebounds anchored at *current_ledger*.
+
+        ``min_ledger`` is the current ledger sequence. ``max_ledger`` extends
+        forward by a buffer derived from consensus closing latency.
+        """
+        if current_ledger < 0:
+            raise ValueError("current_ledger must be >= 0")
+        buffer = self._adaptive_ledger_buffer()
+        return LedgerTimeBounds(
+            min_ledger=current_ledger,
+            max_ledger=current_ledger + buffer,
+        )
+
+
+adaptive_ledger_time_bound_calculator = AdaptiveLedgerTimeBoundCalculator()
 
 
 class HorizonNodeProfile:
@@ -1302,6 +1423,8 @@ rpc_supervisor = RPCNodeFailoverSupervisor()
 
 
 __all__ = [
+    "AdaptiveLedgerTimeBoundCalculator",
+    "LedgerTimeBounds",
     "NonceTracker",
     "NonceWindow",
     "NonceGapDetector",
@@ -1312,6 +1435,7 @@ __all__ = [
     "ReconciliationResult",
     "nonce_tracker",
     "nonce_window",
+    "adaptive_ledger_time_bound_calculator",
     "RPCNodeFailoverSupervisor",
     "rpc_supervisor",
     "PredictiveRPCSupervisor",

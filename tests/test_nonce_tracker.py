@@ -12,7 +12,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from network.nonce_tracker import (
+    AdaptiveLedgerTimeBoundCalculator,
     GapReport,
+    LedgerTimeBounds,
     NonceGapDetector,
     NonceRecoveryEngine,
     NonceTracker,
@@ -1141,3 +1143,40 @@ def test_transaction_latency_tracking(caplog: pytest.LogCaptureFixture) -> None:
     assert "latency=" in caplog.text
     assert "latency=0.0ms" not in caplog.text
 
+
+# ===========================================================================
+# Adaptive ledger time-bounds  —  Issue #651
+# ===========================================================================
+
+
+def test_adaptive_time_bounds() -> None:
+    """Acceptance test for Issue #651: bounds account for consensus closing latency."""
+    calc = AdaptiveLedgerTimeBoundCalculator(
+        ledger_close_seconds=5.0,
+        min_ledger_buffer=2,
+        safety_margin_ledgers=1,
+    )
+    current_ledger = 123_456
+
+    baseline = calc.compute_bounds(current_ledger=current_ledger)
+    assert isinstance(baseline, LedgerTimeBounds)
+    assert baseline.min_ledger == current_ledger
+    assert baseline.max_ledger == current_ledger + calc.min_ledger_buffer
+
+    for _ in range(4):
+        calc.record_consensus_closing_latency(20.0)
+
+    under_load = calc.compute_bounds(current_ledger=current_ledger)
+    assert under_load.max_ledger > baseline.max_ledger
+
+    fast = AdaptiveLedgerTimeBoundCalculator(
+        ledger_close_seconds=5.0,
+        min_ledger_buffer=2,
+        safety_margin_ledgers=1,
+    )
+    for _ in range(4):
+        fast.record_consensus_closing_latency(2.5)
+
+    nominal = fast.compute_bounds(current_ledger=current_ledger)
+    assert nominal.max_ledger <= under_load.max_ledger
+    assert nominal.max_ledger >= current_ledger + fast.min_ledger_buffer
