@@ -572,3 +572,96 @@ def test_sliding_window_limiter_reset_all():
     limiter.reset_all()
     assert limiter.remaining("key-a") == 1
     assert limiter.remaining("key-b") == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #629 — Adaptive Weighted Random Early Detection (WRED) Drops
+# ---------------------------------------------------------------------------
+
+from src.queue.backpressure import PacketPriority, WREDQueue, WREDThreshold
+
+
+class TestWREDQueue:
+    """Tests for the Weighted Random Early Detection (WRED) drop policy."""
+
+    @staticmethod
+    def _fill_with_consensus(queue: WREDQueue, count: int) -> None:
+        """Fill *queue* with CONSENSUS packets, which never trigger WRED."""
+        for i in range(count):
+            assert queue.offer(f"consensus-filler-{i}", PacketPriority.CONSENSUS)
+
+    def test_wred_drop_policy(self) -> None:
+        """CONSENSUS packets pass through at any saturation level while
+        TELEMETRY packets are progressively shed as the queue saturates."""
+        queue = WREDQueue(capacity=100)
+
+        # Below every priority's min_threshold: nothing is shed yet.
+        self._fill_with_consensus(queue, 20)  # saturation = 0.20
+        assert queue.drop_probability(PacketPriority.TELEMETRY) == 0.0
+        assert queue.drop_probability(PacketPriority.STANDARD) == 0.0
+        assert queue.offer("telemetry-early", PacketPriority.TELEMETRY)
+        assert queue.offer("standard-early", PacketPriority.STANDARD)
+
+        # Saturation enters TELEMETRY's drop ramp (0.3-0.8) but stays below
+        # STANDARD's ramp (0.6-0.9): only telemetry starts being shed.
+        self._fill_with_consensus(queue, 30)  # saturation = 0.52
+        telemetry_probability = queue.drop_probability(PacketPriority.TELEMETRY)
+        assert 0.0 < telemetry_probability < 1.0
+        assert queue.drop_probability(PacketPriority.STANDARD) == 0.0
+        assert queue.drop_probability(PacketPriority.CONSENSUS) == 0.0
+
+        # Saturation clears every non-CONSENSUS max_threshold: TELEMETRY is
+        # now shed with certainty while CONSENSUS keeps passing through.
+        self._fill_with_consensus(queue, 33)  # saturation = 0.85
+        assert queue.drop_probability(PacketPriority.TELEMETRY) == 1.0
+        assert not queue.offer("telemetry-shed", PacketPriority.TELEMETRY)
+        assert queue.offer("consensus-passthrough", PacketPriority.CONSENSUS)
+
+        metrics = queue.get_metrics()
+        assert metrics.dropped_by_priority[PacketPriority.TELEMETRY.value] == 1
+        assert PacketPriority.CONSENSUS.value not in metrics.dropped_by_priority
+
+    def test_wred_queue_rejects_non_positive_capacity(self) -> None:
+        """Capacity must be a positive integer."""
+        with pytest.raises(ValueError):
+            WREDQueue(capacity=0)
+
+    def test_wred_queue_hard_capacity_drops_regardless_of_priority(self) -> None:
+        """Once the queue is physically full, admission fails for any
+        priority (including CONSENSUS), since there is no room left."""
+        queue = WREDQueue(capacity=2)
+        assert queue.offer("a", PacketPriority.CONSENSUS)
+        assert queue.offer("b", PacketPriority.CONSENSUS)
+
+        assert not queue.offer("c", PacketPriority.CONSENSUS)
+
+        metrics = queue.get_metrics()
+        assert metrics.dropped_packets == 1
+        assert metrics.admitted_packets == 2
+
+    def test_wred_queue_fifo_dequeue_order(self) -> None:
+        """Admitted packets are dequeued in FIFO order."""
+        queue = WREDQueue(capacity=10)
+        queue.offer("first", PacketPriority.CONSENSUS)
+        queue.offer("second", PacketPriority.CONSENSUS)
+        queue.offer("third", PacketPriority.CONSENSUS)
+
+        assert queue.poll() == "first"
+        assert queue.poll() == "second"
+        assert queue.poll() == "third"
+        assert queue.poll() is None
+
+    def test_wred_queue_custom_thresholds(self) -> None:
+        """Custom per-priority thresholds override the defaults."""
+        thresholds = {
+            PacketPriority.TELEMETRY: WREDThreshold(
+                min_threshold=0.0, max_threshold=0.1, max_drop_probability=1.0
+            ),
+        }
+        queue = WREDQueue(capacity=10, thresholds=thresholds)
+
+        # Saturation is already >= max_threshold (0.1) at 0 items only once
+        # something occupies the queue; add one filler item first.
+        queue.offer("filler", PacketPriority.CONSENSUS)  # saturation = 0.1
+        assert queue.drop_probability(PacketPriority.TELEMETRY) == 1.0
+        assert not queue.offer("telemetry", PacketPriority.TELEMETRY)
