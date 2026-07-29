@@ -442,6 +442,108 @@ class ConnectionKeepAlive:
         logger.info("ConnectionKeepAlive stopped")
 
 
+class AsyncConnectionKeepAlive:
+    """Async-native heartbeat that keeps an async database connection alive.
+
+    Mirrors :class:`ConnectionKeepAlive` for async drivers (asyncpg, aiopg,
+    databases, etc.) that expose an awaitable ``execute`` coroutine rather than
+    a synchronous ``cursor()`` interface.
+
+    A background :class:`asyncio.Task` wakes every ``interval`` seconds and
+    issues a lightweight ``SELECT 1;`` to keep the channel warm. The task is
+    cancellation-safe: ``stop()`` cancels it and awaits its completion so
+    callers get a clean shutdown guarantee without waiting out the full interval.
+
+    Usage::
+
+        keepalive = AsyncConnectionKeepAlive(asyncpg_conn, interval=30.0)
+        keepalive.start()           # schedule the background task
+
+        # … ingestion pipeline runs …
+
+        await keepalive.stop()      # cancel task and await clean exit
+
+    The connection must expose an awaitable ``execute(query: str)`` method.
+    asyncpg connections satisfy this directly; for other drivers wrap the
+    connection in a thin adapter that provides that signature.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        interval: float = DEFAULT_PING_INTERVAL,
+        query: str = HEARTBEAT_QUERY,
+    ) -> None:
+        if connection is None:
+            raise ValueError("connection must not be None")
+        if interval <= 0:
+            raise ValueError("interval must be a positive number of seconds")
+
+        self._conn = connection
+        self._interval = interval
+        self._query = query
+        self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
+
+    @property
+    def is_running(self) -> bool:
+        """True while the background heartbeat task is active."""
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        """Schedule the background heartbeat task on the running event loop.
+
+        Calling ``start`` on an already-running keep-alive is a no-op.
+        Must be called from within a running asyncio event loop.
+        """
+        if self.is_running:
+            logger.debug("AsyncConnectionKeepAlive already running; start() ignored")
+            return
+        self._task = asyncio.ensure_future(self._run())
+        logger.info(
+            "AsyncConnectionKeepAlive started; pinging every %.1f seconds",
+            self._interval,
+        )
+
+    async def ping(self) -> bool:
+        """Issue a single heartbeat query.
+
+        Returns ``True`` if the ping succeeded, ``False`` if it raised.
+        Failures are logged and swallowed so a transient drop never takes
+        down the background loop; the next tick simply tries again.
+        """
+        try:
+            await self._conn.execute(self._query)
+            logger.debug("Async heartbeat ping succeeded")
+            return True
+        except Exception:
+            logger.warning(
+                "Async heartbeat ping failed; will retry next interval",
+                exc_info=True,
+            )
+            return False
+
+    async def _run(self) -> None:
+        """Background coroutine loop — ticks once per interval, exits on cancellation."""
+        try:
+            while True:
+                await asyncio.sleep(self._interval)
+                await self.ping()
+        except asyncio.CancelledError:
+            logger.debug("AsyncConnectionKeepAlive task cancelled")
+
+    async def stop(self) -> None:
+        """Cancel the background task and await its clean exit."""
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        logger.info("AsyncConnectionKeepAlive stopped")
+
+
 def _default_broken_exceptions() -> Tuple[Type[BaseException], ...]:
     """Exception types that signal a stale / dead pooled socket.
 
