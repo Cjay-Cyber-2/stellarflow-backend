@@ -37,3 +37,59 @@ EXPOSE 3000
 
 # Start the app directly - avoids needing package.json in final image
 CMD ["node", "dist/index.js"]
+
+
+# ==========================================
+# Stage 1: Builder
+# ==========================================
+FROM python:3.11-slim AS builder
+
+# Prevent Python from writing .pyc files & buffer stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Install build dependencies required for compiling C extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies into a dedicated wheels directory or virtual environment
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ==========================================
+# Stage 2: Runtime (Production Layer)
+# ==========================================
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/install/bin:$PATH" \
+    PYTHONPATH="/install/lib/python3.11/site-packages:$PYTHONPATH"
+
+WORKDIR /app
+
+# Install runtime-only C dynamic libraries (without compilers/toolchains)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built packages from builder stage
+COPY --from=builder /install /install
+
+# Copy application source code
+COPY . .
+
+# Create and switch to non-root app user for container security hardening
+RUN adduser --disabled-password --gecos "" appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
