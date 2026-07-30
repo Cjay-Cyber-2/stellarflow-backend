@@ -1,5 +1,8 @@
 import { Router } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import prisma from "../lib/prisma";
+import { cacheMiddleware } from "../cache/CacheMiddleware";
+import { CACHE_CONFIG, CACHE_KEYS } from "../config/redis.config";
 const router = Router();
 const RANGE_MAP = {
     "1d": 1,
@@ -68,8 +71,15 @@ const RANGE_MAP = {
  */
 // GET /api/v1/history/:asset?range=7d
 // GET /api/v1/history/:asset?from=2024-01-01&to=2024-01-07
-router.get("/:asset", async (req, res) => {
-    const asset = req.params.asset.toUpperCase();
+router.get("/:asset", cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.history,
+    keyGenerator: (req) => {
+        const asset = req.params.asset?.toUpperCase() || '';
+        const range = req.query.range || "7d";
+        return CACHE_KEYS.history.asset(asset, range);
+    },
+}), async (req, res) => {
+    const asset = req.params.asset?.toUpperCase() || '';
     const rangeParam = req.query.range;
     const fromParam = req.query.from;
     const toParam = req.query.to;
@@ -79,14 +89,14 @@ router.get("/:asset", async (req, res) => {
         if (fromParam) {
             since = new Date(fromParam);
             if (isNaN(since.getTime())) {
-                res.status(400).json({ success: false, error: "Invalid 'from' date" });
+                sendApiError(res, 400, "BAD_REQUEST", "Invalid 'from' date");
                 return;
             }
         }
         if (toParam) {
             until = new Date(toParam);
             if (isNaN(until.getTime())) {
-                res.status(400).json({ success: false, error: "Invalid 'to' date" });
+                sendApiError(res, 400, "BAD_REQUEST", "Invalid 'to' date");
                 return;
             }
         }
@@ -136,10 +146,7 @@ router.get("/:asset", async (req, res) => {
         });
     }
     catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error instanceof Error ? error.message : "Internal server error",
-        });
+        sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
     }
 });
 export default router;

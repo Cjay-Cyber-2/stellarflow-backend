@@ -10,7 +10,27 @@ promClient.collectDefaultMetrics({
   labels: { app: 'stellarflow-backend' },
 });
 
-// Create a custom histogram for HTTP request durations
+/** * NEW: Ingestion Queue Metrics 
+ * Tracks the current depth of the backpressure queue
+ */
+export const ingestionQueueDepth = new promClient.Gauge({
+  name: "ingestion_queue_depth",
+  help: "Current number of items in the backpressure queue",
+});
+register.registerMetric(ingestionQueueDepth);
+
+/**
+ * NEW: Dropped Packets Counter
+ * Tracks how many packets were dropped due to saturation/backpressure
+ */
+export const droppedPacketsTotal = new promClient.Counter({
+  name: "ingestion_dropped_packets_total",
+  help: "Total number of packets dropped by the backpressure manager",
+  labelNames: ["priority"],
+});
+register.registerMetric(droppedPacketsTotal);
+
+// Custom histogram for HTTP request durations
 export const httpRequestDurationMicroseconds = new promClient.Histogram({
   name: "http_request_duration_seconds",
   help: "Duration of HTTP requests in seconds",
@@ -19,13 +39,43 @@ export const httpRequestDurationMicroseconds = new promClient.Histogram({
 });
 register.registerMetric(httpRequestDurationMicroseconds);
 
-// Create a custom counter for HTTP requests
+// Custom counter for HTTP requests
 export const httpRequestsTotal = new promClient.Counter({
   name: "http_requests_total",
   help: "Total number of HTTP requests",
   labelNames: ["method", "route", "status_code"],
 });
 register.registerMetric(httpRequestsTotal);
+
+export const successfulSubmissions = new promClient.Counter({
+  name: "multi_sig_successful_submissions_total",
+  help: "Total successful multi-sig submissions",
+  labelNames: ["asset"],
+});
+register.registerMetric(successfulSubmissions);
+
+export const failedSubmissions = new promClient.Counter({
+  name: "multi_sig_failed_submissions_total",
+  help: "Total failed multi-sig submissions",
+  labelNames: ["asset", "reason"],
+});
+register.registerMetric(failedSubmissions);
+
+export const gasUsagePerAsset = new promClient.Histogram({
+  name: "multi_sig_gas_usage_stroops",
+  help: "Gas usage per asset in stroops",
+  labelNames: ["asset"],
+  buckets: [100000, 500000, 1000000, 5000000, 10000000],
+});
+register.registerMetric(gasUsagePerAsset);
+
+export const submissionDuration = new promClient.Histogram({
+  name: "multi_sig_submission_duration_seconds",
+  help: "Duration of multi-sig submission flow in seconds",
+  labelNames: ["asset"],
+  buckets: [1, 5, 10, 30, 60, 120],
+});
+register.registerMetric(submissionDuration);
 
 export const metricsMiddleware = (
   req: Request,
@@ -42,11 +92,8 @@ export const metricsMiddleware = (
     if (req.route && req.route.path) {
       routeStr = req.baseUrl + req.route.path;
     } else {
-      // Fallback for custom handlers mapped directly on app
       if (
-        req.path === "/health" ||
-        req.path === "/" ||
-        req.path === "/metrics" ||
+        ["/health", "/", "/metrics"].includes(req.path) ||
         req.path.startsWith("/api/v1/docs")
       ) {
         routeStr = req.path;

@@ -10,7 +10,8 @@ export class HourlyAverageService {
   private checkIntervalMs: number;
   private timer: ReturnType<typeof setInterval> | null = null;
 
-  constructor(checkIntervalMs: number = 15 * 60 * 1000) { // Every 15 minutes
+  constructor(checkIntervalMs: number = 15 * 60 * 1000) {
+    // Every 15 minutes
     this.checkIntervalMs = checkIntervalMs;
   }
 
@@ -24,11 +25,13 @@ export class HourlyAverageService {
     }
 
     this.isRunning = true;
-    console.info(`[HourlyAverageService] Started with ${this.checkIntervalMs}ms check interval`);
+    console.info(
+      `[HourlyAverageService] Started with ${this.checkIntervalMs}ms check interval`,
+    );
 
     // Run immediately on start
-    await this.processMissingHourlyStats().catch(err => {
-        console.error("[HourlyAverageService] Initial processing error:", err);
+    await this.processMissingHourlyStats().catch((err) => {
+      console.error("[HourlyAverageService] Initial processing error:", err);
     });
 
     // Start periodic checks
@@ -51,6 +54,21 @@ export class HourlyAverageService {
     console.info("[HourlyAverageService] Stopped");
   }
 
+  restart(newIntervalMs: number): void {
+    if (!this.isRunning) return;
+    if (newIntervalMs === this.checkIntervalMs) return;
+    this.checkIntervalMs = newIntervalMs;
+    if (this.timer) {
+      clearInterval(this.timer);
+    }
+    this.timer = setInterval(() => {
+      this.processMissingHourlyStats().catch((err) => {
+        console.error("[HourlyAverageService] Background job error:", err);
+      });
+    }, this.checkIntervalMs);
+    console.info(`[HourlyAverageService] Check interval updated to ${this.checkIntervalMs}ms`);
+  }
+
   /**
    * Main logic to find missing hourly stats and calculate them.
    * Checks the last 24 hours for any gaps.
@@ -59,11 +77,16 @@ export class HourlyAverageService {
     try {
       const now = new Date();
       // Start of the current hour
-      const currentHourStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours());
+      const currentHourStart = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate(),
+        now.getHours(),
+      );
 
       // Get all active currencies
       const activeCurrencies = await prisma.currency.findMany({
-        where: { isActive: true }
+        where: { isActive: true },
       });
 
       if (activeCurrencies.length === 0) {
@@ -72,7 +95,9 @@ export class HourlyAverageService {
 
       // We look back at the last 24 hours
       for (let i = 1; i <= 24; i++) {
-        const targetHour = new Date(currentHourStart.getTime() - i * 60 * 60 * 1000);
+        const targetHour = new Date(
+          currentHourStart.getTime() - i * 60 * 60 * 1000,
+        );
         const nextHour = new Date(targetHour.getTime() + 60 * 60 * 1000);
 
         for (const currency of activeCurrencies) {
@@ -115,13 +140,16 @@ export class HourlyAverageService {
             });
 
             console.info(
-              `[HourlyAverageService] ✅ Calculated average for ${currency.code} at ${targetHour.toISOString()}: ${aggregate._avg.rate}`
+              `[HourlyAverageService] ✅ Calculated average for ${currency.code} at ${targetHour.toISOString()}: ${aggregate._avg.rate}`,
             );
           }
         }
       }
     } catch (error) {
-      console.error("[HourlyAverageService] Error processing hourly stats:", error);
+      console.error(
+        "[HourlyAverageService] Error processing hourly stats:",
+        error,
+      );
     }
   }
 

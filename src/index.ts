@@ -1,35 +1,67 @@
-import express from "express";
 import { createServer } from "http";
+import compression from "compression";
 import cors from "cors";
 import dotenv from "dotenv";
-import morgan from "morgan";
-import helmet from "helmet";
+import express from "express";
 import { Horizon } from "@stellar/stellar-sdk";
-import swaggerUi from "swagger-ui-express";
+import { getStellarNetwork } from "./lib/stellarNetwork";
 import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
-import statsRouter from "./routes/stats";
-import intelligenceRouter from "./routes/intelligence";
 import priceUpdatesRouter from "./routes/priceUpdates";
-import assetsRouter from "./routes/assets";
-import statusRouter from "./routes/status";
+import statsRouter from "./routes/stats";
+import app from "./app";
 import prisma from "./lib/prisma";
+import { disconnectRedis } from "./lib/redis";
 import { initSocket } from "./lib/socket";
 import { SorobanEventListener } from "./services/sorobanEventListener";
-import { specs } from "./lib/swagger";
 import { multiSigSubmissionService } from "./services/multiSigSubmissionService";
-import { apiKeyMiddleware } from "./middleware/apiKeyMiddleware";
-import { rateLimitMiddleware } from "./middleware/rateLimitMiddleware";
+import {
+  GasBalanceMonitorService,
+  getGasBalanceMonitorService,
+} from "./services/gasBalanceMonitorService";
+import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
+import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
+import { watchConfig } from "./config/configWatcher";
+import { startEnvFileWatcher } from "./config/envFileWatcher";
+import { validateDatabaseSchema } from "./utils/dbValidator";
+import { initializeTracing } from "./config/tracingConfig";
+import { setupAxiosTracing } from "./lib/tracing";
+import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
+import { providerSecretRotationService } from "./services/providerSecretRotationService";
+import { priceAggregatorService } from "./services/priceAggregatorService";
+import { contractSanityCheckService } from "./services/contractSanityCheckService";
 
 // Load environment variables
 dotenv.config();
 
+// Normalize safe startup environment strings before runtime storage.
+// This helps ensure tokens and asset-like values are canonicalized from mixed case.
+sanitizeEnvironmentVariables();
+
+// Initialize tracing before other services
+initializeTracing();
+
+// Setup axios tracing for HTTP requests
+setupAxiosTracing();
+
+// Register tracing shutdown handlers
+registerTracingShutdownHandlers();
+
+// Enable log masking to prevent sensitive data leaks
+enableGlobalLogMasking();
+
+// Start regional health monitoring before we accept requests.
+await getRegionalHealthService().startMonitoring();
+
 // [OPS] Implement "Environment Variable" Check on Start
 validateEnv();
+
+// [OPS] Validate database schema on startup
+await validateDatabaseSchema();
 
 // Validate required environment variables
 const requiredEnvVars = ["STELLAR_SECRET", "DATABASE_URL"] as const;
@@ -60,11 +92,10 @@ if (!dashboardUrl) {
   process.exit(1);
 }
 
-const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Horizon server for health checks
-const stellarNetwork = process.env.STELLAR_NETWORK || "TESTNET";
+const stellarNetwork = getStellarNetwork();
 const horizonUrl =
   stellarNetwork === "PUBLIC"
     ? "https://horizon.stellar.org"
@@ -72,97 +103,14 @@ const horizonUrl =
 const horizonServer = new Horizon.Server(horizonUrl);
 
 // Middleware
-app.use(morgan("dev"));
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      // Allow non-browser requests (e.g. curl, server-to-server)
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      if (origin === dashboardUrl) {
-        return callback(null, true);
-      }
-
-      return callback(
-        new Error(
-          `CORS policy: Access denied from origin ${origin}. Allowed origin: ${dashboardUrl}`,
-        ),
-      );
-    },
-    credentials: true,
-  }),
-);
-// Security headers with Helmet - placed early before routes
-// Configured for API backend with minimal CSP to avoid breaking Swagger UI or frontend integration
-app.use(
-  helmet({
-    // Content Security Policy - minimal config for API backend
-    // Allows Swagger UI to function while providing basic XSS protection
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"], // 'unsafe-inline' needed for Swagger UI
-        styleSrc: ["'self'", "'unsafe-inline'"], // 'unsafe-inline' needed for Swagger UI inline styles
-        imgSrc: ["'self'", "data:", "https:"], // Allow data: for Swagger UI icons, https: for external images
-        fontSrc: ["'self'", "https:"], // Allow fonts from https (Swagger UI uses cdnjs)
-        connectSrc: ["'self'", "https:"], // Allow API calls to any https endpoint
-        frameAncestors: ["'none'"], // Prevent clickjacking
-      },
-    },
-    // X-Content-Type-Options: nosniff - prevents MIME type sniffing
-    noSniff: true,
-    // X-Frame-Options: DENY - prevents clickjacking (also covered by CSP frameAncestors)
-    frameguard: { action: "deny" },
-    // Referrer-Policy: strict-origin-when-cross-origin - sends referrer only to same-origin
-    referrerPolicy: { policy: "strict-origin-when-cross-origin" },
-    // X-XSS-Protection is deprecated and not recommended (modern browsers use CSP instead)
-    xssFilter: false,
-    // Hide X-Powered-By header to reduce fingerprinting
-    hidePoweredBy: true,
-    // Strict-Transport-Security for HTTPS enforcement (only if behind HTTPS proxy)
-    hsts: { maxAge: 31536000, includeSubDomains: false, preload: false },
-  }),
-);
+app.use(cors());
 app.use(express.json());
 
-// Swagger documentation
-app.use("/api/v1/docs", swaggerUi.serve);
-app.get(
-  "/api/v1/docs",
-  swaggerUi.setup(specs, {
-    swaggerOptions: {
-      persistAuthorization: true,
-    },
-    customCss: `
-    .topbar { display: none; }
-    .swagger-ui .api-info { margin-bottom: 20px; }
-  `,
-    customSiteTitle: "StellarFlow API Documentation",
-  }),
-);
-
-// Expose metrics endpoint early so it's not rate limited, but still want timing
-app.use(metricsMiddleware);
-app.get("/metrics", metricsEndpoint);
-
-// Apply Rate Limiting to all /api routes
-app.use("/api", rateLimitMiddleware);
-
-// Apply API Key Middleware to all /api routes
-app.use("/api", apiKeyMiddleware);
-// Apply API Key Middleware to all /api/v1 routes
-app.use("/api/v1", apiKeyMiddleware);
-
 // Routes
-app.use("/api/v1/market-rates", marketRatesRouter);
-app.use("/api/v1/history", historyRouter);
-app.use("/api/v1/stats", statsRouter);
-app.use("/api/v1/intelligence", intelligenceRouter);
-app.use("/api/v1/price-updates", priceUpdatesRouter);
-app.use("/api/v1/assets", assetsRouter);
-app.use("/api/v1/status", statusRouter);
+app.use("/api/market-rates", marketRatesRouter);
+app.use("/api/history", historyRouter);
+app.use("/api/price-updates", priceUpdatesRouter);
+app.use("/api/stats", statsRouter);
 
 // Health check endpoint
 /**
@@ -283,35 +231,17 @@ app.get("/", (req, res) => {
       },
       stats: {
         volume: "/api/v1/stats/volume?date=YYYY-MM-DD",
+        relayers: "/api/stats/relayers",
       },
       history: {
         assetHistory: "/api/v1/history/:asset?range=1d|7d|30d|90d",
       },
+      intelligence: {
+        hourlyVolatility: "/api/v1/intelligence/hourly-volatility",
+        priceChange: "/api/v1/intelligence/price-change/:currency",
+        staleCurrencies: "/api/v1/intelligence/stale",
+      },
     },
-  });
-});
-
-// Error handling middleware
-app.use(
-  (
-    err: Error,
-    req: express.Request,
-    res: express.Response,
-    next: express.NextFunction,
-  ) => {
-    console.error("Unhandled error:", err);
-    res.status(500).json({
-      success: false,
-      error: "Internal server error",
-    });
-  },
-);
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: "Endpoint not found",
   });
 });
 
@@ -319,7 +249,22 @@ app.use((req, res) => {
 const httpServer = createServer(app);
 initSocket(httpServer);
 let sorobanEventListener: SorobanEventListener | null = null;
+
+// FIX 1: Typed as nullable — constructor is not called at module level,
+// so a missing secret env var won't crash the process before the server starts.
+let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
+
 let isShuttingDown = false;
+let stopEnvFileWatcher: (() => void) | undefined;
+const stopConfigWatcher = watchConfig((cfg) => {
+  sorobanEventListener?.stop();
+  multiSigSubmissionService.restart(cfg.multiSigPollIntervalMs);
+  hourlyAverageService.restart(cfg.hourlyAverageCheckIntervalMs);
+});
+
+if (process.env.ENABLE_ENV_FILE_WATCHER === "true") {
+  stopEnvFileWatcher = startEnvFileWatcher();
+}
 
 const closeHttpServer = (): Promise<void> =>
   new Promise((resolve, reject) => {
@@ -338,7 +283,7 @@ const closeHttpServer = (): Promise<void> =>
     });
   });
 
-const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
+const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
   if (isShuttingDown) {
     console.log(
       `Shutdown already in progress. Received duplicate ${signal} signal.`,
@@ -352,13 +297,22 @@ const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
   try {
     sorobanEventListener?.stop();
     multiSigSubmissionService.stop();
+    // FIX 2: Optional chaining — safe to call even if service never started
+    gasBalanceMonitorService?.stop();
     hourlyAverageService.stop();
+    priceAggregatorService.stop();
+    providerSecretRotationService.stop();
+    stopConfigWatcher();
+    stopEnvFileWatcher?.();
 
     await closeHttpServer();
     console.log("HTTP server closed.");
 
     await prisma.$disconnect();
     console.log("Database connections closed cleanly.");
+
+    await disconnectRedis();
+    console.log("Redis connections closed cleanly.");
 
     process.exit(0);
   } catch (error) {
@@ -381,7 +335,7 @@ process.once("SIGTERM", () => {
   });
 });
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`🌊 StellarFlow Backend running on port ${PORT}`);
   console.log(
     `📊 Market Rates API available at http://localhost:${PORT}/api/market-rates`,
@@ -392,19 +346,56 @@ httpServer.listen(PORT, () => {
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
-  // Start Soroban event listener to track confirmed on-chain prices
-  try {
-    sorobanEventListener = new SorobanEventListener();
-    sorobanEventListener.start().catch((err) => {
-      console.error("Failed to start event listener:", err);
-    });
-    console.log(`👂 Soroban event listener started`);
-  } catch (err) {
-    console.warn(
-      "Event listener not started:",
-      err instanceof Error ? err.message : err,
+  // Perform contract sanity check before starting ingestion loop
+  let contractSanityPassed = true;
+  if (contractSanityCheckService.isConfigured()) {
+    try {
+      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      if (!sanityResult.success) {
+        console.error(
+          `❌ Contract sanity check failed: ${sanityResult.error}`,
+        );
+        console.error(
+          "⛔ Preventing ingestion loop from starting due to contract failure",
+        );
+        contractSanityPassed = false;
+      }
+    } catch (err) {
+      console.error(
+        "❌ Contract sanity check error:",
+        err instanceof Error ? err.message : err,
+      );
+      console.error(
+        "⛔ Preventing ingestion loop from starting due to contract check error",
+      );
+      contractSanityPassed = false;
+    }
+  } else {
+    console.log(
+      "ℹ️ CONTRACT_ID not configured - skipping contract sanity check (ingestion loop will start)",
     );
-    sorobanEventListener = null;
+  }
+
+  // Start Soroban event listener to track confirmed on-chain prices
+  // Only start if contract sanity check passed or if check is not configured
+  if (contractSanityPassed) {
+    try {
+      sorobanEventListener = new SorobanEventListener();
+      sorobanEventListener.start().catch((err) => {
+        console.error("Failed to start event listener:", err);
+      });
+      console.log(`👂 Soroban event listener started`);
+    } catch (err) {
+      console.warn(
+        "Event listener not started:",
+        err instanceof Error ? err.message : err,
+      );
+      sorobanEventListener = null;
+    }
+  } else {
+    console.warn(
+      "⚠️ Soroban event listener NOT started due to failed contract sanity check",
+    );
   }
 
   // Start multi-sig submission service if enabled
@@ -434,6 +425,35 @@ httpServer.listen(PORT, () => {
   } catch (err) {
     console.warn(
       "Hourly average service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Issue #208 – Start OHLC price aggregation worker
+  try {
+    priceAggregatorService.start().catch((err: Error) => {
+      console.error("Failed to start OHLC price aggregator:", err);
+    });
+    console.log(`📈 OHLC price aggregator started (MINUTE / HOUR / DAY)`);
+  } catch (err) {
+    console.warn(
+      "OHLC price aggregator not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // FIX 3: getGasBalanceMonitorService() moved inside the listen callback so
+  // the constructor (and Keypair.fromSecret) only runs after the server is up.
+  // A missing secret env var now warns gracefully instead of crashing the process.
+  try {
+    gasBalanceMonitorService = getGasBalanceMonitorService();
+    gasBalanceMonitorService.start().catch((err: Error) => {
+      console.error("Failed to start gas balance monitor service:", err);
+    });
+    console.log(`⛽ Gas balance monitor service started`);
+  } catch (err) {
+    console.warn(
+      "Gas balance monitor service not started:",
       err instanceof Error ? err.message : err,
     );
   }

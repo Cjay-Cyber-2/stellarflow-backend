@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import axios from "axios";
 import { NGNRateFetcher } from "../src/services/marketRate/ngnFetcher";
-import { NGN_PROVIDER_WEIGHTS } from "../src/config/providerWeights.js";
 
 async function run() {
   const originalGet = axios.get;
@@ -67,17 +66,20 @@ async function run() {
     }) as typeof axios.get;
 
     const rate = await fetcher.fetchRate();
-    const expectedRate =
-      (300 * NGN_PROVIDER_WEIGHTS.vtpassCoinGeckoUsd +
-        300 * NGN_PROVIDER_WEIGHTS.coinGeckoDirectNgn +
-        1500 * NGN_PROVIDER_WEIGHTS.coinGeckoExchangeRateUsdNgn) /
-      (NGN_PROVIDER_WEIGHTS.vtpassCoinGeckoUsd +
-        NGN_PROVIDER_WEIGHTS.coinGeckoDirectNgn +
-        NGN_PROVIDER_WEIGHTS.coinGeckoExchangeRateUsdNgn);
+    const expectedRate = 300;
 
     assert.equal(rate.currency, "NGN");
     assert.equal(rate.rate, expectedRate);
-    assert.equal(rate.source, "Weighted average of 3 sources (outliers filtered)");
+    assert.equal(
+      rate.source,
+      "Weighted average of 3 sources (outliers filtered)",
+    );
+    assert.equal(Array.isArray(rate.rawResponses), true);
+    assert.equal(rate.rawResponses?.length, 5);
+    assert.deepEqual(
+      rate.rawResponses?.map((entry) => entry.provider),
+      ["VTpass", "CoinGecko", "CoinGecko", "CoinGecko", "ExchangeRate API"],
+    );
   } finally {
     axios.get = originalGet;
     for (const [key, val] of Object.entries(savedEnv)) {

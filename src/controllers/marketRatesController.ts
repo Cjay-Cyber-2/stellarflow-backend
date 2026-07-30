@@ -1,4 +1,5 @@
 import { Request, Response } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import { MarketRateService } from "../services/marketRate";
 
 const marketRateService = new MarketRateService();
@@ -7,10 +8,7 @@ export const getRate = async (req: Request, res: Response) => {
   try {
     const { currency } = req.params;
     if (!currency || typeof currency !== "string") {
-      return res.status(400).json({
-        success: false,
-        error: "Currency parameter is required and must be a string",
-      });
+      return sendApiError(res, 400, "BAD_REQUEST", "Currency parameter is required and must be a string");
     }
     const result = await marketRateService.getRate(currency);
     if (result.success) {
@@ -19,31 +17,24 @@ export const getRate = async (req: Request, res: Response) => {
         data: result.data,
       });
     } else {
-      res.status(404).json({
-        success: false,
-        error: result.error,
-      });
+      sendApiError(res, 404, "NOT_FOUND", typeof (result.error) === "string" ? String(result.error) : undefined);
     }
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
   }
 };
 
 export const getAllRates = async (req: Request, res: Response) => {
   try {
     const results = await marketRateService.getAllRates();
-    const rates = results.filter((result) => result.success).map((result) => result.data);
+    const rates = results
+      .filter((result) => result.success)
+      .map((result) => result.data);
     res.json({
       success: true,
       data: rates,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
   }
 };

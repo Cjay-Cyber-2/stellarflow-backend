@@ -1,9 +1,12 @@
-import { Horizon, Keypair } from "@stellar/stellar-sdk";
+import { BackpressureManager, PacketPriority } from "../queue/backpressure";
 import prisma from "../lib/prisma";
-import { getIO } from "../lib/socket";
+import { broadcastToSessions } from "../lib/socket";
+import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
+import { logger } from "../utils/logger";
 dotenv.config();
 export class SorobanEventListener {
+    bpManager = new BackpressureManager();
     server;
     oraclePublicKey;
     isRunning = false;
@@ -11,98 +14,135 @@ export class SorobanEventListener {
     lastProcessedLedger = 0;
     pollTimer = null;
     constructor(pollIntervalMs = 15000) {
-        const secret = process.env.ORACLE_SECRET_KEY || process.env.SOROBAN_ADMIN_SECRET;
+        const secret = process.env.ORACLE_SECRET_KEY ??
+            process.env.SOROBAN_ADMIN_SECRET ??
+            process.env.STELLAR_SECRET;
         if (!secret) {
-            throw new Error("ORACLE_SECRET_KEY or SOROBAN_ADMIN_SECRET not found in environment variables");
+            throw new Error("Stellar secret key not found in environment variables. Please set STELLAR_SECRET or SOROBAN_ADMIN_SECRET.");
         }
-        this.oraclePublicKey = Keypair.fromSecret(secret).publicKey();
+        this.oraclePublicKey = "";
         this.pollIntervalMs = pollIntervalMs;
-        const network = process.env.STELLAR_NETWORK || "TESTNET";
-        const horizonUrl = network === "PUBLIC"
-            ? "https://horizon.stellar.org"
-            : "https://horizon-testnet.stellar.org";
-        this.server = new Horizon.Server(horizonUrl);
+        this.server = stellarProvider.getServer();
+    }
+    getOraclePublicKey() {
+        return this.oraclePublicKey;
     }
     async start() {
         if (this.isRunning) {
-            console.warn("SorobanEventListener is already running");
+            logger.warn("[EventListener] SorobanEventListener is already running");
             return;
         }
         this.isRunning = true;
-        console.log(`[EventListener] Starting listener for account ${this.oraclePublicKey}`);
-        // Initialize last processed ledger from the most recent on-chain record
+        const { signer } = await import("../signer/index.js");
+        this.oraclePublicKey = await signer.getPublicKey();
+        logger.info(`[EventListener] Starting listener for account ${this.oraclePublicKey}`);
         const lastRecord = await prisma.onChainPrice.findFirst({
             orderBy: { ledgerSeq: "desc" },
         });
         if (lastRecord) {
             this.lastProcessedLedger = lastRecord.ledgerSeq;
-            console.log(`[EventListener] Resuming from ledger ${this.lastProcessedLedger}`);
+            logger.info(`[EventListener] Resuming from ledger ${this.lastProcessedLedger}`);
         }
+        // Start the background worker to process the backpressure queue
+        this.startWorker();
         // Initial poll
         await this.pollTransactions();
         // Start periodic polling
+        this.startPollingTimer();
+    }
+    restart(pollIntervalMs) {
+        this.stop();
+        if (pollIntervalMs !== undefined)
+            this.pollIntervalMs = pollIntervalMs;
+        this.start().catch((err) => logger.error("[EventListener] Restart failed:", err));
+    }
+    startPollingTimer() {
         this.pollTimer = setInterval(() => {
             this.pollTransactions().catch((err) => {
-                console.error("[EventListener] Poll error:", err);
+                logger.networkError("[EventListener] Poll error:", { err });
             });
         }, this.pollIntervalMs);
     }
-    stop() {
-        if (this.pollTimer) {
-            clearInterval(this.pollTimer);
-            this.pollTimer = null;
+    /**
+     * Worker loop that processes packets from the queue at a controlled pace.
+     */
+    async startWorker() {
+        logger.info("[Worker] Backpressure consumer loop started.");
+        while (this.isRunning) {
+            const packet = await this.bpManager.dequeue();
+            if (packet) {
+                try {
+                    const price = packet.data;
+                    if (packet.priority === PacketPriority.STANDARD) {
+                        // Essential data: Save to DB
+                        await prisma.onChainPrice.create({
+                            data: {
+                                currency: price.currency,
+                                rate: price.rate,
+                                txHash: price.txHash,
+                                memoId: price.memoId,
+                                ledgerSeq: price.ledgerSeq,
+                                confirmedAt: price.confirmedAt,
+                            },
+                        });
+                    }
+                    // Broadcast all successful updates (Essential or Metric) to UI
+                    broadcastToSessions("price_update", price);
+                }
+                catch (err) {
+                    logger.error("[Worker] Failed to process queued price:", err);
+                }
+            }
+            else {
+                // Wait 100ms if queue is empty to prevent CPU spinning
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
         }
-        this.isRunning = false;
-        console.log("[EventListener] Stopped");
     }
     async pollTransactions() {
         try {
+            this.server = stellarProvider.getServer();
             const transactions = await this.server
                 .transactions()
                 .forAccount(this.oraclePublicKey)
                 .order("desc")
                 .limit(50)
                 .call();
-            const confirmedPrices = [];
             for (const tx of transactions.records) {
-                const ledgerSeq = tx.ledger_attr;
-                // Skip already processed transactions
-                if (ledgerSeq <= this.lastProcessedLedger) {
+                if (tx.ledger_attr <= this.lastProcessedLedger)
                     continue;
-                }
-                // Only process transactions with our memo prefix
                 const memoId = this.extractMemoId(tx);
-                if (!memoId || !memoId.startsWith("SF-")) {
+                if (!memoId || !memoId.startsWith("SF-"))
                     continue;
-                }
-                // Parse price updates from operations
                 const prices = await this.parseOperations(tx, memoId);
-                confirmedPrices.push(...prices);
-            }
-            if (confirmedPrices.length > 0) {
-                await this.saveConfirmedPrices(confirmedPrices);
-                this.emitPriceUpdates(confirmedPrices);
-                // Update last processed ledger
-                const maxLedger = Math.max(...confirmedPrices.map((p) => p.ledgerSeq));
-                if (maxLedger > this.lastProcessedLedger) {
-                    this.lastProcessedLedger = maxLedger;
+                for (const price of prices) {
+                    // Wrap price in a packet and send to queue
+                    const packet = {
+                        priority: PacketPriority.STANDARD, // Using Standard for financial data
+                        data: price,
+                        timestamp: Date.now(),
+                    };
+                    const accepted = await this.bpManager.enqueue(packet);
+                    if (accepted) {
+                        // Update tracking only if it was accepted by queue
+                        if (price.ledgerSeq > this.lastProcessedLedger) {
+                            this.lastProcessedLedger = price.ledgerSeq;
+                        }
+                    }
                 }
             }
         }
         catch (error) {
-            // Account not found is expected for new accounts with no transactions
-            if (error instanceof Error &&
-                error.message.includes("status code 404")) {
-                console.log("[EventListener] No transactions found for oracle account");
+            stellarProvider.reportFailure(error);
+            if (error instanceof Error && error.message.includes("status code 404"))
                 return;
-            }
             throw error;
         }
     }
+    // ... (Keep extractMemoId and parseOperations methods as they were) ...
     extractMemoId(tx) {
-        if (tx.memo_type === "text" && tx.memo) {
+        if (tx.memo_type === "text" && tx.memo)
             return tx.memo;
-        }
         return null;
     }
     async parseOperations(tx, memoId) {
@@ -110,27 +150,18 @@ export class SorobanEventListener {
         try {
             const operations = await tx.operations();
             for (const op of operations.records) {
-                if (op.type !== "manage_data") {
+                if (op.type !== "manage_data")
                     continue;
-                }
                 const manageDataOp = op;
-                const name = manageDataOp.name;
-                // Parse operation name format: <CURRENCY>_PRICE
-                if (!name.endsWith("_PRICE")) {
+                if (!manageDataOp.name.endsWith("_PRICE"))
                     continue;
-                }
-                const currency = name.replace("_PRICE", "");
+                const currency = manageDataOp.name.replace("_PRICE", "");
                 const valueBase64 = manageDataOp.value;
-                if (!valueBase64) {
+                if (!valueBase64)
                     continue;
-                }
-                // Decode base64 value to string then parse as number
-                const valueStr = atob(String(valueBase64));
-                const rate = parseFloat(valueStr);
-                if (isNaN(rate)) {
-                    console.warn(`[EventListener] Invalid rate value for ${currency}: ${valueStr}`);
+                const rate = parseFloat(atob(String(valueBase64)));
+                if (isNaN(rate))
                     continue;
-                }
                 confirmedPrices.push({
                     currency,
                     rate,
@@ -142,91 +173,21 @@ export class SorobanEventListener {
             }
         }
         catch (error) {
-            console.error(`[EventListener] Error parsing operations for tx ${tx.hash}:`, error);
+            logger.networkError(`[EventListener] Error parsing tx ${tx.hash}:`, {
+                error,
+            });
         }
         return confirmedPrices;
     }
-    async saveConfirmedPrices(prices) {
-        for (const price of prices) {
-            try {
-                await prisma.onChainPrice.upsert({
-                    where: {
-                        txHash_currency: {
-                            txHash: price.txHash,
-                            currency: price.currency,
-                        },
-                    },
-                    update: {},
-                    create: {
-                        currency: price.currency,
-                        rate: price.rate,
-                        txHash: price.txHash,
-                        memoId: price.memoId,
-                        ledgerSeq: price.ledgerSeq,
-                        confirmedAt: price.confirmedAt,
-                    },
-                });
-                console.log(`[EventListener] Saved confirmed price: ${price.currency} = ${price.rate} (tx: ${price.txHash.substring(0, 8)}...)`);
-            }
-            catch (error) {
-                console.error(`[EventListener] Error saving price for ${price.currency}:`, error);
-            }
-        }
-    }
-    emitPriceUpdates(prices) {
-        try {
-            const io = getIO();
-            for (const price of prices) {
-                io.emit("price:confirmed", {
-                    currency: price.currency,
-                    rate: price.rate,
-                    txHash: price.txHash,
-                    ledgerSeq: price.ledgerSeq,
-                    confirmedAt: price.confirmedAt.toISOString(),
-                });
-            }
-        }
-        catch {
-            // Socket not initialized (e.g., during tests)
-        }
-    }
-    async getLatestConfirmedPrice(currency) {
-        const record = await prisma.onChainPrice.findFirst({
-            where: { currency: currency.toUpperCase() },
-            orderBy: { confirmedAt: "desc" },
-        });
-        if (!record) {
-            return null;
-        }
-        return {
-            currency: record.currency,
-            rate: Number(record.rate),
-            txHash: record.txHash,
-            memoId: record.memoId,
-            ledgerSeq: record.ledgerSeq,
-            confirmedAt: record.confirmedAt,
-        };
-    }
-    async getConfirmedPriceHistory(currency, limit = 100) {
-        const records = await prisma.onChainPrice.findMany({
-            where: { currency: currency.toUpperCase() },
-            orderBy: { confirmedAt: "desc" },
-            take: limit,
-        });
-        return records.map((record) => ({
-            currency: record.currency,
-            rate: Number(record.rate),
-            txHash: record.txHash,
-            memoId: record.memoId,
-            ledgerSeq: record.ledgerSeq,
-            confirmedAt: record.confirmedAt,
-        }));
+    stop() {
+        if (this.pollTimer)
+            clearInterval(this.pollTimer);
+        this.pollTimer = null;
+        this.isRunning = false;
+        logger.info("[EventListener] Stopped");
     }
     isActive() {
         return this.isRunning;
-    }
-    getOraclePublicKey() {
-        return this.oraclePublicKey;
     }
 }
 //# sourceMappingURL=sorobanEventListener.js.map

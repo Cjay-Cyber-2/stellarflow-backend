@@ -3,27 +3,44 @@ import { GHSRateFetcher } from "./ghsFetcher";
 import { NGNRateFetcher } from "./ngnFetcher";
 import { StellarService } from "../stellarService";
 import { multiSigService } from "../multiSigService";
-import { getIO } from "../../lib/socket";
+import { broadcastToSessions } from "../../lib/socket";
 import prisma from "../../lib/prisma";
+import { getRedisClient } from "../../lib/redis";
 import dotenv from "dotenv";
 import { normalizeDateToUTC } from "../../utils/timeUtils";
+import { sanityCheckService } from "../sanityCheckService";
+import { appConfig } from "../../config/configWatcher";
+import { isLockdownEnabled } from "../../state/appState";
+import { httpClient } from "../../lib/httpClient.js";
+import { createFetcherLogger } from "../../utils/logger";
+import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
+import { checkCrossPairConsistency } from "../../logic/crossPairArbitrageDetection";
+import { BackpressureManager, PacketPriority, } from "../../queue/backpressure";
 dotenv.config();
-// Global import for priceReviewService
 import { priceReviewService } from "../priceReviewService";
+import { webhookService } from "../webhook";
+import { anomalyDetectionService } from "../anomalyDetection";
 export class MarketRateService {
     fetchers = new Map();
     cache = new Map();
-    latestPricesCache = null;
     stellarService;
-    CACHE_DURATION_MS = 30000; // 30 seconds
-    LATEST_PRICES_CACHE_DURATION_MS = 10000; // 10 seconds
+    LATEST_PRICES_REDIS_KEY = "market-rates:latest:v1";
+    LATEST_PRICES_REDIS_TTL_SECONDS = 5;
     multiSigEnabled;
     remoteOracleServers = [];
+    pendingSubmissions = [];
+    batchTimeout = null;
+    crossPairLogger = createFetcherLogger("CrossPairArbitrage");
+    backpressureManager;
+    get CACHE_DURATION_MS() {
+        return appConfig.cacheDurationMs;
+    }
+    get BATCH_WINDOW_MS() {
+        return appConfig.batchWindowMs;
+    }
     constructor() {
         this.stellarService = new StellarService();
-        // Check if multi-sig is enabled
         this.multiSigEnabled = process.env.MULTI_SIG_ENABLED === "true";
-        // Parse remote oracle server URLs
         const remoteServersEnv = process.env.REMOTE_ORACLE_SERVERS || "";
         if (remoteServersEnv) {
             this.remoteOracleServers = remoteServersEnv
@@ -35,14 +52,47 @@ export class MarketRateService {
             console.info(`[MarketRateService] Multi-Sig mode ENABLED with ${this.remoteOracleServers.length} remote servers`);
         }
         this.initializeFetchers();
+        // Initialize backpressure manager with default config
+        this.backpressureManager = new BackpressureManager({
+            maxCapacity: 1000,
+            dropThreshold: 0.9,
+            slowDownThreshold: 0.7,
+            slowDownDelay: 100,
+            enableMetrics: true,
+        });
+        console.info("[MarketRateService] Backpressure manager initialized with max capacity 1000");
     }
     initializeFetchers() {
-        const kesFetcher = new KESRateFetcher();
-        const ghsFetcher = new GHSRateFetcher();
-        const ngnFetcher = new NGNRateFetcher();
-        this.fetchers.set("KES", kesFetcher);
-        this.fetchers.set("GHS", ghsFetcher);
-        this.fetchers.set("NGN", ngnFetcher);
+        this.fetchers.set("KES", new KESRateFetcher());
+        this.fetchers.set("GHS", new GHSRateFetcher());
+        this.fetchers.set("NGN", new NGNRateFetcher());
+    }
+    serializeRawPayload(payload) {
+        try {
+            return JSON.stringify(payload);
+        }
+        catch {
+            return String(payload);
+        }
+    }
+    async persistRawResponses(currency, rawResponses) {
+        if (!Array.isArray(rawResponses) || rawResponses.length === 0) {
+            return;
+        }
+        const clientAny = prisma;
+        if (!clientAny?.rawData ||
+            typeof clientAny.rawData.createMany !== "function") {
+            return;
+        }
+        await clientAny.rawData.createMany({
+            data: rawResponses.map((rawResponse) => ({
+                currency,
+                provider: rawResponse.provider,
+                endpoint: rawResponse.endpoint ?? null,
+                payload: this.serializeRawPayload(rawResponse.payload),
+                fetchedAt: normalizeDateToUTC(rawResponse.receivedAt),
+            })),
+        });
     }
     async getRate(currency) {
         try {
@@ -61,36 +111,51 @@ export class MarketRateService {
                     data: cached.rate,
                 };
             }
+            // Apply backpressure check before fetching
+            const packet = {
+                priority: PacketPriority.STANDARD,
+                data: { currency: normalizedCurrency, action: "fetch_rate" },
+                timestamp: Date.now(),
+            };
+            const enqueued = await this.backpressureManager.enqueue(packet);
+            if (!enqueued) {
+                console.warn(`[MarketRateService] Rate fetch for ${normalizedCurrency} dropped due to backpressure`);
+                return {
+                    success: false,
+                    error: `Rate fetch for ${normalizedCurrency} dropped due to backpressure`,
+                };
+            }
             let rate;
             try {
                 rate = await fetcher.fetchRate();
+                // Dequeue the packet after successful fetch
+                this.backpressureManager.tryDequeue();
             }
             catch (fetchError) {
-                // Log provider/fetcher failure to ErrorLog (non-blocking)
+                // Dequeue the packet even on error to prevent queue buildup
+                this.backpressureManager.tryDequeue();
                 try {
                     const providerName = fetcher && typeof fetcher.constructor === "function"
                         ? fetcher.constructor.name
                         : normalizedCurrency;
-                    try {
-                        const clientAny = prisma;
-                        if (clientAny?.errorLog && typeof clientAny.errorLog.create === "function") {
-                            clientAny.errorLog.create({
-                                data: {
-                                    providerName,
-                                    errorMessage: fetchError instanceof Error
-                                        ? fetchError.message
-                                        : JSON.stringify(fetchError),
-                                    occurredAt: new Date(),
-                                },
-                            }).catch(() => { });
-                        }
-                    }
-                    catch {
-                        // swallow
+                    const clientAny = prisma;
+                    if (clientAny?.errorLog &&
+                        typeof clientAny.errorLog.create === "function") {
+                        clientAny.errorLog
+                            .create({
+                            data: {
+                                providerName,
+                                errorMessage: fetchError instanceof Error
+                                    ? fetchError.message
+                                    : JSON.stringify(fetchError),
+                                occurredAt: new Date(),
+                            },
+                        })
+                            .catch(() => { });
                     }
                 }
                 catch {
-                    // swallow any unexpected errors when attempting to log
+                    // swallow logging errors
                 }
                 return {
                     success: false,
@@ -98,6 +163,12 @@ export class MarketRateService {
                         ? fetchError.message
                         : "Unknown fetcher error",
                 };
+            }
+            try {
+                await this.persistRawResponses(normalizedCurrency, rate.rawResponses);
+            }
+            catch (rawDataError) {
+                console.error("Failed to persist raw provider responses:", rawDataError);
             }
             const normalizedRate = {
                 ...rate,
@@ -125,41 +196,73 @@ export class MarketRateService {
                     comparisonTimestamp: reviewAssessment.comparisonTimestamp,
                 }),
             };
+            // Perform Anomaly Detection
+            const anomalyCheck = await anomalyDetectionService.checkAnomaly(normalizedCurrency, rate.rate);
+            if (anomalyCheck.isAnomalous) {
+                console.warn(`[MarketRateService] Anomaly detected for ${normalizedCurrency}: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`);
+                await webhookService.sendManualReviewNotification({
+                    reviewId: 0,
+                    currency: normalizedCurrency,
+                    rate: rate.rate,
+                    previousRate: anomalyCheck.mean,
+                    changePercent: Math.abs(anomalyCheck.zScore * 100),
+                    source: rate.source,
+                    timestamp: rate.timestamp,
+                    reason: `Anomaly detected: Z-Score ${anomalyCheck.zScore.toFixed(2)}σ`,
+                });
+            }
+            // Cross-pair arbitrage detection (NGN only)
+            if (normalizedCurrency === "NGN") {
+                void this.runCrossPairCheck(rate.rate);
+            }
             if (!reviewAssessment.manualReviewRequired) {
                 try {
-                    const memoId = this.stellarService.generateMemoId(normalizedCurrency);
-                    if (this.multiSigEnabled) {
-                        // Multi-sig workflow: create request and collect signatures
-                        console.info(`[MarketRateService] Starting multi-sig workflow for ${normalizedCurrency} rate ${rate.rate}`);
-                        const signatureRequest = await multiSigService.createMultiSigRequest(reviewAssessment.reviewRecordId, normalizedCurrency, rate.rate, rate.source, memoId);
-                        // Sign locally first
-                        try {
-                            await multiSigService.signMultiSigPrice(signatureRequest.multiSigPriceId);
-                            console.info(`[MarketRateService] Local signature added for multi-sig request ${signatureRequest.multiSigPriceId}`);
-                        }
-                        catch (error) {
-                            console.error(`[MarketRateService] Failed to sign locally:`, error);
-                        }
-                        // Request signatures from remote servers asynchronously
-                        // (non-blocking - don't wait for completion)
-                        this.requestRemoteSignaturesAsync(signatureRequest.multiSigPriceId, memoId).catch((err) => {
-                            console.error(`[MarketRateService] Error requesting remote signatures:`, err);
-                        });
-                        // Mark as multi-sig pending (don't submit to Stellar yet)
-                        // The submission will happen via a background job once all signatures are collected
-                        enrichedRate.contractSubmissionSkipped = false;
-                        enrichedRate.pendingMultiSig = true;
-                        enrichedRate.multiSigPriceId = signatureRequest.multiSigPriceId;
-                    }
-                    else {
-                        // Single-sig workflow: submit directly to Stellar
-                        const txHash = await this.stellarService.submitPriceUpdate(normalizedCurrency, rate.rate, memoId);
-                        await priceReviewService.markContractSubmitted(reviewAssessment.reviewRecordId, memoId, txHash);
-                        console.info(`[MarketRateService] Single-sig price update submitted for ${normalizedCurrency}`);
-                    }
+                    await sanityCheckService.checkPrice(normalizedCurrency, rate.rate);
                 }
-                catch (stellarError) {
-                    console.error("Failed to submit price update to Stellar network:", stellarError);
+                catch (sanityError) {
+                    console.warn(`Sanity check failed for ${normalizedCurrency}:`, sanityError);
+                }
+                if (await isLockdownEnabled()) {
+                    enrichedRate.contractSubmissionSkipped = true;
+                    console.warn(`[MarketRateService] Lockdown enabled. Skipping Stellar submission workflow for ${normalizedCurrency}.`);
+                }
+                else {
+                    try {
+                        const memoId = this.stellarService.generateMemoId(normalizedCurrency);
+                        if (this.multiSigEnabled) {
+                            console.info(`[MarketRateService] Starting multi-sig workflow for ${normalizedCurrency} rate ${rate.rate}`);
+                            const signatureRequest = await multiSigService.createMultiSigRequest(reviewAssessment.reviewRecordId, normalizedCurrency, rate.rate, rate.source, memoId);
+                            try {
+                                await multiSigService.signMultiSigPrice(signatureRequest.multiSigPriceId);
+                                console.info(`[MarketRateService] Local signature added for multi-sig request ${signatureRequest.multiSigPriceId}`);
+                            }
+                            catch (error) {
+                                console.error(`[MarketRateService] Failed to sign locally:`, error);
+                            }
+                            this.requestRemoteSignaturesAsync(signatureRequest.multiSigPriceId, memoId).catch((err) => {
+                                console.error(`[MarketRateService] Error requesting remote signatures:`, err);
+                            });
+                            enrichedRate.contractSubmissionSkipped = false;
+                            enrichedRate.pendingMultiSig = true;
+                            enrichedRate.multiSigPriceId = signatureRequest.multiSigPriceId;
+                        }
+                        else {
+                            const txHash = await this.stellarService.submitPriceUpdate(normalizedCurrency, rate.rate, memoId);
+                            await priceReviewService.markContractSubmitted(reviewAssessment.reviewRecordId, memoId, txHash);
+                            console.info(`[MarketRateService] Single-sig price update submitted for ${normalizedCurrency}`);
+                            this.pendingSubmissions.push({
+                                currency: normalizedCurrency,
+                                rate: rate.rate,
+                                reviewId: reviewAssessment.reviewRecordId,
+                            });
+                            if (!this.batchTimeout) {
+                                this.batchTimeout = setTimeout(() => this.flushBatchSubmissions(), this.BATCH_WINDOW_MS);
+                            }
+                        }
+                    }
+                    catch (stellarError) {
+                        console.error("Failed to submit price update to Stellar network:", stellarError);
+                    }
                 }
             }
             else {
@@ -169,7 +272,6 @@ export class MarketRateService {
                 rate: enrichedRate,
                 expiry: new Date(Date.now() + this.CACHE_DURATION_MS),
             });
-            // Persist to price history for sparkline charts
             try {
                 const normalizedTimestamp = normalizeDateToUTC(enrichedRate.timestamp);
                 await prisma.priceHistory.upsert({
@@ -192,21 +294,26 @@ export class MarketRateService {
             catch (dbError) {
                 console.error("Failed to persist price history:", dbError);
             }
-            // Broadcast fresh price to all connected dashboard clients
             try {
-                getIO().emit("price:update", {
-                    currency: normalizedCurrency,
-                    rate: enrichedRate,
-                });
-                if (reviewAssessment.manualReviewRequired) {
-                    getIO().emit("price:review_required", {
+                if (!reviewAssessment.manualReviewRequired) {
+                    broadcastToSessions("price:update", {
                         currency: normalizedCurrency,
-                        rate: enrichedRate,
+                        rate: enrichedRate.rate,
+                        source: enrichedRate.source,
+                        timestamp: enrichedRate.timestamp,
+                    });
+                }
+                else {
+                    broadcastToSessions("price:review_required", {
+                        currency: normalizedCurrency,
+                        rate: enrichedRate.rate,
+                        reviewId: enrichedRate.reviewId,
+                        reason: enrichedRate.reviewReason,
                     });
                 }
             }
             catch {
-                // Socket not initialized yet (e.g. during tests) - skip silently
+                // Socket not initialized yet
             }
             return {
                 success: true,
@@ -222,8 +329,27 @@ export class MarketRateService {
     }
     async getAllRates() {
         const currencies = Array.from(this.fetchers.keys());
-        const promises = currencies.map((currency) => this.getRate(currency));
-        return Promise.all(promises);
+        const settledResults = await Promise.allSettled(currencies.map((currency) => this.getRate(currency)));
+        return settledResults.map((result, index) => {
+            if (result.status === "fulfilled") {
+                return result.value;
+            }
+            const failedCurrency = currencies[index];
+            const errorMessage = result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason);
+            console.error(`[MarketRateService] Isolated failure for ${failedCurrency}: ${errorMessage}`, result.reason);
+            return {
+                success: false,
+                error: `Failed to fetch ${failedCurrency}: ${errorMessage}`,
+            };
+        });
+    }
+    async flushBatchSubmissions() {
+        this.batchTimeout = null;
+        if (this.pendingSubmissions.length === 0)
+            return;
+        this.pendingSubmissions = [];
     }
     async healthCheck() {
         const results = {};
@@ -240,37 +366,112 @@ export class MarketRateService {
     getSupportedCurrencies() {
         return Array.from(this.fetchers.keys());
     }
-    async getLatestPrices() {
-        const cachedLatestPrices = this.latestPricesCache;
-        if (cachedLatestPrices && cachedLatestPrices.expiry > new Date()) {
-            return cachedLatestPrices.response;
+    getLatestPricesCacheClient() {
+        const redisClient = getRedisClient();
+        if (!redisClient || !redisClient.isReady) {
+            return null;
         }
-        const results = await this.getAllRates();
-        const successfulRates = results
-            .filter((result) => result.success && result.data)
-            .map((result) => result.data);
-        const errorMessages = results
-            .filter((result) => !result.success)
-            .map((result) => result.error)
-            .filter((error) => !!error);
-        const allSuccessful = successfulRates.length > 0 && errorMessages.length === 0;
-        const response = {
-            success: allSuccessful,
-            data: successfulRates,
-            ...(errorMessages.length > 0 && { error: errorMessages[0] }),
-            ...(errorMessages.length > 0 && { errors: errorMessages }),
-        };
-        if (response.success) {
-            this.latestPricesCache = {
-                response,
-                expiry: new Date(Date.now() + this.LATEST_PRICES_CACHE_DURATION_MS),
+        return redisClient;
+    }
+    async fetchLatestPricesFromDatabase() {
+        const rows = await prisma.priceHistory.findMany({
+            where: {
+                currency: {
+                    in: this.getSupportedCurrencies(),
+                },
+            },
+            distinct: ["currency"],
+            orderBy: [{ currency: "asc" }, { timestamp: "desc" }],
+        });
+        return rows.map((row) => ({
+            currency: row.currency,
+            rate: Number(row.rate),
+            timestamp: normalizeDateToUTC(row.timestamp),
+            source: row.source,
+        }));
+    }
+    parseLatestPricesCache(cachedPayload) {
+        try {
+            const parsed = JSON.parse(cachedPayload);
+            if (typeof parsed.success !== "boolean") {
+                return null;
+            }
+            const hydratedRates = Array.isArray(parsed.data)
+                ? parsed.data.map((rate) => ({
+                    ...rate,
+                    timestamp: new Date(rate.timestamp),
+                    ...(rate.comparisonTimestamp && {
+                        comparisonTimestamp: new Date(rate.comparisonTimestamp),
+                    }),
+                }))
+                : undefined;
+            return {
+                success: parsed.success,
+                ...(hydratedRates && { data: hydratedRates }),
+                ...(parsed.error && { error: parsed.error }),
+                ...(parsed.errors && { errors: parsed.errors }),
             };
         }
-        return response;
+        catch {
+            return null;
+        }
+    }
+    async getLatestPrices() {
+        const cacheClient = this.getLatestPricesCacheClient();
+        if (cacheClient) {
+            try {
+                const cachedPayload = await cacheClient.get(this.LATEST_PRICES_REDIS_KEY);
+                if (cachedPayload) {
+                    const cachedResponse = this.parseLatestPricesCache(cachedPayload);
+                    if (cachedResponse) {
+                        return cachedResponse;
+                    }
+                }
+            }
+            catch (error) {
+                console.warn("Failed to read latest prices from Redis cache:", error);
+            }
+        }
+        try {
+            const latestRates = await this.fetchLatestPricesFromDatabase();
+            if (latestRates.length === 0) {
+                return {
+                    success: false,
+                    error: "No latest prices available",
+                };
+            }
+            const response = {
+                success: true,
+                data: latestRates,
+            };
+            if (cacheClient) {
+                try {
+                    await cacheClient.setEx(this.LATEST_PRICES_REDIS_KEY, this.LATEST_PRICES_REDIS_TTL_SECONDS, JSON.stringify(response));
+                }
+                catch (error) {
+                    console.warn("Failed to write latest prices to Redis cache:", error);
+                }
+            }
+            return response;
+        }
+        catch (error) {
+            return {
+                success: false,
+                error: error instanceof Error
+                    ? error.message
+                    : "Failed to fetch latest prices from database",
+            };
+        }
     }
     clearCache() {
         this.cache.clear();
-        this.latestPricesCache = null;
+        const cacheClient = this.getLatestPricesCacheClient();
+        if (!cacheClient) {
+            return;
+        }
+        void cacheClient.del(this.LATEST_PRICES_REDIS_KEY).catch((error) => {
+            console.warn("Failed to clear latest prices Redis cache:", error);
+        });
     }
     async getPendingReviews() {
         return priceReviewService.getPendingReviews();
@@ -291,13 +492,13 @@ export class MarketRateService {
         });
         this.cache.delete(pendingReview.currency.toUpperCase());
         try {
-            getIO().emit("price:review_resolved", {
+            broadcastToSessions("price:review_resolved", {
                 action: "approved",
                 review: approvedReview,
             });
         }
         catch {
-            // Socket not initialized yet (e.g. during tests) - skip silently
+            // Socket not initialized yet
         }
         return approvedReview;
     }
@@ -309,13 +510,13 @@ export class MarketRateService {
         });
         this.cache.delete(rejectedReview.currency.toUpperCase());
         try {
-            getIO().emit("price:review_resolved", {
+            broadcastToSessions("price:review_resolved", {
                 action: "rejected",
                 review: rejectedReview,
             });
         }
         catch {
-            // Socket not initialized yet (e.g. during tests) - skip silently
+            // Socket not initialized yet
         }
         return rejectedReview;
     }
@@ -338,16 +539,21 @@ export class MarketRateService {
         return status;
     }
     /**
-     * Asynchronously request signatures from remote oracle servers.
-     * This is non-blocking and doesn't wait for completion.
-     * Errors are logged but don't fail the price fetch operation.
+     * Get backpressure metrics for monitoring queue health
      */
-    async requestRemoteSignaturesAsync(multiSigPriceId, memoId) {
+    getBackpressureMetrics() {
+        return this.backpressureManager.getMetrics();
+    }
+    /**
+     * Reset backpressure metrics (useful for testing)
+     */
+    resetBackpressureMetrics() {
+        this.backpressureManager.resetMetrics();
+    }
+    async requestRemoteSignaturesAsync(multiSigPriceId, _memoId) {
         console.info(`[MarketRateService] Requesting signatures from ${this.remoteOracleServers.length} remote servers for multi-sig ${multiSigPriceId}`);
-        // Request signatures from all remote servers in parallel
         const signatureRequests = this.remoteOracleServers.map((serverUrl) => multiSigService.requestRemoteSignature(multiSigPriceId, serverUrl));
         const results = await Promise.allSettled(signatureRequests);
-        // Log results for monitoring
         results.forEach((result, index) => {
             if (result.status === "fulfilled") {
                 if (result.value.success) {
@@ -361,6 +567,41 @@ export class MarketRateService {
                 console.error(`[MarketRateService] ❌ Error requesting signature from ${this.remoteOracleServers[index]}:`, result.reason);
             }
         });
+    }
+    async runCrossPairCheck(ngnXlmRate) {
+        try {
+            const response = await httpClient.get("https://api.coingecko.com/api/v3/simple/price?ids=stellar&vs_currencies=usd", {
+                timeout: OUTGOING_HTTP_TIMEOUT_MS,
+            });
+            const xlmUsd = response.data?.stellar?.usd;
+            if (typeof xlmUsd !== "number" || xlmUsd <= 0)
+                return;
+            // Derive NGN/USD reference from the same CoinGecko data
+            const ngnUsdReference = ngnXlmRate / xlmUsd;
+            const result = checkCrossPairConsistency(ngnXlmRate, xlmUsd, ngnUsdReference);
+            if (result.flagged) {
+                this.crossPairLogger.warn(`⚠️ CROSS-PAIR ARBITRAGE DETECTED: NGN deviation ${result.deviationPercent.toFixed(2)}% exceeds threshold`, {
+                    ngnXlmRate,
+                    xlmUsdRate: xlmUsd,
+                    impliedRate: result.impliedRate,
+                    directRate: result.directRate,
+                    deviationPercent: result.deviationPercent,
+                });
+            }
+            else {
+                this.crossPairLogger.debug("✅ Cross-pair consistency check passed for NGN", {
+                    ngnXlmRate,
+                    xlmUsdRate: xlmUsd,
+                    impliedRate: result.impliedRate,
+                    deviationPercent: result.deviationPercent,
+                });
+            }
+        }
+        catch (error) {
+            this.crossPairLogger.warn("Cross-pair check failed, skipping", {
+                error: error instanceof Error ? error.message : error,
+            });
+        }
     }
 }
 //# sourceMappingURL=marketRateService.js.map

@@ -17,9 +17,13 @@ async function testRetryUtil() {
         callCount++;
         return { data: "success" };
       },
-      { maxRetries: 3, retryDelay: 100 }
+      { maxRetries: 3, retryDelay: 100 },
     );
-    assert.strictEqual(callCount, 1, "Should only call once for successful request");
+    assert.strictEqual(
+      callCount,
+      1,
+      "Should only call once for successful request",
+    );
     assert.deepStrictEqual(result, { data: "success" });
     console.log("✅ PASS\n");
   } catch (error) {
@@ -42,7 +46,7 @@ async function testRetryUtil() {
         }
         return { data: "success after retries" };
       },
-      { maxRetries: 3, retryDelay: 100 }
+      { maxRetries: 3, retryDelay: 100 },
     );
     assert.strictEqual(callCount, 3, "Should retry until success");
     assert.deepStrictEqual(result, { data: "success after retries" });
@@ -65,7 +69,7 @@ async function testRetryUtil() {
           error.config = {} as any;
           throw error;
         },
-        { maxRetries: 3, retryDelay: 100 }
+        { maxRetries: 3, retryDelay: 100 },
       );
       console.error("❌ FAIL: Should have thrown error");
       process.exit(1);
@@ -100,7 +104,7 @@ async function testRetryUtil() {
         }
         return { data: "recovered" };
       },
-      { maxRetries: 3, retryDelay: 100 }
+      { maxRetries: 3, retryDelay: 100 },
     );
     assert.strictEqual(callCount, 2, "Should retry once on 503");
     assert.deepStrictEqual(result, { data: "recovered" });
@@ -130,7 +134,7 @@ async function testRetryUtil() {
           };
           throw error;
         },
-        { maxRetries: 3, retryDelay: 100 }
+        { maxRetries: 3, retryDelay: 100 },
       );
       console.error("❌ FAIL: Should have thrown error");
       process.exit(1);
@@ -169,7 +173,7 @@ async function testRetryUtil() {
         maxRetries: 3,
         retryDelay: 100,
         shouldRetry: (error) => error.response?.status === 418,
-      }
+      },
     );
     assert.strictEqual(callCount, 2, "Should retry on custom condition");
     assert.deepStrictEqual(result, { data: "custom retry worked" });
@@ -202,9 +206,13 @@ async function testRetryUtil() {
           retryCallbackCount++;
           assert.strictEqual(delay, 100, "Delay should be 100ms");
         },
-      }
+      },
     );
-    assert.strictEqual(retryCallbackCount, 2, "Callback should be called for each retry");
+    assert.strictEqual(
+      retryCallbackCount,
+      2,
+      "Callback should be called for each retry",
+    );
     console.log("✅ PASS\n");
   } catch (error) {
     console.error("❌ FAIL:", error);

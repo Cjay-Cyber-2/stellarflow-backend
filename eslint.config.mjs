@@ -22,6 +22,13 @@ export default [
         console: "readonly",
         process: "readonly",
         setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        atob: "readonly",
+        btoa: "readonly",
+        URL: "readonly",
+        URLSearchParams: "readonly",
       },
     },
     plugins: {
@@ -38,11 +45,75 @@ export default [
           varsIgnorePattern: "^_",
         },
       ],
+      // Enforce PascalCase for classes/types/interfaces/enums, camelCase for everything else
+      "@typescript-eslint/naming-convention": [
+        "error",
+        {
+          selector: "class",
+          format: ["PascalCase"],
+        },
+        {
+          selector: "interface",
+          format: ["PascalCase"],
+        },
+        {
+          selector: "typeAlias",
+          format: ["PascalCase"],
+        },
+        {
+          selector: "enum",
+          format: ["PascalCase"],
+        },
+        {
+          selector: "enumMember",
+          format: ["UPPER_CASE", "PascalCase"],
+        },
+        {
+          selector: "variable",
+          format: ["camelCase", "UPPER_CASE", "PascalCase"],
+          leadingUnderscore: "allow",
+        },
+        {
+          selector: "function",
+          format: ["camelCase", "PascalCase"],
+        },
+        {
+          selector: "parameter",
+          format: ["camelCase"],
+          leadingUnderscore: "allow",
+        },
+        {
+          selector: "classProperty",
+          format: ["camelCase"],
+          leadingUnderscore: "allow",
+        },
+        {
+          selector: "classMethod",
+          format: ["camelCase"],
+          leadingUnderscore: "allow",
+        },
+      ],
     },
   },
   {
     rules: {
       ...eslintConfigPrettier.rules,
+    },
+  },
+  {
+    files: ["test/**/*.ts", "tests/**/*.ts"],
+    languageOptions: {
+      globals: {
+        describe: "readonly",
+        it: "readonly",
+        test: "readonly",
+        expect: "readonly",
+        beforeAll: "readonly",
+        afterAll: "readonly",
+        beforeEach: "readonly",
+        afterEach: "readonly",
+        jest: "readonly",
+      },
     },
   },
 ];

@@ -1,4 +1,5 @@
 import prisma from "../lib/prisma";
+import { generateKsuid } from "../utils/ksuid.js";
 
 type FailureRecord = {
   count: number;
@@ -51,6 +52,7 @@ export class ErrorTracker {
       ) {
         await clientAny.errorLog.create({
           data: {
+            id: generateKsuid(),
             providerName: serviceKey,
             errorMessage:
               errorDetails instanceof Error

@@ -1,5 +1,9 @@
 import { Router } from "express";
+import { sendApiError } from "../lib/apiError.js";
 import prisma from "../lib/prisma";
+import { cacheMiddleware } from "../cache/CacheMiddleware";
+import { CACHE_CONFIG, CACHE_KEYS } from "../config/redis.config";
+
 
 const router = Router();
 
@@ -35,9 +39,15 @@ const router = Router();
  *       '500':
  *         description: Internal server error
  */
-router.get("/", async (req, res) => {
+router.get(
+  "/",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.assets,
+    keyGenerator: () => CACHE_KEYS.assets.all(),
+  }),
+  async (req, res) => {
   try {
-    const assets = await prisma.currency.findMany({
+    const assets = (await prisma.currency.findMany({
       where: { isActive: true },
       select: {
         code: true,
@@ -45,17 +55,14 @@ router.get("/", async (req, res) => {
         symbol: true,
       },
       orderBy: { code: "asc" },
-    });
+    })) || [];
 
     res.json({
       success: true,
       assets,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Internal server error") === "string" ? String(error instanceof Error ? error.message : "Internal server error") : undefined);
   }
 });
 

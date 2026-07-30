@@ -12,6 +12,8 @@ import { MarketRateFetcher, MarketRate } from "./types";
 export declare class NGNRateFetcher implements MarketRateFetcher {
     private readonly coinGeckoUrl;
     private readonly usdToNgnUrl;
+    private logger;
+    private medianPriceService;
     private vtpassBase;
     private vtpassHeaders;
     getCurrency(): string;

@@ -1,19 +1,31 @@
-import { FetcherResponse, AggregatedFetcherResponse } from "./types";
+import { MarketRate, FetcherResponse, AggregatedFetcherResponse } from "./types";
+import type { RedisClientType } from "redis";
 export declare class MarketRateService {
     private fetchers;
     private cache;
-    private latestPricesCache;
     private stellarService;
-    private readonly CACHE_DURATION_MS;
-    private readonly LATEST_PRICES_CACHE_DURATION_MS;
+    private readonly LATEST_PRICES_REDIS_KEY;
+    private readonly LATEST_PRICES_REDIS_TTL_SECONDS;
     private multiSigEnabled;
     private remoteOracleServers;
+    private pendingSubmissions;
+    private batchTimeout;
+    private readonly crossPairLogger;
+    private backpressureManager;
+    private get CACHE_DURATION_MS();
+    private get BATCH_WINDOW_MS();
     constructor();
     private initializeFetchers;
+    private serializeRawPayload;
+    private persistRawResponses;
     getRate(currency: string): Promise<FetcherResponse>;
     getAllRates(): Promise<FetcherResponse[]>;
+    private flushBatchSubmissions;
     healthCheck(): Promise<Record<string, boolean>>;
     getSupportedCurrencies(): string[];
+    protected getLatestPricesCacheClient(): Pick<RedisClientType, "get" | "setEx" | "del"> | null;
+    protected fetchLatestPricesFromDatabase(): Promise<MarketRate[]>;
+    private parseLatestPricesCache;
     getLatestPrices(): Promise<AggregatedFetcherResponse>;
     clearCache(): void;
     getPendingReviews(): Promise<import("../priceReviewService").PendingPriceReview[]>;
@@ -24,10 +36,14 @@ export declare class MarketRateService {
         expiry?: Date;
     }>;
     /**
-     * Asynchronously request signatures from remote oracle servers.
-     * This is non-blocking and doesn't wait for completion.
-     * Errors are logged but don't fail the price fetch operation.
+     * Get backpressure metrics for monitoring queue health
      */
+    getBackpressureMetrics(): import("../../flow_control/backpressure").BackpressureMetrics;
+    /**
+     * Reset backpressure metrics (useful for testing)
+     */
+    resetBackpressureMetrics(): void;
     private requestRemoteSignaturesAsync;
+    private runCrossPairCheck;
 }
 //# sourceMappingURL=marketRateService.d.ts.map
