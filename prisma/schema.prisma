@@ -162,3 +162,26 @@ model HourlyStats {
   @@unique([currency, hour])
   @@index([hour])
 }
+model OhlcvCandle {
+  id        String   @id @default(uuid())
+  pair      String   @db.VarChar(10)
+  timeframe String   // e.g., "1m", "15m", "1h", "1d"
+  open      Decimal  @db.Decimal(20, 10)
+  high      Decimal  @db.Decimal(20, 10)
+  low       Decimal  @db.Decimal(20, 10)
+  close     Decimal  @db.Decimal(20, 10)
+  volume    Decimal  @db.Decimal(20, 10)
+  timestamp DateTime @db.Timestamp(3)
+  @@unique([pair, timeframe, timestamp])
+  @@index([pair, timeframe, timestamp])
+}
+
+model PoolLiquidity {
+  id        String   @id @default(uuid())
+  poolId    String   @db.VarChar(50)
+  timestamp DateTime @db.Timestamp(3)
+  liquidity Decimal  @db.Decimal(20, 10)
+  @@unique([poolId, timestamp])
+  @@index([poolId, timestamp])
+}
+
