@@ -606,25 +606,58 @@ def _wipe_bytes_object(obj: bytes) -> None:
         pass
 
 
-def _wipe_key_handle(handle) -> None:
+def _wipe_key_handle(handle, visited: Optional[set] = None) -> None:
     """Clean up sensitive fields of keypair/signing key objects in memory."""
     if handle is None:
         return
+    if visited is None:
+        visited = set()
+    handle_id = id(handle)
+    if handle_id in visited:
+        return
+    visited.add(handle_id)
+
     try:
-        if isinstance(handle, bytes):
-            _wipe_bytes_object(handle)
-        
-        for attr in ("_seed", "_signing_key", "_verifier", "_key", "seed", "secret_key"):
-            if hasattr(handle, attr):
-                val = getattr(handle, attr, None)
-                if val is not None:
-                    if isinstance(val, (bytes, bytearray)):
-                        if isinstance(val, bytearray):
-                            _zero_wipe(val)
-                        else:
-                            _wipe_bytes_object(val)
-                    elif type(val).__name__ in ("SigningKey", "VerifyKey", "Keypair"):
-                        _wipe_key_handle(val)
+        if isinstance(handle, (bytes, bytearray)):
+            if isinstance(handle, bytearray):
+                _zero_wipe(handle)
+            else:
+                _wipe_bytes_object(handle)
+            return
+
+        is_mock = False
+        try:
+            import unittest.mock as _mock
+            if isinstance(handle, _mock.Base):
+                is_mock = True
+        except ImportError:
+            pass
+
+        attrs_to_wipe = (
+            "_seed", "_signing_key", "_verifier", "_key", "seed", "secret_key",
+            "_secret_key", "_raw_secret_key", "raw_secret_key", "_keypair",
+            "_private_key", "private_key", "_sk", "sk", "_vk", "vk"
+        )
+        for attr in attrs_to_wipe:
+            if is_mock:
+                if attr in handle.__dict__:
+                    val = handle.__dict__[attr]
+                else:
+                    continue
+            else:
+                if hasattr(handle, attr):
+                    val = getattr(handle, attr, None)
+                else:
+                    continue
+
+            if val is not None:
+                if isinstance(val, (bytes, bytearray)):
+                    if isinstance(val, bytearray):
+                        _zero_wipe(val)
+                    else:
+                        _wipe_bytes_object(val)
+                elif not is_mock and (hasattr(val, "__dict__") or type(val).__name__ in ("SigningKey", "VerifyKey", "Keypair")):
+                    _wipe_key_handle(val, visited)
     except Exception:
         pass
 
@@ -664,13 +697,12 @@ def _unlock_memory(buf: bytearray) -> None:
 
 
 def _wipe_bytes_view(view: bytes) -> None:
-    """Best-effort wipe of a temporary bytes copy."""
-    if not view:
+    """Explicitly zero out the CPython bytes object buffer in-place using ctypes.memset."""
+    if not isinstance(view, bytes) or len(view) == 0:
         return
 
     try:
-        buf = (ctypes.c_char * len(view)).from_buffer_copy(view)
-        ctypes.memset(ctypes.addressof(buf), 0, len(view))
+        _wipe_bytes_object(view)
     except Exception:  # noqa: BLE001
         pass
 
@@ -770,6 +802,13 @@ class SecureKeyHandle:
         if self._locked:
             _munlock_buffer(self._buf)
             self._locked = False
+        try:
+            _zero_wipe(self._buf)
+        finally:
+            _unlock_memory(self._buf)
+            if self._locked:
+                _munlock_buffer(self._buf)
+                self._locked = False
 
         # Layer 3: tear down the isolated mmap heap — wipes + PROT_NONE + unmaps.
         heap_obj = getattr(self, "_heap", None)
