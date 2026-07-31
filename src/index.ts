@@ -23,7 +23,7 @@ import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
-import { getRegionalHealthService } from "./services/regionalHealthService";
+import { ohlcvAggregator } from "./jobs/ohlcvJob";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
@@ -416,9 +416,12 @@ httpServer.listen(PORT, async () => {
   // Start background hourly average job
   try {
     hourlyAverageService.start().catch((err: Error) => {
-      console.error("Failed to start hourly average service:", err);
+      console.error(`Failed to start hourly average service:`, err);
     });
     console.log(`📊 Hourly average service started`);
+    // Start OHLCV aggregator
+    ohlcvAggregator.start();
+    console.log(`📈 OHLCV aggregator started`);
   } catch (err) {
     console.warn(
       "Hourly average service not started:",

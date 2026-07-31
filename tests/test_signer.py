@@ -26,6 +26,7 @@ Assumptions
 """
 from __future__ import annotations
 
+import ctypes
 import gc
 import logging
 import os
@@ -49,6 +50,10 @@ from crypto.signer import (  # noqa: E402
     GuardPageError,
     IsolatedMemoryHeap,
     _zero_wipe,
+    _wipe_bytes_object,
+    _wipe_bytes_view,
+    _wipe_key_handle,
+    _SecureKeypairContext,
     _configure_openssl_hardware_acceleration,
     _get_page_size,
     _round_up_to_page,
@@ -362,15 +367,7 @@ class TestExceptionPathCleanup:
 
     def test_import_error_does_not_leak_key_material_in_message(self):
         """Error messages from missing-library paths must not embed key bytes."""
-        # Force both import paths to fail by patching builtins.__import__.
-        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
-
-        def blocking_import(name, *args, **kwargs):
-            if name in ("stellar_sdk", "nacl"):
-                raise ImportError(f"blocked: {name}")
-            return original_import(name, *args, **kwargs)
-
-        with mock.patch("builtins.__import__", side_effect=blocking_import):
+        with mock.patch.dict(sys.modules, {"stellar_sdk": None, "nacl": None, "nacl.signing": None}):
             with pytest.raises(SigningError) as exc_info:
                 with SecureKeyHandle(_DUMMY_KEY) as handle:
                     handle.sign(_DUMMY_HASH)
@@ -961,3 +958,89 @@ class TestSecureKeyHandleUsesIsolatedHeap:
             assert heap.requested_size == len(_DUMMY_KEY)
         # After the scope, the heap was torn down.
         assert getattr(handle, "_heap").is_closed is True
+
+
+# ---------------------------------------------------------------------------
+# Key Zeroization Coverage (#640)
+# ---------------------------------------------------------------------------
+
+
+class TestKeyZeroization:
+    """Explicit ephemeral key zeroization routines using ctypes.memset."""
+
+    def test_key_zeroization_after_signing(self):
+        """Verify key buffers and temporary views are zeroed out immediately after signing."""
+        pytest.importorskip("nacl")
+        key_bytes = bytearray(_DUMMY_KEY)
+        handle = SecureKeyHandle(bytes(key_bytes))
+        with handle:
+            sig = handle.sign(_DUMMY_HASH)
+            assert len(sig) == 64
+
+        _assert_wiped(handle._buf, "SecureKeyHandle._buf")
+        assert handle._wiped is True
+
+    def test_key_zeroization_on_exception(self):
+        """Verify key buffers are zeroed out immediately when signing raises an exception."""
+        handle = SecureKeyHandle(_DUMMY_KEY)
+        try:
+            with handle:
+                raise RuntimeError("Signing error simulated")
+        except RuntimeError:
+            pass
+
+        _assert_wiped(handle._buf, "SecureKeyHandle._buf after exception")
+        assert handle._wiped is True
+
+    def test_key_zeroization_bytes_view(self):
+        """Verify _wipe_bytes_view explicitly zeroizes bytes memory using ctypes.memset."""
+        secret = bytes(bytearray(range(1, 33)))
+        addr = id(secret) + (32 if ctypes.sizeof(ctypes.c_void_p) == 8 else 16)
+
+        initial_content = (ctypes.c_char * len(secret)).from_address(addr).raw
+        assert initial_content == bytes(range(1, 33))
+
+        _wipe_bytes_view(secret)
+
+        wiped_content = (ctypes.c_char * len(secret)).from_address(addr).raw
+        assert wiped_content == b"\x00" * 32
+
+    def test_key_zeroization_session_credentials(self):
+        """Verify SecureSessionCredentials zeroes memory immediately on exit."""
+        creds = SecureSessionCredentials(_DUMMY_KEY)
+        with creds:
+            token = creds.get()
+            assert token == _DUMMY_KEY
+
+        _assert_wiped(creds._buf, "SecureSessionCredentials._buf")
+        assert creds._wiped is True
+
+    def test_key_zeroization_variable_wrapper(self):
+        """Verify SecureVariableWrapper zeroes memory immediately on exit."""
+        wrapper = SecureVariableWrapper(_DUMMY_KEY)
+        with wrapper:
+            val = wrapper.get()
+            assert val == _DUMMY_KEY
+
+        _assert_wiped(wrapper._buf, "SecureVariableWrapper._buf")
+        assert wrapper._wiped is True
+
+    def test_key_zeroization_secure_keypair_context(self):
+        """Verify _SecureKeypairContext zeroizes key objects and key bytes using ctypes.memset."""
+        secret_bytes = bytes(bytearray(range(32, 64)))
+        mock_handle = mock.MagicMock()
+        mock_handle._seed = bytearray(b"\xAA" * 32)
+        mock_handle.secret_key = bytes(bytearray(b"\xBB" * 32))
+
+        with _SecureKeypairContext(mock_handle, secret_bytes):
+            pass
+
+        _assert_wiped(mock_handle._seed, "mock_handle._seed")
+        addr = id(mock_handle.secret_key) + (32 if ctypes.sizeof(ctypes.c_void_p) == 8 else 16)
+        wiped_sk = (ctypes.c_char * 32).from_address(addr).raw
+        assert wiped_sk == b"\x00" * 32
+
+        addr_sec = id(secret_bytes) + (32 if ctypes.sizeof(ctypes.c_void_p) == 8 else 16)
+        wiped_sec = (ctypes.c_char * 32).from_address(addr_sec).raw
+        assert wiped_sec == b"\x00" * 32
+

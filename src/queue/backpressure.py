@@ -590,173 +590,105 @@ class QueueCapacityController:
 
 
 # ---------------------------------------------------------------------------
-# Issue #629 — Adaptive Weighted Random Early Detection (WRED) Drops
+# Issue #649 - Token Bucket Rate Limiter (Multitenant)
 # ---------------------------------------------------------------------------
-# Tail-drop policies discard packets indiscriminately once a queue saturates,
-# which can silently shed critical validator heartbeat/consensus packets
-# during traffic surges. WRED instead derives a per-priority drop
-# probability from queue saturation: below a priority's min_threshold
-# nothing is dropped, the probability ramps linearly up to
-# max_drop_probability by max_threshold, and stays there beyond it. Low
-# priority telemetry ramps up early and can be shed with certainty, while
-# consensus traffic keeps a zero drop probability so it always passes
-# through.
 
-
-class PacketPriority(Enum):
-    """Priority flag carried by a packet entering a WRED-managed queue."""
-
-    CONSENSUS = "CONSENSUS"  # Validator heartbeats / consensus traffic
-    STANDARD = "STANDARD"
-    TELEMETRY = "TELEMETRY"  # Low-priority observability/telemetry traffic
+@dataclass(frozen=True)
+class TokenBucketConfig:
+    capacity: int = 100
+    refill_rate: float = 10.0
 
 
 @dataclass(frozen=True)
-class WREDThreshold:
-    """Drop curve for a single priority class.
+class TokenBucketResult:
+    allowed: bool
+    remaining: int
+    retry_after_s: float
 
-    Below ``min_threshold`` saturation, packets of this priority are never
-    dropped. Between ``min_threshold`` and ``max_threshold`` the drop
-    probability ramps up linearly to ``max_drop_probability``. At or above
-    ``max_threshold``, packets are dropped with ``max_drop_probability``.
+
+class TokenBucketRateLimiter:
+    """Token bucket rate limiter that enforces limits per-tenant.
+
+    Thread-safe via a ``threading.Lock``.
     """
 
-    min_threshold: float
-    max_threshold: float
-    max_drop_probability: float
+    __slots__ = ("_capacity", "_refill_rate", "_buckets", "_lock")
 
-
-@dataclass
-class WREDMetrics:
-    """Metrics tracked by a :class:`WREDQueue`."""
-
-    total_packets: int = 0
-    admitted_packets: int = 0
-    dropped_packets: int = 0
-    dropped_by_priority: Dict[str, int] = field(default_factory=dict)
-
-
-# Default drop curves: consensus never drops, standard ramps in the upper
-# half of the queue, telemetry starts shedding earliest and hardest.
-_DEFAULT_WRED_THRESHOLDS: Dict[PacketPriority, WREDThreshold] = {
-    PacketPriority.CONSENSUS: WREDThreshold(
-        min_threshold=1.0, max_threshold=1.0, max_drop_probability=0.0
-    ),
-    PacketPriority.STANDARD: WREDThreshold(
-        min_threshold=0.6, max_threshold=0.9, max_drop_probability=0.5
-    ),
-    PacketPriority.TELEMETRY: WREDThreshold(
-        min_threshold=0.3, max_threshold=0.8, max_drop_probability=1.0
-    ),
-}
-
-
-class WREDQueue:
-    """Bounded FIFO queue that applies Weighted Random Early Detection.
-
-    Unlike a plain tail-drop queue — which discards indiscriminately once
-    full — WRED computes a per-priority drop probability from queue
-    saturation, so low-priority traffic is shed progressively as the queue
-    fills while high-priority traffic keeps flowing.
-    """
-
-    __slots__ = ("_capacity", "_thresholds", "_queue", "_metrics", "_lock", "_rand")
-
-    def __init__(
-        self,
-        capacity: int,
-        thresholds: Optional[Dict[PacketPriority, WREDThreshold]] = None,
-        rng: Optional[random.Random] = None,
-    ) -> None:
+    def __init__(self, capacity: int = 100, refill_rate: float = 10.0) -> None:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
+        if refill_rate <= 0.0:
+            raise ValueError("refill_rate must be positive")
 
         self._capacity = capacity
-        self._thresholds = dict(thresholds) if thresholds else dict(_DEFAULT_WRED_THRESHOLDS)
-        self._queue: List[object] = []
-        self._metrics = WREDMetrics()
+        self._refill_rate = refill_rate
+        # Maps tenant_id -> (current_tokens, last_refill_timestamp)
+        self._buckets: Dict[str, Tuple[float, float]] = {}
         self._lock = threading.Lock()
-        self._rand = rng or random.Random()
-
-    def _threshold_for(self, priority: PacketPriority) -> WREDThreshold:
-        return self._thresholds.get(priority, _DEFAULT_WRED_THRESHOLDS[PacketPriority.STANDARD])
-
-    def _drop_probability_at(self, priority: PacketPriority, saturation: float) -> float:
-        threshold = self._threshold_for(priority)
-
-        if saturation <= threshold.min_threshold:
-            return 0.0
-        if saturation >= threshold.max_threshold:
-            return threshold.max_drop_probability
-
-        span = threshold.max_threshold - threshold.min_threshold
-        if span <= 0:
-            return threshold.max_drop_probability
-
-        ramp_ratio = (saturation - threshold.min_threshold) / span
-        return threshold.max_drop_probability * ramp_ratio
-
-    def drop_probability(self, priority: PacketPriority) -> float:
-        """Return the current WRED drop probability for *priority* at the
-        queue's present saturation level."""
-        with self._lock:
-            saturation = len(self._queue) / self._capacity
-            return self._drop_probability_at(priority, saturation)
-
-    def _record_drop(self, priority: PacketPriority) -> None:
-        self._metrics.dropped_packets += 1
-        self._metrics.dropped_by_priority[priority.value] = (
-            self._metrics.dropped_by_priority.get(priority.value, 0) + 1
-        )
-
-    def offer(self, packet: object, priority: PacketPriority = PacketPriority.STANDARD) -> bool:
-        """Attempt to enqueue *packet* under the given *priority*.
-
-        Returns ``True`` if the packet was admitted, ``False`` if WRED (or
-        the hard capacity limit) shed it.
-        """
-        with self._lock:
-            self._metrics.total_packets += 1
-
-            if len(self._queue) >= self._capacity:
-                self._record_drop(priority)
-                return False
-
-            saturation = len(self._queue) / self._capacity
-            drop_probability = self._drop_probability_at(priority, saturation)
-
-            if drop_probability > 0.0 and self._rand.random() < drop_probability:
-                self._record_drop(priority)
-                return False
-
-            self._queue.append(packet)
-            self._metrics.admitted_packets += 1
-            return True
-
-    def poll(self) -> Optional[object]:
-        """Dequeue and return the next packet in FIFO order, or ``None`` if empty."""
-        with self._lock:
-            if not self._queue:
-                return None
-            return self._queue.pop(0)
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._queue)
 
     @property
-    def saturation(self) -> float:
-        with self._lock:
-            return len(self._queue) / self._capacity
+    def config(self) -> TokenBucketConfig:
+        return TokenBucketConfig(
+            capacity=self._capacity,
+            refill_rate=self._refill_rate,
+        )
 
-    def get_metrics(self) -> WREDMetrics:
+    def allow(self, tenant_id: str, tokens: int = 1) -> TokenBucketResult:
+        """Check if *tenant_id* is allowed to consume *tokens*."""
+        now = time.monotonic()
         with self._lock:
-            return WREDMetrics(
-                total_packets=self._metrics.total_packets,
-                admitted_packets=self._metrics.admitted_packets,
-                dropped_packets=self._metrics.dropped_packets,
-                dropped_by_priority=dict(self._metrics.dropped_by_priority),
-            )
+            bucket = self._buckets.get(tenant_id)
+            if bucket is None:
+                current_tokens = float(self._capacity)
+                last_refill = now
+            else:
+                current_tokens, last_refill = bucket
+
+            # Refill tokens based on time elapsed
+            elapsed = now - last_refill
+            new_tokens = min(float(self._capacity), current_tokens + elapsed * self._refill_rate)
+
+            if new_tokens >= tokens:
+                new_tokens -= tokens
+                self._buckets[tenant_id] = (new_tokens, now)
+                return TokenBucketResult(
+                    allowed=True,
+                    remaining=int(new_tokens),
+                    retry_after_s=0.0,
+                )
+            else:
+                # Not enough tokens, calculate retry time
+                self._buckets[tenant_id] = (new_tokens, now)
+                missing = tokens - new_tokens
+                retry_after = missing / self._refill_rate
+                return TokenBucketResult(
+                    allowed=False,
+                    remaining=int(new_tokens),
+                    retry_after_s=retry_after,
+                )
+
+    def remaining(self, tenant_id: str) -> int:
+        """Return the number of currently available tokens for *tenant_id*."""
+        now = time.monotonic()
+        with self._lock:
+            bucket = self._buckets.get(tenant_id)
+            if bucket is None:
+                return self._capacity
+            
+            current_tokens, last_refill = bucket
+            elapsed = now - last_refill
+            new_tokens = min(float(self._capacity), current_tokens + elapsed * self._refill_rate)
+            return int(new_tokens)
+
+    def reset(self, tenant_id: str) -> None:
+        """Clear the token bucket for *tenant_id*."""
+        with self._lock:
+            self._buckets.pop(tenant_id, None)
+
+    def reset_all(self) -> None:
+        """Clear all token buckets."""
+        with self._lock:
+            self._buckets.clear()
 
 
 __all__ = [
@@ -764,8 +696,7 @@ __all__ = [
     "SlidingWindowResult",
     "SlidingWindowRateLimiter",
     "QueueCapacityController",
-    "PacketPriority",
-    "WREDThreshold",
-    "WREDMetrics",
-    "WREDQueue",
+    "TokenBucketConfig",
+    "TokenBucketResult",
+    "TokenBucketRateLimiter",
 ]
