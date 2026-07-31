@@ -13,11 +13,13 @@ to failing endpoints and allowing graceful recovery.
 from __future__ import annotations
 
 import logging
+import math
+import random
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, Optional, TypeVar
+from typing import Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
