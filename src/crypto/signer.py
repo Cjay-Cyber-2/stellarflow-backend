@@ -707,10 +707,6 @@ def _wipe_bytes_view(view: bytes) -> None:
         pass
 
 
-class SigningError(Exception):
-    """Raised when signing fails or the key handle is no longer usable."""
-
-
 class SecureKeyHandle:
     """
     Context manager that keeps private-key material isolated.
@@ -781,12 +777,31 @@ class SecureKeyHandle:
             pass
 
     def _do_wipe(self) -> None:
-        """Idempotently wipe and unlock the internal key buffer."""
+        """Idempotently wipe and unlock the internal key buffer.
+
+        Execution order is critical:
+        1. Zero-wipe the bytearray with ctypes.memset (Layer 1 overwrite sweep).
+        2. Release the mlock / sodium lock AFTER the wipe so the OS never
+           evicts live key material to swap during the window between unlock
+           and wipe.
+        3. Tear down the IsolatedMemoryHeap (its own wipe + PROT_NONE + unmap).
+        4. Emit an audit entry confirming the cleanup.
+        """
         if self._wiped:
             return
 
         self._wiped = True
 
+        # Layer 1: immediate byte-clearing overwrite via ctypes.memset.
+        _zero_wipe(
+            self._buf,
+            audit_details={"object_type": "SecureKeyHandle"},
+        )
+
+        # Layer 2: release memory lock only after the overwrite is done.
+        if self._locked:
+            _munlock_buffer(self._buf)
+            self._locked = False
         try:
             _zero_wipe(self._buf)
         finally:
@@ -795,9 +810,7 @@ class SecureKeyHandle:
                 _munlock_buffer(self._buf)
                 self._locked = False
 
-        # Tear down the isolated mmap heap (wipes + mprotect-to-NONE +
-        # unmaps) so the canonical key copy leaves no recoverable trace
-        # in the process address space (Issue #660).
+        # Layer 3: tear down the isolated mmap heap — wipes + PROT_NONE + unmaps.
         heap_obj = getattr(self, "_heap", None)
         if heap_obj is not None:
             try:
@@ -806,6 +819,7 @@ class SecureKeyHandle:
                 pass
 
         logger.debug("[SecureKeyHandle] Signing scope closed — key wiped.")
+        audit_log.log_key_revoked(self._key_id, reason="scope_exit")
 
     def sign(self, tx_hash: bytes) -> bytes:
         """Sign a 32-byte transaction hash."""
@@ -850,7 +864,10 @@ class SecureKeyHandle:
             except ImportError:
                 return self._try_pynacl(key_bytes, tx_hash)
         finally:
-            _wipe_bytes_view(key_bytes)
+            # Overwrite the transient bytes copy in-place before releasing
+            # the reference, so the CPython object's internal buffer is
+            # zeroed while it is still uniquely held on this call stack.
+            _wipe_bytes_object(key_bytes)
             del key_bytes
 
     @staticmethod
