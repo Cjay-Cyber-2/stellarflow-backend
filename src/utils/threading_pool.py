@@ -4,9 +4,9 @@ import asyncio
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from multiprocessing import shared_memory
-from queue import Queue, Full, Empty
 import struct
 from typing import Callable, Optional, List, Sequence, Generic, TypeVar, Any
 import os
@@ -184,6 +184,147 @@ class LockFreeSPSCQueue(Generic[T]):
             The queue's fixed capacity.
         """
         return self._capacity
+
+
+# ---------------------------------------------------------------------------
+# Work-stealing task queue
+# ---------------------------------------------------------------------------
+
+_SCALE_DOWN_SENTINEL = object()
+
+
+class _WorkerTaskQueue:
+    """Per-worker task queue that supports owner pop and thief steal semantics."""
+
+    __slots__ = ("_deque", "_lock", "_active")
+
+    def __init__(self) -> None:
+        self._deque: deque[Callable | object] = deque()
+        self._lock = threading.Lock()
+        self._active = True
+
+    def put(self, item: Callable | object) -> None:
+        with self._lock:
+            self._deque.append(item)
+
+    def pop_left(self) -> Optional[Callable | object]:
+        with self._lock:
+            if not self._deque:
+                return None
+            return self._deque.popleft()
+
+    def pop_right(self) -> Optional[Callable | object]:
+        with self._lock:
+            if not self._deque:
+                return None
+            return self._deque.pop()
+
+    def peek_right(self) -> Optional[Callable | object]:
+        with self._lock:
+            if not self._deque:
+                return None
+            return self._deque[-1]
+
+    def qsize(self) -> int:
+        with self._lock:
+            return len(self._deque)
+
+    def empty(self) -> bool:
+        with self._lock:
+            return not self._deque
+
+    def deactivate(self) -> None:
+        with self._lock:
+            self._active = False
+
+    def is_active(self) -> bool:
+        with self._lock:
+            return self._active
+
+
+class _WorkStealingTaskQueue:
+    """Coordinator for per-worker task queues with steal-from-tail semantics."""
+
+    __slots__ = ("_worker_queues", "_lock", "_not_empty")
+
+    def __init__(self) -> None:
+        self._worker_queues: list[_WorkerTaskQueue] = []
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+
+    def register_worker(self) -> _WorkerTaskQueue:
+        queue = _WorkerTaskQueue()
+        with self._lock:
+            self._worker_queues.append(queue)
+            self._not_empty.notify_all()
+        return queue
+
+    def deactivate_worker(self, worker_queue: _WorkerTaskQueue) -> None:
+        worker_queue.deactivate()
+        with self._lock:
+            self._not_empty.notify_all()
+
+    def submit(self, task: Callable) -> None:
+        queues = self._snapshot_active_queues()
+        if not queues:
+            raise RuntimeError("Cannot submit tasks to a stopped or unstarted pool")
+
+        # Load-balance across active workers by pushing tasks to the shortest queue.
+        target = min(queues, key=lambda q: q.qsize())
+        target.put(task)
+
+        with self._not_empty:
+            self._not_empty.notify()
+
+    def enqueue_scale_down_sentinel(self) -> None:
+        queues = self._snapshot_active_queues()
+        if not queues:
+            return
+
+        target = min(queues, key=lambda q: q.qsize())
+        target.put(_SCALE_DOWN_SENTINEL)
+        with self._not_empty:
+            self._not_empty.notify()
+
+    def steal_task(self, own_queue: _WorkerTaskQueue) -> Optional[Callable | object]:
+        queues = self._snapshot_all_queues()
+        if len(queues) <= 1:
+            return None
+
+        # Start stealing from the next queue after the owner to avoid bias.
+        try:
+            start_index = queues.index(own_queue)
+        except ValueError:
+            start_index = 0
+
+        for offset in range(1, len(queues)):
+            queue = queues[(start_index + offset) % len(queues)]
+            if queue.peek_right() is _SCALE_DOWN_SENTINEL:
+                continue
+            task = queue.pop_right()
+            if task is not None and task is not _SCALE_DOWN_SENTINEL:
+                return task
+        return None
+
+    def wait_for_task(self, timeout: float) -> None:
+        with self._not_empty:
+            self._not_empty.wait(timeout=timeout)
+
+    def notify_all(self) -> None:
+        with self._not_empty:
+            self._not_empty.notify_all()
+
+    def qsize(self) -> int:
+        with self._lock:
+            return sum(queue.qsize() for queue in self._worker_queues)
+
+    def _snapshot_active_queues(self) -> list[_WorkerTaskQueue]:
+        with self._lock:
+            return [queue for queue in self._worker_queues if queue.is_active()]
+
+    def _snapshot_all_queues(self) -> list[_WorkerTaskQueue]:
+        with self._lock:
+            return list(self._worker_queues)
 
 
 # ---------------------------------------------------------------------------
@@ -615,8 +756,8 @@ def _supervisor(
 
         elif ratio < _SCALE_DOWN_RATIO and current > MIN_WORKERS:
             # Signal one idle worker to exit on its next empty-queue loop by
-            # enqueuing a sentinel None value that workers check for.
-            work_queue.put(None)  # handled below — see _worker_with_sentinel
+            # enqueuing a sentinel in the least-loaded active queue.
+            work_queue.enqueue_scale_down_sentinel()
             with lock:
                 state.worker_count -= 1
             logger.info(
@@ -681,7 +822,7 @@ class DynamicThreadingPool:
             affinity_config if affinity_config is not None else CoreAffinityConfig(enabled=False)
         )
 
-        self._work_queue: Queue = Queue()
+        self._work_queue: _WorkStealingTaskQueue = _WorkStealingTaskQueue()
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._state = _PoolState(worker_count=min_workers)
@@ -701,10 +842,12 @@ class DynamicThreadingPool:
         """Create (but do not start) a daemon worker thread with a unique ID."""
         worker_id = self._next_worker_id
         self._next_worker_id += 1
+        worker_queue = self._work_queue.register_worker()
         return threading.Thread(
             target=_worker_with_sentinel,
             args=(
                 self._work_queue,
+                worker_queue,
                 self._stop_event,
                 self._state,
                 self._lock,
@@ -719,10 +862,12 @@ class DynamicThreadingPool:
         """Create (but do not start) a daemon worker thread pinned to a specific core."""
         worker_id = self._next_worker_id
         self._next_worker_id += 1
+        worker_queue = self._work_queue.register_worker()
         return threading.Thread(
             target=_worker_with_sentinel,
             args=(
                 self._work_queue,
+                worker_queue,
                 self._stop_event,
                 self._state,
                 self._lock,
@@ -821,7 +966,7 @@ class DynamicThreadingPool:
         """
         if self._stop_event.is_set():
             raise RuntimeError("Cannot submit tasks to a stopped pool")
-        self._work_queue.put(task)
+        self._work_queue.submit(task)
 
     def stop(self, wait: bool = True, timeout: Optional[float] = None) -> None:
         """Signal all workers and the supervisor to stop.
@@ -834,6 +979,7 @@ class DynamicThreadingPool:
             Optional per-thread join timeout in seconds.
         """
         self._stop_event.set()
+        self._work_queue.notify_all()
 
         if wait:
             if self._supervisor_thread is not None:
@@ -873,30 +1019,29 @@ class DynamicThreadingPool:
 
 
 def _worker_with_sentinel(
-    work_queue: Queue,
+    work_queue: _WorkStealingTaskQueue,
+    local_queue: _WorkerTaskQueue,
     stop_event: threading.Event,
     state: _PoolState,
     lock: threading.Lock,
     worker_id: int,
     core: Optional[int],
 ) -> None:
-    """Worker loop that also handles the ``None`` scale-down sentinel.
-
-    When the supervisor wants to remove a worker it enqueues ``None``.  The
-    first worker to dequeue it exits cleanly, reducing the active count by one.
-    """
+    """Worker loop that processes owned tasks and steals from busy peers."""
     # Set CPU affinity for this worker before processing tasks
     if core is not None:
         pin_thread_to_cores([core])
+
     while not stop_event.is_set():
-        try:
-            task = work_queue.get(timeout=_WORKER_TIMEOUT)
-        except Empty:
+        task = local_queue.pop_left()
+        if task is None:
+            task = work_queue.steal_task(local_queue)
+
+        if task is None:
+            work_queue.wait_for_task(_WORKER_TIMEOUT)
             continue
 
-        # Scale-down sentinel — exit gracefully.
-        if task is None:
-            work_queue.task_done()
+        if task is _SCALE_DOWN_SENTINEL:
             break
 
         try:
@@ -907,8 +1052,8 @@ def _worker_with_sentinel(
             logger.exception("Worker caught unhandled exception in task")
             with lock:
                 state.tasks_failed += 1
-        finally:
-            work_queue.task_done()
+
+    work_queue.deactivate_worker(local_queue)
 
 
 # ---------------------------------------------------------------------------
