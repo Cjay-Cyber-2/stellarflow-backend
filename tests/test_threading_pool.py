@@ -67,6 +67,40 @@ def test_event_loop_thread_pinning():
         pass
 
 
+def test_work_stealing_queue():
+    """Verify idle workers can steal tasks from busy worker queue tails."""
+    pool = DynamicThreadingPool(min_workers=4, max_workers=4)
+    pool.start()
+
+    try:
+        # Access internal worker queues directly for test stimulation.
+        queues = pool._work_queue._worker_queues
+        assert len(queues) == 4
+
+        executed = []
+        executed_lock = threading.Lock()
+
+        def make_task(task_id: int):
+            def task():
+                time.sleep(0.02)
+                with executed_lock:
+                    executed.append((threading.current_thread().name, task_id))
+            return task
+
+        # Add all tasks to the first worker queue to force other workers to steal.
+        for i in range(20):
+            queues[0].put(make_task(i))
+
+        pool._work_queue.notify_all()
+        time.sleep(1.0)
+    finally:
+        pool.stop()
+
+    assert len(executed) == 20
+    worker_names = {name for name, _ in executed}
+    assert len(worker_names) > 1
+
+
 # ---------------------------------------------------------------------------
 # Non-blocking Task Cancellation
 # ---------------------------------------------------------------------------
