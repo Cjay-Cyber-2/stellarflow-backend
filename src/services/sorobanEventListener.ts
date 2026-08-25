@@ -7,6 +7,7 @@ import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
 import { logger } from "../utils/logger";
 import { parseBase64ToPositiveNumber } from "../serialization/helpers.js";
+import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
 
 dotenv.config();
 
@@ -140,6 +141,8 @@ export class SorobanEventListener {
     try {
       this.server = stellarProvider.getServer();
 
+      await this.pollOrderFilledEvents();
+
       const transactions = await this.server
         .transactions()
         .forAccount(this.oraclePublicKey)
@@ -177,6 +180,24 @@ export class SorobanEventListener {
       if (error instanceof Error && error.message.includes("status code 404"))
         return;
       throw error;
+    }
+  }
+
+  private async pollOrderFilledEvents(): Promise<void> {
+    const contractId = process.env.CONTRACT_ID?.trim();
+    if (!contractId) return;
+
+    const rpc = stellarProvider.getRpcServer() as any;
+    const response = await rpc.getEvents({
+      startLedger: Math.max(1, this.lastProcessedLedger),
+      filters: [{ type: "contract", contractIds: [contractId] }],
+      limit: 100,
+    });
+
+    for (const event of response.events ?? []) {
+      await verifyOrderFilledEvent(event);
+      const ledger = Number(event.ledger ?? 0);
+      if (ledger > this.lastProcessedLedger) this.lastProcessedLedger = ledger;
     }
   }
 
