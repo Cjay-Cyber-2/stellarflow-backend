@@ -292,4 +292,3 @@ model PoolLiquidity {
   @@unique([poolId, timestamp])
   @@index([poolId, timestamp])
 }
-
