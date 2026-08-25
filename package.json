@@ -15,6 +15,7 @@
     "prepare": "husky",
     "test": "tsx test/marketRates.test.ts",
     "test:jest": "node --experimental-vm-modules ./node_modules/.bin/jest",
+    "test:e2e": "node --experimental-vm-modules ./node_modules/.bin/jest --config jest.config.e2e.ts",
     "test:cache": "node --experimental-vm-modules ./node_modules/.bin/jest cache.test.ts",
     "check:gas-balance": "tsx scripts/check-gas-balance.ts",
     "download:ngn-rates": "tsx scripts/download-ngn-rates.ts",
