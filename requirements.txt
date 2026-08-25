@@ -15,6 +15,10 @@ aiohttp>=3.9.0
 # Async PostgreSQL driver for high-performance bulk inserts
 asyncpg>=0.28.0
 
+# Distributed workers for heavy analytics jobs
+celery[rabbitmq]>=5.4.0,<6.0.0
+flower>=2.0.1
+
 # MsgPack binary serialisation with C-extensions for Redis cache payloads
 msgpack>=1.0.0
 
