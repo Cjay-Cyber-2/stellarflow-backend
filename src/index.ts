@@ -34,6 +34,7 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
+import { governanceTimelockService } from "./services/governanceTimelockService";
 
 // Load environment variables
 dotenv.config();
@@ -297,6 +298,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
   try {
     sorobanEventListener?.stop();
     multiSigSubmissionService.stop();
+    governanceTimelockService.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     hourlyAverageService.stop();
@@ -411,6 +413,18 @@ httpServer.listen(PORT, async () => {
         err instanceof Error ? err.message : err,
       );
     }
+  }
+
+  try {
+    governanceTimelockService.start().catch((err: Error) => {
+      console.error("Failed to start governance timelock service:", err);
+    });
+    console.log("Governance timelock service started");
+  } catch (err) {
+    console.warn(
+      "Governance timelock service not started:",
+      err instanceof Error ? err.message : err,
+    );
   }
 
   // Start background hourly average job
