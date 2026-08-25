@@ -54,6 +54,7 @@ import statusRouter from "./routes/status";
 import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
+import zkRouter from "./routes/zk";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -202,6 +203,8 @@ app.use("/api/v1/cache", cacheMetricsRouter);
 
 // Issue #208 – Analytics / OHLC time-series endpoint
 app.use("/api/v1/analytics", analyticsRouter);
+
+app.use("/api/v1/zk", zkRouter);
 
 app.get("/", (req, res) => {
   res.json({
