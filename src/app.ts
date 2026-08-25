@@ -54,6 +54,7 @@ import statusRouter from "./routes/status";
 import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
+import feeEstimateRouter from "./routes/feeEstimate";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -202,6 +203,9 @@ app.use("/api/v1/cache", cacheMetricsRouter);
 
 // Issue #208 – Analytics / OHLC time-series endpoint
 app.use("/api/v1/analytics", analyticsRouter);
+
+// Dynamic transaction fee estimation for wallet signing wrappers
+app.use("/api/v1/tx", feeEstimateRouter);
 
 app.get("/", (req, res) => {
   res.json({
