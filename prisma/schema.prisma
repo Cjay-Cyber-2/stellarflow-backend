@@ -293,3 +293,29 @@ model PoolLiquidity {
   @@index([poolId, timestamp])
 }
 
+model OpenOrder {
+  id           String              @id @default(uuid())
+  orderId      String              @unique
+  totalAmount  Decimal             @db.Decimal(38, 18)
+  filledAmount Decimal             @default(0) @db.Decimal(38, 18)
+  status       String              @default("open")
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  @@index([status])
+}
+
+model OrderFilledEvent {
+  id          String    @id @default(uuid())
+  orderId     String
+  fillAmount  Decimal   @db.Decimal(38, 18)
+  txHash      String
+  ledgerSeq   Int
+  eventIndex  Int
+  payload     Json
+  createdAt   DateTime  @default(now())
+
+  @@unique([txHash, eventIndex])
+  @@index([orderId, ledgerSeq])
+}
+
