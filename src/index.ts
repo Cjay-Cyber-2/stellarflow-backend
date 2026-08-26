@@ -38,6 +38,7 @@ import { governanceTimelockService } from "./services/governanceTimelockService"
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 
 // Load environment variables
 dotenv.config();
@@ -310,6 +311,8 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    redisOperationsWorker.stop();
+    complianceScreeningWorker.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -360,6 +363,9 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  complianceScreeningWorker.start();
+  console.log(`🛡️ Compliance screening worker started`);
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;

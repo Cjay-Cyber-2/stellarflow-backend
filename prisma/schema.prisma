@@ -292,3 +292,26 @@ model PoolLiquidity {
   @@unique([poolId, timestamp])
   @@index([poolId, timestamp])
 }
+
+// Cross-border remittance rows screened against OFAC / sanctions watchlists (Issue #784)
+model RemittanceTransaction {
+  id                 String    @id @default(uuid())
+  senderPublicKey    String
+  recipientPublicKey String
+  amount             Decimal?
+  assetCode          String?
+  corridor           String?
+  // pending_screening | screening | flagged_compliance | compliance_cleared | payout_relayed | payout_halted
+  status             String
+  screeningProvider  String?
+  screeningHits      Json?
+  payoutHalted       Boolean   @default(false)
+  payoutRelayedAt    DateTime?
+  screenedAt         DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([senderPublicKey])
+  @@index([recipientPublicKey])
+}
