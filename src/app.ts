@@ -206,6 +206,7 @@ app.use("/api/v1/cache", cacheMetricsRouter);
 app.use("/api/v1/analytics", analyticsRouter);
 
 app.use("/api/v1/zk", zkRouter);
+app.use("/api/v1/governance", governanceRouter);
 
 // Governance: voter history, delegation tree – Issue #<this issue>
 app.use("/api/v1/governance", governanceRouter);

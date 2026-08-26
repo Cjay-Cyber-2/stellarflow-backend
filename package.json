@@ -20,6 +20,7 @@
     "check:gas-balance": "tsx scripts/check-gas-balance.ts",
     "download:ngn-rates": "tsx scripts/download-ngn-rates.ts",
     "cache:warm": "tsx scripts/cache-warming.ts",
+    "cache:worker": "tsx src/services/cacheWarmingWorker.ts",
     "db:backup": "bash scripts/pg_backup.sh",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",

@@ -128,6 +128,12 @@ export class SorobanEventListener {
 
           // Broadcast all successful updates (Essential or Metric) to UI
           broadcastToSessions("price_update", price);
+
+          // Trigger cache warming on new price update
+          const cacheWarmingWorker = getCacheWarmingWorker();
+          cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
+            logger.error("[EventListener] Cache warming failed:", err);
+          });
         } catch (err) {
           logger.error("[Worker] Failed to process queued price:", err);
         }
