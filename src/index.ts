@@ -35,6 +35,7 @@ import { providerSecretRotationService } from "./services/providerSecretRotation
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
+import { getCacheWarmingWorker } from "./services/cacheWarmingWorker";
 
 // Load environment variables
 dotenv.config();
@@ -304,6 +305,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
+    getCacheWarmingWorker().stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -468,6 +470,18 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Gas balance monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Start cache warming worker for market endpoints
+  try {
+    const cacheWarmingWorker = getCacheWarmingWorker();
+    cacheWarmingWorker.start();
+    console.log(`🔥 Cache warming worker started`);
+  } catch (err) {
+    console.warn(
+      "Cache warming worker not started:",
       err instanceof Error ? err.message : err,
     );
   }
