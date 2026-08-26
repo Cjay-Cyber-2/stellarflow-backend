@@ -8,6 +8,7 @@ import dotenv from "dotenv";
 import { logger } from "../utils/logger";
 import { parseBase64ToPositiveNumber } from "../serialization/helpers.js";
 import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
+import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
 
 dotenv.config();
 
@@ -142,6 +143,7 @@ export class SorobanEventListener {
       this.server = stellarProvider.getServer();
 
       await this.pollOrderFilledEvents();
+      await this.pollGovernanceVoteEvents();
 
       const transactions = await this.server
         .transactions()
@@ -198,6 +200,73 @@ export class SorobanEventListener {
       await verifyOrderFilledEvent(event);
       const ledger = Number(event.ledger ?? 0);
       if (ledger > this.lastProcessedLedger) this.lastProcessedLedger = ledger;
+    }
+  }
+
+  /**
+   * Polls Soroban for GovernanceVoted events emitted by the governance contract
+   * and upserts a GovernanceVote row for each unique (accountId, proposalId) pair.
+   *
+   * Expected event topics: ["GovernanceVoted", accountId, proposalId]
+   * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
+   */
+  private async pollGovernanceVoteEvents(): Promise<void> {
+    const contractId =
+      (process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID)?.trim();
+    if (!contractId) return;
+
+    const rpc = stellarProvider.getRpcServer() as any;
+
+    let response: { events?: any[] };
+    try {
+      response = await rpc.getEvents({
+        startLedger: Math.max(1, this.lastProcessedLedger),
+        filters: [
+          {
+            type: "contract",
+            contractIds: [contractId],
+            topics: [["GovernanceVoted", "*", "*"]],
+          },
+        ],
+        limit: 200,
+      });
+    } catch (err) {
+      logger.networkError("[EventListener] GovernanceVoted poll failed:", { err });
+      return;
+    }
+
+    for (const event of response.events ?? []) {
+      try {
+        // Topics: [eventName, accountId, proposalId]
+        const topics: string[] = event.topic ?? [];
+        const accountId  = topics[1];
+        const proposalId = topics[2];
+
+        if (!accountId || !proposalId) continue;
+
+        // Data value is a Soroban SCVal map – coerce to plain object
+        const dataVal = event.value?.value ?? event.value ?? {};
+        const choice: string  = dataVal.choice  ?? "Abstain";
+        const weight: string  = dataVal.weight  ?? "0";
+        const txHash: string  = event.txHash    ?? event.id ?? null;
+        const ledger: number  = Number(event.ledger ?? 0);
+        const closedAt: Date  = event.ledgerClosedAt
+          ? new Date(event.ledgerClosedAt)
+          : new Date();
+
+        await ingestGovernanceVoteEvent({
+          accountId,
+          proposalId,
+          choice,
+          weight,
+          txHash,
+          votedAt: closedAt,
+        });
+
+        if (ledger > this.lastProcessedLedger) this.lastProcessedLedger = ledger;
+      } catch (err) {
+        logger.error("[EventListener] Failed to ingest GovernanceVoted event:", err);
+      }
     }
   }
 

@@ -55,6 +55,7 @@ import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
 import zkRouter from "./routes/zk";
+import governanceRouter from "./routes/governance";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -205,6 +206,9 @@ app.use("/api/v1/cache", cacheMetricsRouter);
 app.use("/api/v1/analytics", analyticsRouter);
 
 app.use("/api/v1/zk", zkRouter);
+
+// Governance: voter history, delegation tree – Issue #<this issue>
+app.use("/api/v1/governance", governanceRouter);
 
 app.get("/", (req, res) => {
   res.json({
