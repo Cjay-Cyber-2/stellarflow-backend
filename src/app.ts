@@ -55,6 +55,7 @@ import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
 import zkRouter from "./routes/zk";
+import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -206,6 +207,9 @@ app.use("/api/v1/analytics", analyticsRouter);
 
 app.use("/api/v1/zk", zkRouter);
 
+// Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
+app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -264,6 +268,16 @@ app.get("/", (req, res) => {
           updateConfig: "PUT /api/admin/rate-limit",
           refreshWhitelist: "POST /api/admin/rate-limit/whitelist/refresh",
         },
+      },
+
+      sorobanRent: {
+        estimateInstructionFee:
+          "POST /api/v1/soroban/rent/estimate-instruction-fee",
+        estimateStorageRent: "POST /api/v1/soroban/rent/estimate-storage-rent",
+        estimateEntryCosts: "POST /api/v1/soroban/rent/estimate-entry-costs",
+        fullEstimate: "POST /api/v1/soroban/rent/estimate",
+        storageInfo:
+          "GET /api/v1/soroban/rent/storage-info/:contractId/:storageKey",
       },
     },
   });
