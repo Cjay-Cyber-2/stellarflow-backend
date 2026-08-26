@@ -35,6 +35,7 @@ import { providerSecretRotationService } from "./services/providerSecretRotation
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
+import { storageRentBumpService } from "./services/storageRentBumpService";
 
 // Load environment variables
 dotenv.config();
@@ -304,6 +305,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
+    storageRentBumpService.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -348,15 +350,17 @@ httpServer.listen(PORT, async () => {
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
+  redisOperationsWorker.start();
+  console.log(`🧹 Redis operations worker started`);
+
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
   if (contractSanityCheckService.isConfigured()) {
     try {
-      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      const sanityResult =
+        await contractSanityCheckService.performSanityCheck();
       if (!sanityResult.success) {
-        console.error(
-          `❌ Contract sanity check failed: ${sanityResult.error}`,
-        );
+        console.error(`❌ Contract sanity check failed: ${sanityResult.error}`);
         console.error(
           "⛔ Preventing ingestion loop from starting due to contract failure",
         );
@@ -468,6 +472,18 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Gas balance monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Start storage rent bump service
+  try {
+    storageRentBumpService.start().catch((err: Error) => {
+      console.error("Failed to start storage rent bump service:", err);
+    });
+  } catch (err) {
+    console.warn(
+      "Storage rent bump service not started:",
       err instanceof Error ? err.message : err,
     );
   }

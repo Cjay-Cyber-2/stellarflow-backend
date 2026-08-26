@@ -18,7 +18,9 @@ export enum AlertType {
   FAILOVER_EVENT = "failover_event",
   HEALTH_CHECK_FAILURE = "health_check_failure",
   SECURITY_ALERT = "security_alert",
-  GOVERNANCE_TIMELOCK_READY = "governance_timelock_ready",
+  POOL_RESERVE_DEVIATION = "pool_reserve_deviation",
+  REDIS_MEMORY_THRESHOLD = "redis_memory_threshold",
+  VAULT_LIQUIDATION_RISK = "vault_liquidation_risk",
 }
 
 export interface SystemAlert {
