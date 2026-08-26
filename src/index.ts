@@ -350,15 +350,17 @@ httpServer.listen(PORT, async () => {
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
+  redisOperationsWorker.start();
+  console.log(`🧹 Redis operations worker started`);
+
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
   if (contractSanityCheckService.isConfigured()) {
     try {
-      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      const sanityResult =
+        await contractSanityCheckService.performSanityCheck();
       if (!sanityResult.success) {
-        console.error(
-          `❌ Contract sanity check failed: ${sanityResult.error}`,
-        );
+        console.error(`❌ Contract sanity check failed: ${sanityResult.error}`);
         console.error(
           "⛔ Preventing ingestion loop from starting due to contract failure",
         );
