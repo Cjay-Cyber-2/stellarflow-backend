@@ -292,3 +292,54 @@ model PoolLiquidity {
   @@unique([poolId, timestamp])
   @@index([poolId, timestamp])
 }
+
+// Governance Proposal – tracks timelock execution windows for multi-sig governance actions.
+// Populated by indexing ProposalQueued and TimelockActionExecuted Soroban contract events.
+model GovernanceProposal {
+  id                      Int       @id @default(autoincrement())
+  proposalId              String    @unique
+  contractId              String
+  /// Source field recorded from the indexed ProposalQueued event (e.g. "soroban-rpc")
+  timelockActionSource    String?
+  /// Timestamp when the ProposalQueued event was first indexed from the chain
+  queuedAt                DateTime?
+  expiresAt               DateTime
+  status                  String    @default("Queued")
+  transactionHash         String?
+  executedAt              DateTime?
+  /// How many execution-ready notifications have been fired so far
+  notificationCount       Int       @default(0)
+  /// Timestamp of the last execution-ready notification sent
+  executionReadyNotifiedAt DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  timelockEvents TimelockEvent[]
+
+  @@index([status, expiresAt])
+}
+
+/// Raw indexed record of a Soroban contract event relating to governance timelock.
+/// Stores both ProposalQueued and TimelockActionExecuted events exactly as seen on-chain.
+model TimelockEvent {
+  id                 Int       @id @default(autoincrement())
+  /// "ProposalQueued" | "TimelockActionExecuted"
+  eventType          String
+  proposalId         String
+  contractId         String
+  ledgerSeq          Int
+  txHash             String
+  /// JSON-serialised raw topic array from the Soroban RPC response
+  topics             String
+  /// JSON-serialised raw value from the Soroban RPC response
+  value              String
+  /// When this event row was inserted into the database
+  indexedAt          DateTime  @default(now())
+
+  governanceProposal GovernanceProposal? @relation(fields: [proposalId], references: [proposalId])
+
+  @@unique([txHash, eventType, proposalId])
+  @@index([proposalId])
+  @@index([eventType])
+  @@index([ledgerSeq])
+}
