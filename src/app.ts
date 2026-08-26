@@ -1,10 +1,6 @@
-import cors from "cors";
-
 import dotenv from "dotenv";
 
 import express from "express";
-
-import helmet from "helmet";
 
 import morgan from "morgan";
 
@@ -18,6 +14,12 @@ import { adminMiddleware } from "./middleware/adminMiddleware";
 import { adminRateLimitMiddleware } from "./middleware/adminRateLimitMiddleware";
 
 import { apiKeyMiddleware } from "./middleware/apiKeyMiddleware";
+
+import { originGuard } from "./middleware/corsMiddleware";
+
+import { applyHttpSecurity } from "./middleware/httpSecurity";
+
+import { inspectHeadersMiddleware } from "./middleware/securityMiddleware";
 
 import { latencyValidationMiddleware } from "./middleware/latencyGuardMiddleware";
 
@@ -61,74 +63,30 @@ dotenv.config();
 
 const app = express();
 
-const dashboardUrl =
-  process.env.DASHBOARD_URL ||
-  process.env.FRONTEND_URL ||
-  "http://localhost:3000";
-
 app.use(morgan("dev"));
+
+// Issue #792 – Security headers + strict CORS allowlist. Registered before
+// everything else so the headers reach every response, including short-circuit
+// replies such as CORS 403s, preflight 204s and maintenance 503s.
+applyHttpSecurity(app);
 
 // Maintenance mode middleware: must be early in the chain
 
 app.use(maintenanceMiddleware);
 
-app.use(
-  cors({
-    origin: (origin, callback) => {
-      if (!origin) return callback(null, true);
-
-      if (origin === dashboardUrl) return callback(null, true);
-
-      return callback(
-        new Error(
-          `CORS policy: Access denied from origin ${origin}. Allowed origin: ${dashboardUrl}`,
-        ),
-      );
-    },
-
-    credentials: true,
-  }),
-);
-
-app.use(
-  helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-
-        scriptSrc: ["'self'", "'unsafe-inline'"],
-
-        styleSrc: ["'self'", "'unsafe-inline'"],
-
-        imgSrc: ["'self'", "data:", "https:"],
-
-        fontSrc: ["'self'", "https:"],
-
-        connectSrc: ["'self'"],
-
-        frameAncestors: ["'none'"],
-      },
-    },
-
-    noSniff: true,
-
-    frameguard: { action: "deny" },
-
-    referrerPolicy: { policy: "strict-origin-when-cross-origin" },
-
-    xssFilter: false,
-
-    hidePoweredBy: true,
-
-    hsts: { maxAge: 31536000, includeSubDomains: false, preload: false },
-  }),
-);
+app.use(inspectHeadersMiddleware);
 
 app.use(express.json());
 
 // Add tracing middleware early in the stack
 app.use(tracingMiddleware);
 app.use(axiosTracingMiddleware);
+
+// Issue #792 – Reject API traffic with no usable Origin unless it identifies as
+// a non-browser client. Mounted ahead of the auth router and the API key layer
+// so credential-bearing browser endpoints are covered and blocked requests
+// never reach a database lookup.
+app.use("/api", originGuard);
 
 app.use("/api/v1/docs", swaggerUi.serve);
 

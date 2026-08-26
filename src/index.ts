@@ -1,8 +1,6 @@
 import { createServer } from "http";
 import compression from "compression";
-import cors from "cors";
 import dotenv from "dotenv";
-import express from "express";
 import { Horizon } from "@stellar/stellar-sdk";
 import { getStellarNetwork } from "./lib/stellarNetwork";
 import marketRatesRouter from "./routes/marketRates";
@@ -21,6 +19,7 @@ import {
 } from "./services/gasBalanceMonitorService";
 import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
+import { refreshAllowedOrigins } from "./middleware/corsMiddleware";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
@@ -35,6 +34,7 @@ import { providerSecretRotationService } from "./services/providerSecretRotation
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
+import { getRegionalHealthService } from "./services/regionalHealthService";
 
 // Load environment variables
 dotenv.config();
@@ -83,15 +83,18 @@ if (missingEnvVars.length > 0) {
   process.exit(1);
 }
 
-const dashboardUrl =
-  process.env.DASHBOARD_URL ||
-  process.env.FRONTEND_URL ||
-  "http://localhost:3000";
+// Issue #792 – Fail fast when the CORS allowlist is empty in production rather
+// than starting a server that rejects every browser client.
+const allowedOrigins = refreshAllowedOrigins();
 
-if (!dashboardUrl) {
-  console.error("❌ Missing required environment variable: DASHBOARD_URL");
+if (allowedOrigins.length === 0) {
+  console.error(
+    "❌ No CORS origins configured. Set CORS_ALLOWED_ORIGINS (comma-separated) or DASHBOARD_URL.",
+  );
   process.exit(1);
 }
+
+console.log(`🔒 CORS allowlist: ${allowedOrigins.join(", ")}`);
 
 const PORT = process.env.PORT || 3000;
 
@@ -103,9 +106,9 @@ const horizonUrl =
     : "https://horizon-testnet.stellar.org";
 const horizonServer = new Horizon.Server(horizonUrl);
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// CORS, security headers and body parsing are configured once in app.ts.
+// Re-registering them here previously overwrote the strict allowlist with a
+// wildcard Access-Control-Allow-Origin.
 
 // Routes
 app.use("/api/market-rates", marketRatesRouter);
@@ -352,11 +355,10 @@ httpServer.listen(PORT, async () => {
   let contractSanityPassed = true;
   if (contractSanityCheckService.isConfigured()) {
     try {
-      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      const sanityResult =
+        await contractSanityCheckService.performSanityCheck();
       if (!sanityResult.success) {
-        console.error(
-          `❌ Contract sanity check failed: ${sanityResult.error}`,
-        );
+        console.error(`❌ Contract sanity check failed: ${sanityResult.error}`);
         console.error(
           "⛔ Preventing ingestion loop from starting due to contract failure",
         );

@@ -29,6 +29,8 @@ export default [
         btoa: "readonly",
         URL: "readonly",
         URLSearchParams: "readonly",
+        fetch: "readonly",
+        Response: "readonly",
       },
     },
     plugins: {
