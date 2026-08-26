@@ -36,6 +36,10 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getGasProfilerService } from "./services/gasProfiler/gasProfilerService";
+import { gasProfileScheduler } from "./jobs/gasProfileJob";
+import { getRegionalHealthService } from "./services/regionalHealthService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
 // Load environment variables
 dotenv.config();
@@ -484,6 +488,22 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Storage rent bump service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Issue #786 – Gas & CPU instruction profiler (RPC backfill + daily rollup)
+  try {
+    getGasProfilerService()
+      .start()
+      .catch((err: Error) => {
+        console.error("Failed to start gas profiler service:", err);
+      });
+    gasProfileScheduler.start();
+    console.log("⛽ Gas profiler service started");
+  } catch (err) {
+    console.warn(
+      "Gas profiler service not started:",
       err instanceof Error ? err.message : err,
     );
   }

@@ -292,3 +292,60 @@ model PoolLiquidity {
   @@unique([poolId, timestamp])
   @@index([poolId, timestamp])
 }
+
+// Per-transaction gas and CPU instruction profile (Issue #786)
+// One row per profiled Soroban transaction. Instruction and byte counts are
+// uint32 in the XDR and fee values are int64 stroops, so both are stored as
+// Decimal rather than Int to avoid overflowing a 4-byte column.
+model GasProfileSample {
+  id           String   @id @default(uuid())
+  txHash       String   @unique
+  txType       String   @db.VarChar(32)  // swap | deposit | withdraw | other | unknown
+  contractId   String?  @db.VarChar(64)
+  functionName String?  @db.VarChar(64)
+  successful   Boolean  @default(true)
+
+  cpuInstructions Decimal @db.Decimal(20, 0)
+  diskReadBytes   Decimal @db.Decimal(20, 0)
+  writeBytes      Decimal @db.Decimal(20, 0)
+
+  resourceFeeStroops      Decimal @db.Decimal(20, 0)             // declared in the envelope
+  feeChargedStroops       Decimal @db.Decimal(20, 0)             // actually charged
+  nonRefundableFeeStroops Decimal @db.Decimal(20, 0) @default(0)
+  refundableFeeStroops    Decimal @db.Decimal(20, 0) @default(0)
+  rentFeeStroops          Decimal @db.Decimal(20, 0) @default(0) // storage rent
+
+  ledgerSeq  Int
+  source     String   @db.VarChar(16)  // submission | backfill
+  occurredAt DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([txType, occurredAt])
+  @@index([occurredAt])
+  @@index([ledgerSeq])
+}
+
+// Daily average cost per transaction type (Issue #786)
+// Written by the daily rollup job and read by the spike detector as the
+// trailing baseline.
+model GasDailyAggregate {
+  id          String   @id @default(uuid())
+  day         DateTime @db.Date
+  txType      String   @db.VarChar(32)
+  sampleCount Int
+
+  avgCpuInstructions   Decimal @db.Decimal(20, 4)
+  avgFeeChargedStroops Decimal @db.Decimal(20, 4)
+  avgRentFeeStroops    Decimal @db.Decimal(20, 4)
+  avgDiskReadBytes     Decimal @db.Decimal(20, 4)
+  avgWriteBytes        Decimal @db.Decimal(20, 4)
+
+  maxCpuInstructions     Decimal @db.Decimal(20, 0)
+  totalFeeChargedStroops Decimal @db.Decimal(20, 0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([day, txType])
+  @@index([day])
+}
