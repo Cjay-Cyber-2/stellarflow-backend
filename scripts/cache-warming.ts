@@ -1,6 +1,7 @@
 import { cacheService } from "../src/cache/CacheService";
 import { CACHE_CONFIG, CACHE_KEYS } from "../src/config/redis.config";
 import prisma from "../src/lib/prisma";
+import { getCacheWarmingWorker } from "../src/services/cacheWarmingWorker";
 
 /**
  * Cache warming script to pre-populate frequently accessed data
@@ -9,6 +10,15 @@ import prisma from "../src/lib/prisma";
 
 async function warmCache() {
   console.log("[Cache Warming] Starting cache warming...");
+
+  // Also trigger the cache warming worker for market endpoints
+  try {
+    const worker = getCacheWarmingWorker();
+    worker.start();
+    console.log("[Cache Warming] Cache warming worker started for market endpoints");
+  } catch (error) {
+    console.warn("[Cache Warming] Could not start cache warming worker:", error);
+  }
 
   try {
     // Warm up active currencies
