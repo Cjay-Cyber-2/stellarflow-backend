@@ -36,6 +36,8 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getRegionalHealthService } from "./services/regionalHealthService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
 // Load environment variables
 dotenv.config();
@@ -220,6 +222,8 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     endpoints: {
       health: "/health",
+      liveness: "/health/liveness",
+      readiness: "/health/readiness",
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
@@ -348,6 +352,10 @@ httpServer.listen(PORT, async () => {
     `📚 API Documentation available at http://localhost:${PORT}/api/docs`,
   );
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
+  console.log(`💓 Liveness probe at http://localhost:${PORT}/health/liveness`);
+  console.log(
+    `✅ Readiness probe at http://localhost:${PORT}/health/readiness`,
+  );
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
   redisOperationsWorker.start();
