@@ -86,7 +86,7 @@ export default [
         },
         {
           selector: "classProperty",
-          format: ["camelCase"],
+          format: ["camelCase", "UPPER_CASE"],
           leadingUnderscore: "allow",
         },
         {

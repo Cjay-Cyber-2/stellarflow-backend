@@ -35,6 +35,8 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { getRegionalHealthService } from "./services/regionalHealthService";
+import { storageRentBumpService } from "./services/storageRentBumpService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
 // Load environment variables
 dotenv.config();
@@ -307,6 +309,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
+    storageRentBumpService.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -350,6 +353,9 @@ httpServer.listen(PORT, async () => {
   );
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
   console.log(`🔌 Socket.io ready for dashboard connections`);
+
+  redisOperationsWorker.start();
+  console.log(`🧹 Redis operations worker started`);
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
@@ -470,6 +476,18 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Gas balance monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Start storage rent bump service
+  try {
+    storageRentBumpService.start().catch((err: Error) => {
+      console.error("Failed to start storage rent bump service:", err);
+    });
+  } catch (err) {
+    console.warn(
+      "Storage rent bump service not started:",
       err instanceof Error ? err.message : err,
     );
   }
