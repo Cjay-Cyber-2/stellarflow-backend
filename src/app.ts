@@ -55,7 +55,7 @@ import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
 import zkRouter from "./routes/zk";
-import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate";
+import governanceRouter from "./routes/governance";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -206,6 +206,7 @@ app.use("/api/v1/cache", cacheMetricsRouter);
 app.use("/api/v1/analytics", analyticsRouter);
 
 app.use("/api/v1/zk", zkRouter);
+app.use("/api/v1/governance", governanceRouter);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
