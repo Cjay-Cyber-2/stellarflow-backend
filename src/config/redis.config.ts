@@ -52,4 +52,8 @@ export const CACHE_KEYS = {
   feeEstimate: {
     current: () => "fee-estimate:current",
   },
+  orderBook: {
+    latestSnapshot: () => "orderbook:snapshot:latest",
+    snapshot: (ledgerSeq: number) => `orderbook:snapshot:${ledgerSeq}`,
+  },
 } as const;

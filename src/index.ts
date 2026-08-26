@@ -36,6 +36,9 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
+import { getRegionalHealthService } from "./services/regionalHealthService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
 // Load environment variables
 dotenv.config();
@@ -306,6 +309,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    getOrderBookSnapshotEngine().stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -352,6 +356,21 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  // Start the order book snapshot engine (Issue #796)
+  try {
+    getOrderBookSnapshotEngine()
+      .start()
+      .catch((err) => {
+        console.error("Failed to start order book snapshot engine:", err);
+      });
+    console.log(`📖 Order book snapshot engine started`);
+  } catch (err) {
+    console.warn(
+      "Order book snapshot engine not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
