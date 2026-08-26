@@ -138,6 +138,27 @@ model MultiSigSignature {
 }
 
 // Error log table for tracking provider/fetcher failures
+// Invariant Violation Circuit Breaker Event Model
+// Records automated circuit breaker activations triggered by invariant
+// violation detections from off-chain workers. Provides an audit trail and
+// cross-restart de-duplication for the automated pause() sequence.
+model CircuitBreakerEvent {
+  id              Int      @id @default(autoincrement())
+  breachType      String   // e.g., "KEEPER_XLM_BALANCE_BELOW_FLOOR"
+  severity        String   // e.g., "CRITICAL"
+  reason          String   // Human readable description of the violation
+  details         Json?    // Extra context (balance, threshold, contract id, etc.)
+  status          String   // "DETECTED" | "PAUSE_SUBMITTED" | "PAUSE_FAILED" | "NOTIFIED"
+  txHash          String?  // Stellar transaction hash of the submitted pause() tx
+  keeperPublicKey String?  // Emergency keeper key used to sign the pause() tx
+  detectedAt      DateTime @default(now())
+  createdAt       DateTime @default(now())
+
+  @@index([status, detectedAt])
+  @@index([breachType, detectedAt])
+  @@index([txHash])
+}
+
 model ErrorLog {
   id           String   @id  // K-sortable KSUID (26-char Crockford Base32)
   providerName String   // e.g., "CoinGecko", "KESRateFetcher"

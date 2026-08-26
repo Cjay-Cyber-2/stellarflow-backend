@@ -70,10 +70,7 @@ async function run() {
 
     assert.equal(rate.currency, "NGN");
     assert.equal(rate.rate, expectedRate);
-    assert.equal(
-      rate.source,
-      "Weighted average of 3 sources (outliers filtered)",
-    );
+    assert.equal(rate.source, "Median of 3 sources");
     assert.equal(Array.isArray(rate.rawResponses), true);
     assert.equal(rate.rawResponses?.length, 5);
     assert.deepEqual(

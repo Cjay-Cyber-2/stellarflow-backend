@@ -34,6 +34,7 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
+import { getCircuitBreakerService } from "./services/circuitBreakerService";
 
 // Load environment variables
 dotenv.config();
@@ -253,6 +254,7 @@ let sorobanEventListener: SorobanEventListener | null = null;
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
+const circuitBreakerService = getCircuitBreakerService();
 
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
@@ -299,6 +301,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     multiSigSubmissionService.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
+    circuitBreakerService.stop();
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
@@ -350,11 +353,10 @@ httpServer.listen(PORT, async () => {
   let contractSanityPassed = true;
   if (contractSanityCheckService.isConfigured()) {
     try {
-      const sanityResult = await contractSanityCheckService.performSanityCheck();
+      const sanityResult =
+        await contractSanityCheckService.performSanityCheck();
       if (!sanityResult.success) {
-        console.error(
-          `❌ Contract sanity check failed: ${sanityResult.error}`,
-        );
+        console.error(`❌ Contract sanity check failed: ${sanityResult.error}`);
         console.error(
           "⛔ Preventing ingestion loop from starting due to contract failure",
         );
@@ -451,6 +453,22 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Gas balance monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Invariant Violation Automated Circuit Breaker (Issue #829):
+  // monitors balance invariants off-chain and auto-submits a pause()
+  // transaction signed by the emergency keeper key when a CRITICAL breach
+  // is detected. Opt-in via CIRCUIT_BREAKER_ENABLED=true.
+  try {
+    circuitBreakerService.start().catch((err: Error) => {
+      console.error("Failed to start circuit breaker service:", err);
+    });
+    console.log(`🚨 Circuit breaker service started`);
+  } catch (err) {
+    console.warn(
+      "Circuit breaker service not started:",
       err instanceof Error ? err.message : err,
     );
   }

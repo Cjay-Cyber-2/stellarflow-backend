@@ -36,3 +36,4 @@ jobs:
           npx tsx test/ghsFetcher.test.ts
           npx tsx test/ngnFetcher.test.ts
           npx tsx test/sorobanEventListener.test.ts
+          npx tsx test/circuitBreakerService.test.ts

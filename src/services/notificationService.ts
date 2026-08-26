@@ -18,6 +18,7 @@ export enum AlertType {
   FAILOVER_EVENT = "failover_event",
   HEALTH_CHECK_FAILURE = "health_check_failure",
   SECURITY_ALERT = "security_alert",
+  INVARIANT_BREACH = "invariant_breach",
 }
 
 export interface SystemAlert {
@@ -483,6 +484,40 @@ export class NotificationService {
     });
   }
 
+  /**
+   * Send a high-priority security alert when an invariant violation triggers
+   * the automated circuit breaker. Fires on the immediate high-priority
+   * channel (Discord/Slack) so the security team is notified right away.
+   */
+  public async sendInvariantBreachAlert(details: {
+    breachType: string;
+    reason: string;
+    contractId?: string;
+    txHash?: string;
+    service?: string;
+    region?: string;
+    correlationId?: string;
+  }): Promise<boolean> {
+    return this.sendAlert({
+      type: AlertType.INVARIANT_BREACH,
+      severity: AlertSeverity.CRITICAL,
+      title: "🚨 INVARIANT VIOLATION — CIRCUIT BREAKER TRIGGERED",
+      message: `Automated circuit breaker triggered: ${details.reason}`,
+      details: {
+        breach_type: details.breachType,
+        reason: details.reason,
+        ...(details.contractId ? { contract_id: details.contractId } : {}),
+        ...(details.txHash ? { pause_tx_hash: details.txHash } : {}),
+        action_taken: "pause() submitted via emergency keeper key",
+        manual_intervention_required: true,
+      },
+      timestamp: new Date(),
+      service: details.service ?? "circuit-breaker",
+      region: details.region,
+      correlationId: details.correlationId,
+    });
+  }
+
   public async sendPriceAnomalyAlert(details: {
     currency: string;
     rate: number;
@@ -564,3 +599,5 @@ export const sendFailoverEventAlert =
   notificationService.sendFailoverEventAlert.bind(notificationService);
 export const sendPriceAnomalyAlert =
   notificationService.sendPriceAnomalyAlert.bind(notificationService);
+export const sendInvariantBreachAlert =
+  notificationService.sendInvariantBreachAlert.bind(notificationService);
