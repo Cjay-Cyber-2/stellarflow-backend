@@ -6,6 +6,7 @@ import { Horizon } from "@stellar/stellar-sdk";
 import marketRatesRouter from "./routes/marketRates";
 import prisma from "./lib/prisma";
 import { initSocket } from "./lib/socket";
+import { startLiquidityRebalancingWorker } from "./services/liquidity/bootstrap";
 
 // Load environment variables
 dotenv.config();
@@ -129,6 +130,7 @@ app.use("*", (req, res) => {
 // Start server
 const httpServer = createServer(app);
 initSocket(httpServer);
+startLiquidityRebalancingWorker();
 
 httpServer.listen(PORT, () => {
   console.log(`🌊 StellarFlow Backend running on port ${PORT}`);
