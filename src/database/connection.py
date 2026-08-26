@@ -58,10 +58,17 @@ Usage::
     avg = controller.average_latency_ms()
 """
 
+import asyncio
 import logging
 import threading
-from typing import Any, Deque, Optional
+import time
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Type
 from collections import deque
+
+try:  # psycopg2 is optional: the module must import under sqlite/test setups too.
+    import psycopg2
+except ImportError:  # pragma: no cover - exercised only where psycopg2 is absent
+    psycopg2 = None
 
 logger = logging.getLogger(__name__)
  
@@ -74,6 +81,20 @@ logger = logging.getLogger(__name__)
 # warm with comfortable margin.
 DEFAULT_PING_INTERVAL: float = 30.0
 HEARTBEAT_QUERY: str = "SELECT 1;"
+
+# ---------------------------------------------------------------------------
+# ConnectionPoolHealthMonitor constants
+# ---------------------------------------------------------------------------
+
+# How often the background loop validates a pooled connection. Shorter than the
+# keep-alive cadence so a stale socket left by a DB restart is caught and the
+# pool rebuilt before too many write attempts hit the dead connection.
+DEFAULT_HEALTH_CHECK_INTERVAL: float = 15.0
+
+# Number of consecutive failed probes that escalate from discarding individual
+# connections to rebuilding the whole pool. A single blip discards one socket;
+# a true outage (every pooled socket dead after a restart) trips the rebuild.
+DEFAULT_FAILURE_THRESHOLD: int = 2
 
 # ---------------------------------------------------------------------------
 # AdaptiveTimeoutController constants
@@ -101,8 +122,232 @@ DEFAULT_MAX_TIMEOUT_S: float = 60.0
 # Rolling window size for the internal latency sample buffer used by
 # record_latency() / average_latency_ms().
 DEFAULT_LATENCY_WINDOW: int = 100
- 
- 
+
+# ---------------------------------------------------------------------------
+# Index Usage Telemetry constants
+# ---------------------------------------------------------------------------
+
+# Threshold for considering an index as under-utilized (percentage of scans)
+DEFAULT_INDEX_USAGE_THRESHOLD: float = 0.05  # 5% of total scans
+
+# Minimum number of index scans before considering usage statistics valid
+DEFAULT_MIN_INDEX_SCANS: int = 100
+
+# Alert emission interval in seconds (prevent spam)
+DEFAULT_ALERT_INTERVAL_S: float = 3600.0  # 1 hour
+
+
+class IndexUsageTelemetry:
+    """Tracks database index usage and generates diagnostic alerts for under-utilized indexes.
+    
+    This class monitors index usage statistics from PostgreSQL's pg_stat_user_indexes
+    view and emits alerts when indexes are not being used effectively. Under-utilized
+    indexes consume valuable storage I/O bandwidth without providing query performance
+    benefits.
+    
+    The telemetry is designed to work with PostgreSQL databases via psycopg2. For other
+    database backends, the tracking is a no-op but will not raise errors.
+    
+    Usage::
+    
+        telemetry = IndexUsageTelemetry(connection)
+        telemetry.record_index_usage()  # Called periodically
+        alerts = telemetry.get_underutilized_alerts()
+    """
+    
+    def __init__(
+        self,
+        connection: Any,
+        usage_threshold: float = DEFAULT_INDEX_USAGE_THRESHOLD,
+        min_scans: int = DEFAULT_MIN_INDEX_SCANS,
+        alert_interval: float = DEFAULT_ALERT_INTERVAL_S,
+    ) -> None:
+        """Initialize index usage telemetry tracker.
+        
+        Parameters
+        ----------
+        connection:
+            Database connection object exposing cursor() method (DB-API 2.0).
+        usage_threshold:
+            Minimum usage ratio (0.0-1.0) below which an index is considered
+            under-utilized. Default is 0.05 (5%).
+        min_scans:
+            Minimum number of index scans required before usage statistics
+            are considered valid. Default is 100.
+        alert_interval:
+            Minimum seconds between repeated alerts for the same index to
+            prevent alert spam. Default is 3600 (1 hour).
+        """
+        if connection is None:
+            raise ValueError("connection must not be None")
+        if not (0.0 <= usage_threshold <= 1.0):
+            raise ValueError("usage_threshold must be between 0.0 and 1.0")
+        if min_scans < 0:
+            raise ValueError("min_scans must be non-negative")
+        if alert_interval <= 0:
+            raise ValueError("alert_interval must be positive")
+        
+        self._conn = connection
+        self._usage_threshold = usage_threshold
+        self._min_scans = min_scans
+        self._alert_interval = alert_interval
+        
+        self._index_stats: Dict[str, Dict[str, Any]] = {}
+        self._last_alert_time: Dict[str, float] = {}
+        self._lock = threading.Lock()
+        
+        logger.info(
+            "IndexUsageTelemetry initialised: threshold=%.2f min_scans=%d alert_interval=%.1fs",
+            usage_threshold,
+            min_scans,
+            alert_interval,
+        )
+    
+    def record_index_usage(self) -> None:
+        """Query and record current index usage statistics from the database.
+        
+        This method executes a query against PostgreSQL's pg_stat_user_indexes
+        view to collect index scan counts and updates the internal tracking state.
+        
+        For non-PostgreSQL databases or when the query fails, this method logs
+        a debug message and returns without raising an exception.
+        """
+        if psycopg2 is None:
+            logger.debug("IndexUsageTelemetry: psycopg2 not available, skipping index stats")
+            return
+        
+        try:
+            with self._lock:
+                cursor = self._conn.cursor()
+                try:
+                    # Query PostgreSQL's index statistics
+                    query = """
+                        SELECT 
+                            schemaname,
+                            relname as table_name,
+                            indexrelname as index_name,
+                            idx_scan as index_scans,
+                            idx_tup_read as tuples_read,
+                            idx_tup_fetch as tuples_fetched
+                        FROM pg_stat_user_indexes
+                    """
+                    cursor.execute(query)
+                    rows = cursor.fetchall()
+                    
+                    # Update internal statistics
+                    current_time = time.time()
+                    for row in rows:
+                        schemaname, table_name, index_name, index_scans, tuples_read, tuples_fetched = row
+                        key = f"{schemaname}.{table_name}.{index_name}"
+                        
+                        self._index_stats[key] = {
+                            "schemaname": schemaname,
+                            "table_name": table_name,
+                            "index_name": index_name,
+                            "index_scans": index_scans,
+                            "tuples_read": tuples_read,
+                            "tuples_fetched": tuples_fetched,
+                            "last_updated": current_time,
+                        }
+                    
+                    logger.debug(
+                        "IndexUsageTelemetry: recorded stats for %d indexes",
+                        len(rows)
+                    )
+                finally:
+                    close = getattr(cursor, "close", None)
+                    if callable(close):
+                        close()
+        except Exception as exc:
+            logger.debug(
+                "IndexUsageTelemetry: failed to record index usage (optional): %s",
+                exc
+            )
+    
+    def get_underutilized_alerts(self) -> List[Dict[str, Any]]:
+        """Generate diagnostic alerts for under-utilized database indexes.
+        
+        An index is considered under-utilized if:
+        1. It has been scanned at least min_scans times
+        2. Its usage ratio is below the usage_threshold
+        3. Sufficient time has passed since the last alert for this index
+        
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of alert dictionaries, each containing:
+            - index_name: Name of the under-utilized index
+            - table_name: Table the index belongs to
+            - schemaname: Schema name
+            - index_scans: Total number of index scans
+            - usage_ratio: Calculated usage ratio
+            - timestamp: When the alert was generated
+        """
+        alerts = []
+        current_time = time.time()
+        
+        if not self._index_stats:
+            return alerts
+        
+        # Calculate total scans across all indexes for ratio calculation
+        total_scans = sum(
+            stats["index_scans"] for stats in self._index_stats.values()
+        )
+        
+        if total_scans == 0:
+            return alerts
+        
+        with self._lock:
+            for key, stats in self._index_stats.items():
+                index_scans = stats["index_scans"]
+                
+                # Skip if not enough scans to make a valid assessment
+                if index_scans < self._min_scans:
+                    continue
+                
+                # Calculate usage ratio
+                usage_ratio = index_scans / total_scans
+                
+                # Check if under-utilized
+                if usage_ratio < self._usage_threshold:
+                    # Check alert interval to prevent spam
+                    last_alert = self._last_alert_time.get(key, 0)
+                    if current_time - last_alert >= self._alert_interval:
+                        alert = {
+                            "index_name": stats["index_name"],
+                            "table_name": stats["table_name"],
+                            "schemaname": stats["schemaname"],
+                            "index_scans": index_scans,
+                            "usage_ratio": usage_ratio,
+                            "timestamp": current_time,
+                        }
+                        alerts.append(alert)
+                        self._last_alert_time[key] = current_time
+                        
+                        logger.warning(
+                            "[IndexUsageTelemetry] Under-utilized index detected: "
+                            "%s on %s.%s (scans=%d, ratio=%.4f)",
+                            stats["index_name"],
+                            stats["schemaname"],
+                            stats["table_name"],
+                            index_scans,
+                            usage_ratio,
+                        )
+        
+        return alerts
+    
+    def get_index_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Return the current index usage statistics.
+        
+        Returns
+        -------
+        Dict[str, Dict[str, Any]]
+            Dictionary mapping index keys to their statistics.
+        """
+        with self._lock:
+            return dict(self._index_stats)
+
+
 class ConnectionKeepAlive:
     """Background heartbeat that keeps a relational connection channel alive.
  
@@ -195,7 +440,511 @@ class ConnectionKeepAlive:
             thread.join(timeout=timeout)
         self._thread = None
         logger.info("ConnectionKeepAlive stopped")
- 
+
+
+class AsyncConnectionKeepAlive:
+    """Async-native heartbeat that keeps an async database connection alive.
+
+    Mirrors :class:`ConnectionKeepAlive` for async drivers (asyncpg, aiopg,
+    databases, etc.) that expose an awaitable ``execute`` coroutine rather than
+    a synchronous ``cursor()`` interface.
+
+    A background :class:`asyncio.Task` wakes every ``interval`` seconds and
+    issues a lightweight ``SELECT 1;`` to keep the channel warm. The task is
+    cancellation-safe: ``stop()`` cancels it and awaits its completion so
+    callers get a clean shutdown guarantee without waiting out the full interval.
+
+    Usage::
+
+        keepalive = AsyncConnectionKeepAlive(asyncpg_conn, interval=30.0)
+        keepalive.start()           # schedule the background task
+
+        # … ingestion pipeline runs …
+
+        await keepalive.stop()      # cancel task and await clean exit
+
+    The connection must expose an awaitable ``execute(query: str)`` method.
+    asyncpg connections satisfy this directly; for other drivers wrap the
+    connection in a thin adapter that provides that signature.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        interval: float = DEFAULT_PING_INTERVAL,
+        query: str = HEARTBEAT_QUERY,
+    ) -> None:
+        if connection is None:
+            raise ValueError("connection must not be None")
+        if interval <= 0:
+            raise ValueError("interval must be a positive number of seconds")
+
+        self._conn = connection
+        self._interval = interval
+        self._query = query
+        self._task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
+
+    @property
+    def is_running(self) -> bool:
+        """True while the background heartbeat task is active."""
+        return self._task is not None and not self._task.done()
+
+    def start(self) -> None:
+        """Schedule the background heartbeat task on the running event loop.
+
+        Calling ``start`` on an already-running keep-alive is a no-op.
+        Must be called from within a running asyncio event loop.
+        """
+        if self.is_running:
+            logger.debug("AsyncConnectionKeepAlive already running; start() ignored")
+            return
+        self._task = asyncio.ensure_future(self._run())
+        logger.info(
+            "AsyncConnectionKeepAlive started; pinging every %.1f seconds",
+            self._interval,
+        )
+
+    async def ping(self) -> bool:
+        """Issue a single heartbeat query.
+
+        Returns ``True`` if the ping succeeded, ``False`` if it raised.
+        Failures are logged and swallowed so a transient drop never takes
+        down the background loop; the next tick simply tries again.
+        """
+        try:
+            await self._conn.execute(self._query)
+            logger.debug("Async heartbeat ping succeeded")
+            return True
+        except Exception:
+            logger.warning(
+                "Async heartbeat ping failed; will retry next interval",
+                exc_info=True,
+            )
+            return False
+
+    async def _run(self) -> None:
+        """Background coroutine loop — ticks once per interval, exits on cancellation."""
+        try:
+            while True:
+                await asyncio.sleep(self._interval)
+                await self.ping()
+        except asyncio.CancelledError:
+            logger.debug("AsyncConnectionKeepAlive task cancelled")
+
+    async def stop(self) -> None:
+        """Cancel the background task and await its clean exit."""
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        logger.info("AsyncConnectionKeepAlive stopped")
+
+
+def _default_broken_exceptions() -> Tuple[Type[BaseException], ...]:
+    """Exception types that signal a stale / dead pooled socket.
+
+    ``OSError`` is always included (it is the base of the stdlib ``socket.error``
+    and covers raw connection-reset / broken-pipe failures). When ``psycopg2``
+    is importable its ``OperationalError`` (server gone, connection closed) and
+    ``InterfaceError`` (connection already closed by the client) are added — the
+    two driver errors raised when a pooled connection's socket has died.
+    """
+    exceptions: Tuple[Type[BaseException], ...] = (OSError,)
+    if psycopg2 is not None:
+        exceptions = exceptions + (
+            psycopg2.OperationalError,
+            psycopg2.InterfaceError,
+        )
+    return exceptions
+
+
+class ConnectionPoolHealthMonitor:
+    """Validates pooled connections and rebuilds broken paths automatically.
+
+    A sudden database restart or a transient network drop leaves a connection
+    pool holding connections whose underlying TCP socket is dead. The next write
+    that checks one of those connections out fails with a stale-socket error,
+    and keeps failing until the process is restarted. This monitor closes that
+    gap *without* a restart:
+
+    1. **Probe** — every ``interval`` seconds (or on demand via
+       :meth:`check_health`) it checks a connection out of the pool, runs a
+       lightweight ``validation_query`` (``SELECT 1;``) and returns it.
+    2. **Discard** — if the probe raises a stale-socket exception the connection
+       is handed back with ``close=True`` so the pool drops the dead socket and
+       lazily opens a fresh one on the next ``getconn``.
+    3. **Rebuild** — after ``failure_threshold`` *consecutive* failed probes the
+       monitor assumes the whole pool is poisoned (the common case after a full
+       engine restart), calls ``pool_factory`` to build a replacement, swaps it
+       in atomically and closes the old pool. A subsequent healthy probe resets
+       the counter.
+
+    The monitor is pool-agnostic: ``pool`` need only expose ``getconn()`` /
+    ``putconn(conn)`` and, for the rebuild path, ``closeall()`` — the interface
+    of :class:`psycopg2.pool.ThreadedConnectionPool` used by
+    :class:`database.hub.ConnectionHub`. ``putconn(conn, close=True)`` is used
+    when supported and degrades to a plain ``putconn(conn)`` otherwise.
+
+    Because the pool reference is swapped on recovery, callers that want to keep
+    acquiring from the healed pool should read it back through the :attr:`pool`
+    property rather than caching the original object.
+
+    The background thread mirrors :class:`ConnectionKeepAlive`: a daemon thread
+    driven by a :class:`threading.Event`, so ``stop()`` is prompt and a double
+    ``start()`` is a no-op.
+    """
+
+    def __init__(
+        self,
+        pool: Any,
+        pool_factory: Callable[[], Any],
+        interval: float = DEFAULT_HEALTH_CHECK_INTERVAL,
+        validation_query: str = HEARTBEAT_QUERY,
+        failure_threshold: int = DEFAULT_FAILURE_THRESHOLD,
+        broken_exceptions: Optional[Tuple[Type[BaseException], ...]] = None,
+    ) -> None:
+        if pool is None:
+            raise ValueError("pool must not be None")
+        if pool_factory is None or not callable(pool_factory):
+            raise ValueError("pool_factory must be a callable returning a pool")
+        if interval <= 0:
+            raise ValueError("interval must be a positive number of seconds")
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be at least 1")
+
+        self._pool = pool
+        self._pool_factory = pool_factory
+        self._interval = interval
+        self._query = validation_query
+        self._failure_threshold = failure_threshold
+        self._broken = broken_exceptions or _default_broken_exceptions()
+
+        self._consecutive_failures = 0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def pool(self) -> Any:
+        """The current live pool — the rebuilt one after any recovery swap."""
+        with self._lock:
+            return self._pool
+
+    @property
+    def is_running(self) -> bool:
+        """True while the background health-check thread is alive."""
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def consecutive_failures(self) -> int:
+        """Number of consecutive failed probes since the last healthy one."""
+        with self._lock:
+            return self._consecutive_failures
+
+    def start(self) -> None:
+        """Start the background health-check loop.
+
+        Calling ``start`` on an already-running monitor is a no-op.
+        """
+        if self.is_running:
+            logger.debug("ConnectionPoolHealthMonitor already running; start() ignored")
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="ConnectionPoolHealthMonitor",
+        )
+        self._thread.start()
+        logger.info(
+            "ConnectionPoolHealthMonitor started; validating every %.1f seconds "
+            "(rebuild after %d consecutive failures)",
+            self._interval,
+            self._failure_threshold,
+        )
+
+    def check_health(self) -> bool:
+        """Run a single probe / discard / rebuild cycle.
+
+        Returns ``True`` if the pool is healthy — either the probe succeeded or
+        a rebuild produced a working pool — and ``False`` if the probe failed
+        and the failure count has not yet reached the rebuild threshold.
+
+        Never raises: any exception from the probe is classified and handled so
+        the background loop can survive an indefinite outage and keep retrying.
+        """
+        pool = self.pool
+        conn = None
+        try:
+            conn = pool.getconn()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(self._query)
+                cursor.fetchone()
+            finally:
+                close = getattr(cursor, "close", None)
+                if callable(close):
+                    close()
+        except Exception as exc:
+            stale = isinstance(exc, self._broken)
+            self._return_broken(pool, conn)
+            return self._on_failure(exc, stale)
+
+        # Healthy probe: return the connection and reset the failure streak.
+        self._return_healthy(pool, conn)
+        with self._lock:
+            self._consecutive_failures = 0
+        logger.debug("Pool health probe succeeded")
+        return True
+
+    def recover(self) -> bool:
+        """Rebuild the pool via ``pool_factory`` and swap it in atomically.
+
+        The old pool is closed (best-effort ``closeall()``) after the swap so
+        in-flight callers holding the old reference are not yanked mid-query.
+        Returns ``True`` on a successful rebuild, ``False`` if the factory
+        raised (the existing pool is kept so the next tick can retry).
+        """
+        try:
+            new_pool = self._pool_factory()
+        except Exception:
+            logger.exception("Pool rebuild failed; keeping existing pool for retry")
+            return False
+
+        with self._lock:
+            old_pool = self._pool
+            self._pool = new_pool
+            self._consecutive_failures = 0
+
+        if old_pool is not None and old_pool is not new_pool:
+            closeall = getattr(old_pool, "closeall", None)
+            if callable(closeall):
+                try:
+                    closeall()
+                except Exception:
+                    logger.warning("Error closing the old pool after rebuild", exc_info=True)
+        logger.info("ConnectionPoolHealthMonitor rebuilt the connection pool")
+        return True
+
+    def stop(self, timeout: Optional[float] = 5.0) -> None:
+        """Signal the background thread to stop and wait for it to exit."""
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        self._thread = None
+        logger.info("ConnectionPoolHealthMonitor stopped")
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _run(self) -> None:
+        """Background worker loop; ticks once per interval, exits promptly on stop."""
+        while not self._stop_event.wait(self._interval):
+            self.check_health()
+
+    def _on_failure(self, exc: BaseException, stale: bool) -> bool:
+        """Record a failed probe and escalate to a rebuild past the threshold."""
+        with self._lock:
+            self._consecutive_failures += 1
+            failures = self._consecutive_failures
+        if stale:
+            logger.warning(
+                "Pool health probe hit a stale-socket error (%d/%d): %s",
+                failures,
+                self._failure_threshold,
+                exc,
+            )
+        else:
+            logger.warning(
+                "Pool health probe failed (%d/%d)",
+                failures,
+                self._failure_threshold,
+                exc_info=True,
+            )
+        if failures >= self._failure_threshold:
+            return self.recover()
+        return False
+
+    def _return_healthy(self, pool: Any, conn: Any) -> None:
+        """Return a validated connection to the pool, swallowing return errors."""
+        if conn is None:
+            return
+        try:
+            pool.putconn(conn)
+        except Exception:
+            logger.warning("Failed to return a healthy connection to the pool", exc_info=True)
+
+    def _return_broken(self, pool: Any, conn: Any) -> None:
+        """Discard a broken connection so the pool drops its dead socket.
+
+        Prefers ``putconn(conn, close=True)`` (psycopg2 pools) so the pool opens
+        a fresh connection next time; falls back to a plain ``putconn`` for pools
+        that do not accept the keyword.
+        """
+        if conn is None:
+            return
+        try:
+            pool.putconn(conn, close=True)
+        except TypeError:
+            # Pool's putconn does not support the close kwarg.
+            try:
+                pool.putconn(conn)
+            except Exception:
+                logger.warning("Failed to discard a broken connection", exc_info=True)
+        except Exception:
+            logger.warning("Failed to discard a broken connection", exc_info=True)
+
+
+class PooledConnectionRecycler:
+    """Wraps a connection pool and validates connections before checkout.
+
+    On each ``getconn()``, runs a lightweight validation query (``SELECT 1``).
+    If the underlying TCP socket is stale (connection reset, broken pipe, or
+    driver-level disconnect error), the connection is recycled via
+    ``putconn(conn, close=True)`` and a fresh connection is obtained and
+    validated. This prevents silent network drops from surfacing as
+    unexpected connection reset errors when the caller issues its first
+    real query.
+
+    The recycler is identity-transparent: it proxies ``getconn`` and
+    ``putconn`` so existing pool consumers require no changes beyond wrapping
+    their pool::
+
+        raw_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=...)
+        recycler = PooledConnectionRecycler(raw_pool)
+        conn = recycler.getconn()
+        try:
+            # conn is guaranteed to have passed a SELECT 1 probe
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO ...")
+        finally:
+            recycler.putconn(conn)
+
+    Thread safety
+    -------------
+    All public methods hold the underlying pool's inherent lock and add no
+    additional contention beyond the validation query itself.
+    """
+
+    def __init__(
+        self,
+        pool: Any,
+        validation_query: str = HEARTBEAT_QUERY,
+        max_retries: int = 1,
+        broken_exceptions: Optional[Tuple[Type[BaseException], ...]] = None,
+    ) -> None:
+        if pool is None:
+            raise ValueError("pool must not be None")
+        if max_retries < 0:
+            raise ValueError("max_retries must be >= 0")
+
+        self._pool = pool
+        self._query = validation_query
+        self._max_retries = max_retries
+        self._broken = broken_exceptions or _default_broken_exceptions()
+
+    def getconn(self) -> Any:
+        """Obtain a validated connection from the pool.
+
+        The connection is probed with ``validation_query`` before being
+        returned. If the probe fails with a stale-socket error the
+        connection is discarded (``putconn(conn, close=True)``) and a new
+        one is retrieved and validated.  This repeats up to
+        ``max_retries + 1`` attempts.
+
+        Raises
+        ------
+        RuntimeError
+            If every attempt produced a stale connection — the pool is
+            likely entirely dead.
+        """
+        last_error: Optional[BaseException] = None
+        attempts = self._max_retries + 1
+
+        for attempt in range(attempts):
+            conn = self._pool.getconn()
+            try:
+                self._validate(conn)
+            except self._broken as exc:
+                logger.warning(
+                    "Recycler: stale connection detected (attempt %d/%d); "
+                    "discarding and retrying",
+                    attempt + 1,
+                    attempts,
+                )
+                self._return_broken(conn)
+                last_error = exc
+                continue
+            except BaseException:
+                self._return_broken(conn)
+                raise
+
+            logger.debug("Recycler: validated connection from pool")
+            return conn
+
+        raise RuntimeError(
+            f"PooledConnectionRecycler: all {attempts} attempt(s) produced "
+            f"stale connections; the pool may be entirely dead"
+        ) from last_error
+
+    def putconn(self, conn: Any, close: bool = False) -> None:
+        """Return a connection to the pool.
+
+        Delegates to ``self._pool.putconn(conn, close=close)``.
+
+        When *close* is ``True`` the pool discards the connection instead
+        of keeping it idle; use this when *conn* is known to be stale.
+        """
+        try:
+            self._pool.putconn(conn, close=close)
+        except TypeError:
+            try:
+                self._pool.putconn(conn)
+            except Exception:
+                logger.warning("Recycler: failed to return connection", exc_info=True)
+
+    def closeall(self) -> None:
+        """Close all connections managed by the underlying pool."""
+        closeall = getattr(self._pool, "closeall", None)
+        if callable(closeall):
+            closeall()
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _validate(self, conn: Any) -> None:
+        """Run the validation query against *conn*.
+
+        Raises on failure; the caller classifies the exception against
+        ``self._broken`` to decide whether to retry.
+        """
+        cursor = conn.cursor()
+        try:
+            cursor.execute(self._query)
+            cursor.fetchone()
+        finally:
+            close = getattr(cursor, "close", None)
+            if callable(close):
+                close()
+
+    def _return_broken(self, conn: Any) -> None:
+        """Discard a broken connection."""
+        try:
+            self._pool.putconn(conn, close=True)
+        except TypeError:
+            try:
+                self._pool.putconn(conn)
+            except Exception:
+                logger.warning("Recycler: failed to discard broken connection", exc_info=True)
+        except Exception:
+            logger.warning("Recycler: failed to discard broken connection", exc_info=True)
 
 
 class AdaptiveTimeoutController:
@@ -424,3 +1173,239 @@ class AdaptiveTimeoutController:
             active_connections=active_connections,
             latency_ms=self.average_latency_ms(),
         )
+
+
+# ---------------------------------------------------------------------------
+# asyncpg prepared statement pool constants (Issue #569)
+# ---------------------------------------------------------------------------
+
+# Maximum number of distinct prepared statements cached per connection.
+# asyncpg caches statements per-connection internally, but we track them
+# explicitly so callers can inspect and invalidate entries on DDL changes.
+DEFAULT_STATEMENT_CACHE_SIZE: int = 128
+
+try:  # asyncpg is optional – module must still import in sync/test environments.
+    import asyncpg as _asyncpg
+except ImportError:  # pragma: no cover
+    _asyncpg = None
+
+
+class PreparedStatementPool:
+    """Reusable asyncpg prepared-statement cache for high-frequency inserts.
+
+    Re-compiling the same SQL on every ingestion cycle adds measurable database
+    parser overhead. This class prepares each unique SQL string once against the
+    supplied ``asyncpg.Connection`` and caches the resulting
+    ``asyncpg.PreparedStatement`` object. Subsequent calls for the same SQL
+    return the cached statement without a round-trip to the database.
+
+    Usage::
+
+        pool = PreparedStatementPool(conn)
+        await pool.initialize()
+
+        stmt = await pool.get_or_prepare(
+            "INSERT INTO pricing (asset_id, price, ts) VALUES ($1, $2, $3)"
+        )
+        await stmt.fetch("NGN/XLM", 12345, 1700000000)
+
+        # Pre-register known queries at startup:
+        await pool.prepare_all([INSERT_PRICING_SQL, INSERT_TELEMETRY_SQL])
+
+        # Release all prepared statements (e.g. before connection teardown):
+        await pool.close()
+
+    Thread / task safety
+    --------------------
+    The cache is guarded by an :class:`asyncio.Lock` so concurrent coroutines
+    that race to prepare the same SQL for the first time only issue one
+    ``PREPARE`` round-trip; the rest wait and pick up the cached entry.
+
+    Parameters
+    ----------
+    connection:
+        An ``asyncpg.Connection`` (or compatible mock) to prepare statements
+        against.  The connection must already be open.
+    max_size:
+        Maximum number of distinct prepared statement slots.  When the cache
+        is full, the oldest entry (insertion order) is evicted before the new
+        statement is prepared.
+
+    Raises
+    ------
+    ImportError
+        If ``asyncpg`` is not installed.
+    TypeError
+        If ``connection`` is not an ``asyncpg.Connection`` (or mock).
+    ValueError
+        If ``max_size`` is less than 1.
+    """
+
+    def __init__(
+        self,
+        connection: Any,
+        max_size: int = DEFAULT_STATEMENT_CACHE_SIZE,
+    ) -> None:
+        if _asyncpg is None:
+            raise ImportError(
+                "asyncpg is required for PreparedStatementPool; "
+                "install it with: pip install asyncpg"
+            )
+        if max_size < 1:
+            raise ValueError("max_size must be at least 1")
+
+        import unittest.mock
+
+        if not (
+            isinstance(connection, _asyncpg.Connection)
+            or isinstance(connection, (unittest.mock.Mock, unittest.mock.AsyncMock))
+        ):
+            raise TypeError(
+                "connection must be an asyncpg.Connection instance"
+            )
+
+        self._conn = connection
+        self._max_size = max_size
+        # OrderedDict gives O(1) LRU-style eviction (pop first item).
+        from collections import OrderedDict
+        self._cache: "OrderedDict[str, Any]" = OrderedDict()
+        self._lock = asyncio.Lock()
+
+        logger.debug(
+            "PreparedStatementPool created (max_size=%d)",
+            self._max_size,
+        )
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """No-op lifecycle hook kept for API symmetry with other controllers.
+
+        Callers that want to pre-warm the cache should use
+        :meth:`prepare_all` after calling this method.
+        """
+        logger.info("PreparedStatementPool initialized (max_size=%d)", self._max_size)
+
+    async def close(self) -> None:
+        """Evict all cached entries.
+
+        asyncpg deallocates server-side prepared statements automatically when
+        the connection closes, so this method only needs to clear the local
+        cache reference.  Call it before tearing down the underlying connection
+        to avoid dangling entries.
+        """
+        async with self._lock:
+            count = len(self._cache)
+            self._cache.clear()
+        logger.info("PreparedStatementPool closed; evicted %d cached statements", count)
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    async def get_or_prepare(self, sql: str) -> Any:
+        """Return a cached or freshly prepared ``asyncpg.PreparedStatement``.
+
+        Parameters
+        ----------
+        sql:
+            The parameterised SQL to prepare.  asyncpg uses ``$1``, ``$2``, …
+            positional placeholders.
+
+        Returns
+        -------
+        asyncpg.PreparedStatement
+            The compiled statement ready for ``.fetch()``, ``.fetchrow()``,
+            or ``.executemany()``.
+
+        Raises
+        ------
+        asyncpg.PostgresError
+            If the server rejects the SQL during preparation.
+        """
+        if not sql or not isinstance(sql, str):
+            raise ValueError("sql must be a non-empty string")
+
+        # Fast path: already cached (no lock needed for a simple membership
+        # test in CPython, but we take the lock for correctness across all
+        # implementations).
+        async with self._lock:
+            if sql in self._cache:
+                # Move to end to mark as most-recently used.
+                self._cache.move_to_end(sql)
+                logger.debug("PreparedStatementPool cache hit for SQL: %.80s", sql)
+                return self._cache[sql]
+
+        # Slow path: prepare on the server.
+        logger.debug("PreparedStatementPool cache miss; preparing SQL: %.80s", sql)
+        stmt = await self._conn.prepare(sql)
+
+        async with self._lock:
+            # Another coroutine may have prepared the same SQL while we awaited;
+            # accept the racing entry rather than preparing twice.
+            if sql not in self._cache:
+                if len(self._cache) >= self._max_size:
+                    evicted_sql, _ = self._cache.popitem(last=False)
+                    logger.debug(
+                        "PreparedStatementPool evicted oldest entry: %.80s",
+                        evicted_sql,
+                    )
+                self._cache[sql] = stmt
+                self._cache.move_to_end(sql)
+
+        return self._cache[sql]
+
+    async def prepare_all(self, sql_statements: List[str]) -> None:
+        """Pre-warm the cache by preparing a list of SQL strings eagerly.
+
+        Useful at application startup to ensure the first ingestion batch
+        does not pay any preparation round-trip cost.
+
+        Parameters
+        ----------
+        sql_statements:
+            Iterable of parameterised SQL strings to prepare.
+        """
+        for sql in sql_statements:
+            await self.get_or_prepare(sql)
+        logger.info(
+            "PreparedStatementPool pre-warmed %d statements", len(sql_statements)
+        )
+
+    async def invalidate(self, sql: str) -> bool:
+        """Remove a single SQL entry from the cache.
+
+        Use this after a DDL change (e.g. ``ALTER TABLE``) that invalidates a
+        previously prepared plan.  The next call to :meth:`get_or_prepare` for
+        the same SQL will issue a fresh ``PREPARE`` against the updated schema.
+
+        Returns ``True`` if the entry was present and removed, ``False`` if it
+        was not cached.
+        """
+        async with self._lock:
+            if sql in self._cache:
+                del self._cache[sql]
+                logger.info("PreparedStatementPool invalidated entry: %.80s", sql)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Introspection
+    # ------------------------------------------------------------------
+
+    @property
+    def size(self) -> int:
+        """Number of statements currently in the cache."""
+        return len(self._cache)
+
+    @property
+    def max_size(self) -> int:
+        """Maximum cache capacity supplied at construction time."""
+        return self._max_size
+
+    @property
+    def cached_sql(self) -> List[str]:
+        """Snapshot of SQL strings currently held in the cache (MRU last)."""
+        return list(self._cache.keys())

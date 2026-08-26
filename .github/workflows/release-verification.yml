@@ -1,0 +1,49 @@
+name: Release Verification (E2E)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  python-e2e:
+    name: Python E2E (5 layers + load)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run end-to-end integration suite
+        run: python -m pytest tests/integration/e2e -q -p no:cacheprovider
+      - name: Gate on release readiness
+        run: python scripts/generate_release_report.py check
+      - name: Upload release report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-readiness-python
+          path: reports/release-readiness.*
+
+  ts-e2e:
+    name: TypeScript E2E (Keeper + load)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run TypeScript E2E suite
+        run: npm run test:e2e
+      - name: Upload release report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-readiness-ts
+          path: reports/release-readiness.ts.*

@@ -1,4 +1,4 @@
-import axios, { AxiosError } from "axios";
+import { httpClient } from "../lib/httpClient.js";
 import { withRetry } from "../utils/retryUtil.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../utils/httpTimeout.js";
 
@@ -19,6 +19,9 @@ export enum AlertType {
   HEALTH_CHECK_FAILURE = "health_check_failure",
   SECURITY_ALERT = "security_alert",
   INVARIANT_BREACH = "invariant_breach",
+  POOL_RESERVE_DEVIATION = "pool_reserve_deviation",
+  REDIS_MEMORY_THRESHOLD = "redis_memory_threshold",
+  VAULT_LIQUIDATION_RISK = "vault_liquidation_risk",
 }
 
 export interface SystemAlert {
@@ -311,7 +314,7 @@ export class NotificationService {
     try {
       await withRetry(
         () =>
-          axios.post(this.config.discordWebhookUrl!, payload, {
+          httpClient.post(this.config.discordWebhookUrl!, payload, {
             headers: { "Content-Type": "application/json" },
             timeout: this.config.timeoutMs,
           }),
@@ -346,7 +349,7 @@ export class NotificationService {
     try {
       await withRetry(
         () =>
-          axios.post(this.config.slackWebhookUrl!, payload, {
+          httpClient.post(this.config.slackWebhookUrl!, payload, {
             headers: { "Content-Type": "application/json" },
             timeout: this.config.timeoutMs,
           }),

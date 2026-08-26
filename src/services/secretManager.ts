@@ -8,6 +8,7 @@ export type ReloadTrigger = "admin-endpoint" | "file-watcher" | "startup";
 // Module-level private state
 let reloadCount: number = 0;
 const KEY_SLOT = "stellar-secret";
+let initialized = false;
 
 function shouldFailFast(): boolean {
   return process.env.NODE_ENV === "production";
@@ -31,9 +32,12 @@ function validateKey(candidate: string): void {
 
 /**
  * Initialization function — strict validation on startup.
- * Called at the end of this module.
+ * Called lazily when getSecretKey() or getPublicKey() is first invoked.
  */
 function init(): void {
+  if (initialized) return;
+  initialized = true;
+
   const isKms = process.env.SIGNER_BACKEND === "kms";
   if (isKms) {
     logger.info("[SecretManager] Running in KMS mode. Local keys bypassed.");
@@ -90,9 +94,6 @@ function init(): void {
   }
 }
 
-// Run initialization
-init();
-
 /**
  * Returns the currently active Stellar secret key from the vault.
  */
@@ -100,6 +101,9 @@ export function getSecretKey(): string {
   if (process.env.SIGNER_BACKEND === "kms") {
     throw new Error("Secret key is not available in KMS mode");
   }
+
+  // Ensure the vault is populated before the first retrieval (lazy init).
+  init();
 
   const context = vault.openContext("secret-retrieval");
   try {

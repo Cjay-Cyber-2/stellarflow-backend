@@ -7,6 +7,8 @@ import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
 import { logger } from "../utils/logger";
 import { parseBase64ToPositiveNumber } from "../serialization/helpers.js";
+import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
+import { getCacheWarmingWorker } from "./cacheWarmingWorker";
 
 dotenv.config();
 
@@ -82,6 +84,14 @@ export class SorobanEventListener {
     this.startPollingTimer();
   }
 
+  restart(pollIntervalMs?: number): void {
+    this.stop();
+    if (pollIntervalMs !== undefined) this.pollIntervalMs = pollIntervalMs;
+    this.start().catch((err) =>
+      logger.error("[EventListener] Restart failed:", err),
+    );
+  }
+
   private startPollingTimer(): void {
     this.pollTimer = setInterval(() => {
       this.pollTransactions().catch((err) => {
@@ -118,6 +128,12 @@ export class SorobanEventListener {
 
           // Broadcast all successful updates (Essential or Metric) to UI
           broadcastToSessions("price_update", price);
+
+          // Trigger cache warming on new price update
+          const cacheWarmingWorker = getCacheWarmingWorker();
+          cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
+            logger.error("[EventListener] Cache warming failed:", err);
+          });
         } catch (err) {
           logger.error("[Worker] Failed to process queued price:", err);
         }
@@ -131,6 +147,8 @@ export class SorobanEventListener {
   private async pollTransactions(): Promise<void> {
     try {
       this.server = stellarProvider.getServer();
+
+      await this.pollOrderFilledEvents();
 
       const transactions = await this.server
         .transactions()
@@ -169,6 +187,24 @@ export class SorobanEventListener {
       if (error instanceof Error && error.message.includes("status code 404"))
         return;
       throw error;
+    }
+  }
+
+  private async pollOrderFilledEvents(): Promise<void> {
+    const contractId = process.env.CONTRACT_ID?.trim();
+    if (!contractId) return;
+
+    const rpc = stellarProvider.getRpcServer() as any;
+    const response = await rpc.getEvents({
+      startLedger: Math.max(1, this.lastProcessedLedger),
+      filters: [{ type: "contract", contractIds: [contractId] }],
+      limit: 100,
+    });
+
+    for (const event of response.events ?? []) {
+      await verifyOrderFilledEvent(event);
+      const ledger = Number(event.ledger ?? 0);
+      if (ledger > this.lastProcessedLedger) this.lastProcessedLedger = ledger;
     }
   }
 
@@ -220,14 +256,6 @@ export class SorobanEventListener {
     this.pollTimer = null;
     this.isRunning = false;
     logger.info("[EventListener] Stopped");
-  }
-
-  restart(pollIntervalMs?: number): void {
-    this.stop();
-    if (pollIntervalMs !== undefined) this.pollIntervalMs = pollIntervalMs;
-    this.start().catch((err) =>
-      logger.error("[EventListener] Restart failed:", err),
-    );
   }
 
   isActive(): boolean {

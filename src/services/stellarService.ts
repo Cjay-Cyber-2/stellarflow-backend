@@ -8,6 +8,9 @@ import {
   Horizon,
   xdr,
   Account,
+  Contract,
+  nativeToScVal,
+  rpc as SorobanRpc,
 } from "@stellar/stellar-sdk";
 import stellarProvider from "../lib/stellarProvider";
 import {
@@ -123,6 +126,49 @@ export class StellarService {
       { hash: result.hash, url: txURL },
     );
     return result.hash;
+  }
+
+  async executeGovernanceProposal(
+    contractId: string,
+    proposalId: string,
+  ): Promise<string> {
+    await assertSigningAllowed();
+    const publicKey = await this.getPublicKey();
+    const sequence = await sequenceManager.getNextSequence(publicKey);
+    const account = new Account(publicKey, sequence);
+    const transaction = new TransactionBuilder(account, {
+      fee: await this.getRecommendedFee(),
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(
+        new Contract(contractId).call(
+          "execute",
+          nativeToScVal(BigInt(proposalId), { type: "u64" }),
+        ),
+      )
+      .setTimeout(this.TRANSACTION_TIME_BOUND_SECONDS)
+      .build();
+
+    const rpcServer = stellarProvider.getRpcServer();
+    const simulation = await rpcServer.simulateTransaction(transaction);
+    const prepared = SorobanRpc.assembleTransaction(transaction, simulation).build();
+    const signature = await signer.sign(prepared.hash());
+    const keypair = Keypair.fromPublicKey(publicKey);
+    prepared.signatures.push(
+      new xdr.DecoratedSignature({
+        hint: keypair.signatureHint(),
+        signature,
+      }),
+    );
+
+    const submitted = await rpcServer.sendTransaction(prepared);
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const result = await rpcServer.getTransaction(submitted.hash);
+      if (result.status === "SUCCESS") return submitted.hash;
+      if (result.status === "FAILED") throw new Error(`Governance proposal ${proposalId} failed`);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+    throw new Error(`Governance proposal ${proposalId} confirmation timed out`);
   }
 
   /**

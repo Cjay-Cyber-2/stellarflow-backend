@@ -12,4 +12,12 @@ prisma/migrations/
 docs/
 backups/
 .env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
 
+
+# Generated release-readiness reports
+reports/

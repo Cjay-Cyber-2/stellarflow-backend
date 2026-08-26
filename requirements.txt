@@ -1,0 +1,43 @@
+# Python dependencies for the StellarFlow ingestion pipeline
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# pysimdjson provides SIMD-accelerated JSON parsing (SSE4.2 / AVX2 / AVX-512).
+# The ingestion layer uses it as a high-throughput drop-in for json.loads().
+# If a pre-built wheel is unavailable for your platform, pip will compile from
+# source — a C++11-capable compiler is required in that case.
+pysimdjson>=5.0.2
+
+# Async HTTP client used by rest_fallback.py and LocalVaultProvider (Issue #718)
+aiohttp>=3.9.0
+
+# Async PostgreSQL driver for high-performance bulk inserts
+asyncpg>=0.28.0
+
+# Distributed workers for heavy analytics jobs
+celery[rabbitmq]>=5.4.0,<6.0.0
+flower>=2.0.1
+
+# MsgPack binary serialisation with C-extensions for Redis cache payloads
+msgpack>=1.0.0
+
+# ---------------------------------------------------------------------------
+# Issue #717 — Dead-Letter Queue (app/queue/dlq.py)
+# ---------------------------------------------------------------------------
+
+# Async Redis client for the DLQ backend
+redis[asyncio]>=5.0.0
+
+# ---------------------------------------------------------------------------
+# Issue #718 — KMS Key Rotation (app/security/kms.py)
+# ---------------------------------------------------------------------------
+
+# AWS SDK — required by AwsKmsProvider
+boto3>=1.34.0
+
+# Ed25519 signature verification for SignedEnvelope (preferred over cryptography)
+PyNaCl>=1.5.0
+
+# Alternative Ed25519 / ECDSA verification backend (fallback if PyNaCl absent)
+cryptography>=42.0.0

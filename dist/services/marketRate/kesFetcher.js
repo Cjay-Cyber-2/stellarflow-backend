@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
 import { withRetry } from "../../utils/retryUtil";
 import { createFetcherLogger } from "../../utils/logger";
@@ -13,11 +13,8 @@ export class KESRateFetcher {
     }
     async fetchRate() {
         try {
-            const response = await withRetry(() => axios.get(this.coinGeckoUrl, {
+            const response = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                 timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                headers: {
-                    "User-Agent": "StellarFlow-Oracle/1.0",
-                },
             }), { maxRetries: 3, retryDelay: 1000 });
             const stellarPrice = response.data.stellar;
             if (stellarPrice &&

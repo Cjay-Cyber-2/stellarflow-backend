@@ -7,6 +7,7 @@ export const CACHE_CONFIG = {
     assets: 1800, // 30 minutes
     derivedAssets: 300, // 5 minutes
     status: 60, // 1 minute
+    feeEstimate: 30, // 30 seconds (fees change rapidly)
   },
   l1: {
     enabled: true,
@@ -47,5 +48,8 @@ export const CACHE_KEYS = {
   },
   status: {
     system: () => "status:system",
+  },
+  feeEstimate: {
+    current: () => "fee-estimate:current",
   },
 } as const;

@@ -6,6 +6,10 @@ subsequent requests use a timeout derived from recent latency observations via
 an exponential moving average (EMA) so that the window adapts to regional
 network conditions without ever dropping below a safety floor.
 
+TCP socket buffers (SO_RCVBUF, SO_SNDBUF) are also tuned dynamically based on
+the same EMA latency estimate using the bandwidth-delay product (BDP) heuristic:
+larger buffers for high-latency links, smaller for low-latency links.
+
 Timeout handling contract
 -------------------------
 * ``httpx.TimeoutException`` / ``asyncio.TimeoutError`` are caught,
@@ -15,17 +19,31 @@ Timeout handling contract
   propagate unchanged — this module never swallows them.
 * Connections are always returned to the pool automatically — httpx manages
   this transparently via its internal connection pool.
+
+Multi-interface failover
+-------------------------
+* ``MultiInterfaceClient`` wraps ``httpx.AsyncClient`` with health-check
+  monitoring and automatic failover between primary and secondary network
+  interfaces.
+* On primary failure, traffic is rerouted through the secondary interface.
+* Health checks run periodically against a configurable endpoint.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
+import ssl
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from enum import Enum, auto
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import httpx
+from httpx import AsyncHTTPTransport
 
 from src.analytics.ema import RollingEMA
 
@@ -54,6 +72,271 @@ _EMA_MULTIPLIER: float = 3.0
 _TIMEOUT_LABEL_MS: int = int(REQUEST_TIMEOUT_S * 1000)
 
 # ---------------------------------------------------------------------------
+# Multi-interface networking & failover
+# ---------------------------------------------------------------------------
+
+
+class InterfaceState(Enum):
+    """Health state of a network interface."""
+    HEALTHY = auto()
+    DEGRADED = auto()
+    DOWN = auto()
+
+
+@dataclass
+class InterfaceConfig:
+    """Configuration for a network interface.
+
+    Parameters
+    ----------
+    name:
+        Human-readable label (e.g. ``"primary"``, ``"secondary"``).
+    bind_ip:
+        Optional IP address to bind sockets to.  When ``None`` the OS
+        default interface is used.
+    description:
+        Optional description for logging / observability.
+    """
+    name: str
+    bind_ip: Optional[str] = None
+    description: str = ""
+
+
+@dataclass
+class FailoverConfig:
+    """Configuration for automatic interface failover.
+
+    Parameters
+    ----------
+    primary:
+        The primary network interface.
+    secondary:
+        The secondary (backup) network interface.
+    health_check_url:
+        URL used for periodic health checks (HEAD request).
+    check_interval_s:
+        Seconds between health checks when the primary is healthy.
+    check_timeout_s:
+        Timeout for each health check request.
+    retry_count:
+        Number of times to retry a failed request on the secondary
+        before giving up.
+    failure_threshold:
+        Consecutive health-check failures required to mark an interface DOWN.
+    """
+    primary: InterfaceConfig
+    secondary: InterfaceConfig
+    health_check_url: str = "https://example.com"
+    check_interval_s: float = 30.0
+    check_timeout_s: float = 5.0
+    retry_count: int = 2
+    failure_threshold: int = 3
+
+
+class MultiInterfaceClient:
+    """Async HTTP client with automatic network-interface failover.
+
+    Wraps two ``httpx.AsyncClient`` sessions (one per interface) and
+    monitors primary health.  On primary failure all new requests are
+    routed through the secondary interface.  Periodic health checks
+    automatically restore the primary when it recovers.
+
+    Parameters
+    ----------
+    config:
+        Failover configuration including primary/secondary interfaces.
+    session_kwargs:
+        Additional keyword arguments forwarded to ``make_session``.
+    """
+
+    def __init__(
+        self,
+        config: FailoverConfig,
+        **session_kwargs: Any,
+    ) -> None:
+        self.config = config
+        self._session_kwargs = session_kwargs
+
+        self._primary_state: InterfaceState = InterfaceState.HEALTHY
+        self._secondary_state: InterfaceState = InterfaceState.HEALTHY
+        self._active_interface: str = config.primary.name
+        self._primary_failures: int = 0
+        self._secondary_failures: int = 0
+        self._primary_session: Optional[httpx.AsyncClient] = None
+        self._secondary_session: Optional[httpx.AsyncClient] = None
+        self._health_task: Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
+        self._started: bool = False
+
+        logger.info(
+            "[MultiInterfaceClient] Initialised | primary=%s secondary=%s "
+            "health_url=%s check_interval=%.1fs",
+            config.primary.name, config.secondary.name,
+            config.health_check_url, config.check_interval_s,
+        )
+
+    async def _build_primary_session(self) -> httpx.AsyncClient:
+        """Create an httpx client bound to the primary interface."""
+        kwargs = dict(self._session_kwargs)
+        if self.config.primary.bind_ip:
+            # Use our _KeepAliveTransport even for bound interfaces to keep TCP keep-alive and buffer tuning
+            transport = _KeepAliveTransport(
+                local_address=self.config.primary.bind_ip,
+            )
+            kwargs.setdefault("transport", transport)
+        return make_session(**kwargs)
+
+    async def _build_secondary_session(self) -> httpx.AsyncClient:
+        """Create an httpx client bound to the secondary interface."""
+        kwargs = dict(self._session_kwargs)
+        if self.config.secondary.bind_ip:
+            # Use our _KeepAliveTransport even for bound interfaces to keep TCP keep-alive and buffer tuning
+            transport = _KeepAliveTransport(
+                local_address=self.config.secondary.bind_ip,
+            )
+            kwargs.setdefault("transport", transport)
+        return make_session(**kwargs)
+
+    async def start(self) -> None:
+        """Open both sessions and begin health monitoring."""
+        async with self._lock:
+            if self._started:
+                return
+            self._primary_session = await self._build_primary_session()
+            self._secondary_session = await self._build_secondary_session()
+            self._started = True
+            self._health_task = asyncio.create_task(self._health_loop())
+            logger.info(
+                "[MultiInterfaceClient] Started | active=%s",
+                self._active_interface,
+            )
+
+    async def stop(self) -> None:
+        """Shut down health monitoring and close both sessions."""
+        if self._health_task:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            if self._primary_session:
+                await self._primary_session.aclose()
+            if self._secondary_session:
+                await self._secondary_session.aclose()
+            self._started = False
+        logger.info("[MultiInterfaceClient] Stopped")
+
+    async def _health_loop(self) -> None:
+        """Periodically check primary interface health."""
+        while True:
+            try:
+                await asyncio.sleep(self.config.check_interval_s)
+                await self._check_primary_health()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[MultiInterfaceClient] Health check error")
+
+    async def _check_primary_health(self) -> None:
+        """Perform a single health check on the primary interface."""
+        if not self._primary_session:
+            return
+        try:
+            timeout = httpx.Timeout(self.config.check_timeout_s)
+            await self._primary_session.head(
+                self.config.health_check_url,
+                timeout=timeout,
+            )
+            self._primary_failures = 0
+            if self._primary_state != InterfaceState.HEALTHY:
+                self._primary_state = InterfaceState.HEALTHY
+                self._active_interface = self.config.primary.name
+                logger.warning(
+                    "[MultiInterfaceClient] Primary restored | "
+                    "failing back to %s",
+                    self.config.primary.name,
+                )
+        except httpx.RequestError:
+            self._primary_failures += 1
+            logger.warning(
+                "[MultiInterfaceClient] Primary health check failed "
+                "(%d/%d)",
+                self._primary_failures,
+                self.config.failure_threshold,
+            )
+            if self._primary_failures >= self.config.failure_threshold:
+                old_state = self._primary_state
+                self._primary_state = InterfaceState.DOWN
+                if old_state != InterfaceState.DOWN:
+                    logger.error(
+                        "[MultiInterfaceClient] PRIMARY FAILURE | "
+                        "failing over to %s",
+                        self.config.secondary.name,
+                    )
+                    self._active_interface = self.config.secondary.name
+
+    @property
+    def active_session(self) -> Optional[httpx.AsyncClient]:
+        """Return the currently active httpx session based on interface state."""
+        if self._active_interface == self.config.primary.name:
+            return self._primary_session
+        return self._secondary_session
+
+    @property
+    def active_interface(self) -> str:
+        """Name of the currently active interface."""
+        return self._active_interface
+
+    @property
+    def primary_state(self) -> InterfaceState:
+        return self._primary_state
+
+    @property
+    def secondary_state(self) -> InterfaceState:
+        return self._secondary_state
+
+    async def request(
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Make an HTTP request with automatic failover retry.
+
+        On failure, retries the request on the secondary interface.
+        """
+        session = self.active_session
+        if session is None:
+            raise RuntimeError("[MultiInterfaceClient] Not started")
+
+        try:
+            return await session.request(method, url, **kwargs)
+        except httpx.RequestError as exc:
+            logger.warning(
+                "[MultiInterfaceClient] Request failed on %s | "
+                "retrying on %s | url=%s",
+                self._active_interface,
+                self.config.secondary.name,
+                url,
+            )
+            fallback = self._secondary_session
+            if fallback and fallback is not session:
+                for attempt in range(self.config.retry_count):
+                    try:
+                        return await fallback.request(method, url, **kwargs)
+                    except httpx.RequestError:
+                        if attempt == self.config.retry_count - 1:
+                            raise
+                        logger.warning(
+                            "[MultiInterfaceClient] Retry %d/%d failed "
+                            "on secondary | url=%s",
+                            attempt + 1, self.config.retry_count, url,
+                        )
+            raise exc
+
+
+# ---------------------------------------------------------------------------
 # Connection limits & HTTP/2
 # ---------------------------------------------------------------------------
 
@@ -64,6 +347,42 @@ _LIMITS = httpx.Limits(
     max_connections=1,
     max_keepalive_connections=1,
 )
+
+# ---------------------------------------------------------------------------
+# TCP buffer tuning constants
+# ---------------------------------------------------------------------------
+
+#: Assumed baseline bandwidth (bits per second) used in the BDP calculation.
+#: 10 Mbps is a conservative estimate for typical regional inter-datacenter
+#: links; operators may tune this via environment variable.
+_ASSUMED_BANDWIDTH_BPS: int = int(os.environ.get(
+    "HTTP_CLIENT_BANDWIDTH_BPS", "10_000_000"
+))
+
+#: Minimum receive buffer size in bytes.
+_MIN_RCVBUF: int = 65536  # 64 KB
+
+#: Maximum receive buffer size in bytes.
+_MAX_RCVBUF: int = 4_194_304  # 4 MB
+
+#: Minimum send buffer size in bytes.
+_MIN_SNDBUF: int = 65536  # 64 KB
+
+#: Maximum send buffer size in bytes.
+_MAX_SNDBUF: int = 2_097_152  # 2 MB
+
+# ---------------------------------------------------------------------------
+# Keep-alive constants (used by _KeepAliveTransport)
+# ---------------------------------------------------------------------------
+
+#: Idle time (seconds) before sending the first keep-alive probe.
+_KA_IDLE_S: int = 10
+
+#: Interval (seconds) between subsequent keep-alive probes.
+_KA_INTVL_S: int = 5
+
+#: Maximum number of keep-alive probes sent before dropping the connection.
+_KA_CNT: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +425,129 @@ class AdaptiveTimeout:
         t = self.timeout_s
         return httpx.Timeout(connect=t, read=t, write=t, pool=t)
 
+    @property
+    def rtt_estimate_s(self) -> float:
+        """Return the current EMA RTT estimate in seconds, or a default."""
+        if self._ema.value is None:
+            return REQUEST_TIMEOUT_S / _EMA_MULTIPLIER
+        return self._ema.value
+
 
 #: Module-level shared instance – all helpers use this by default so the EMA
 #: accumulates across every outbound request in the process.
 _adaptive_timeout: AdaptiveTimeout = AdaptiveTimeout()
+
+
+# ---------------------------------------------------------------------------
+# Buffer size computation
+# ---------------------------------------------------------------------------
+
+
+def compute_buffer_size(rtt_s: float) -> Tuple[int, int]:
+    """Compute optimal TCP send/receive buffer sizes using BDP.
+
+    The bandwidth-delay product (BDP) is ``(bandwidth in bytes/s) × RTT``.
+    The receive buffer is clamped to ``[_MIN_RCVBUF, _MAX_RCVBUF]``; the send
+    buffer is half the receive size, clamped to ``[_MIN_SNDBUF, _MAX_SNDBUF]``.
+
+    Parameters
+    ----------
+    rtt_s:
+        Round-trip time estimate in seconds.
+
+    Returns
+    -------
+    Tuple[int, int]
+        ``(recv_buffer_size, send_buffer_size)`` in bytes.
+    """
+    bandwidth_bytes_s = _ASSUMED_BANDWIDTH_BPS // 8
+    bdp = int(bandwidth_bytes_s * rtt_s)
+    rcvbuf = max(_MIN_RCVBUF, min(bdp, _MAX_RCVBUF))
+    sndbuf = max(_MIN_SNDBUF, min(bdp // 2, _MAX_SNDBUF))
+    return rcvbuf, sndbuf
+
+
+# ---------------------------------------------------------------------------
+# Socket helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_keepalive(sock: socket.socket) -> None:
+    """Enable TCP keep-alive on *sock* with the module-level constants."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KA_IDLE_S)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _KA_INTVL_S)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KA_CNT)
+    except OSError as exc:
+        logger.warning("Failed to set TCP keep-alive: %s", exc)
+
+
+def _apply_tcp_buffers(sock: socket.socket, rtt_s: float) -> None:
+    """Set SO_RCVBUF and SO_SNDBUF on *sock* based on the given RTT.
+
+    Parameters
+    ----------
+    sock:
+        The connected TCP socket to tune.
+    rtt_s:
+        Round-trip time estimate in seconds used to compute buffer sizes.
+    """
+    try:
+        rcvbuf, sndbuf = compute_buffer_size(rtt_s)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+        logger.debug(
+            "TCP buffers tuned | rcvbuf=%d | sndbuf=%d | rtt_s=%.3f",
+            rcvbuf,
+            sndbuf,
+            rtt_s,
+        )
+    except OSError as exc:
+        logger.warning("Failed to set TCP buffer sizes: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Custom transport with keep-alive + buffer tuning
+# ---------------------------------------------------------------------------
+
+
+class _KeepAliveTransport(AsyncHTTPTransport):
+    """An ``httpx.AsyncHTTPTransport`` that applies keep-alive and dynamic
+    TCP buffer sizing to every newly-created socket.
+
+    Buffer sizes are derived from the module-level ``_adaptive_timeout``
+    RTT estimate so they respond to the same dynamic network conditions used
+    for timeout tuning.
+    """
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        # Let the parent transport do the actual I/O, then patch the socket.
+        response = await super().handle_async_request(request)
+        stream = response.stream
+        if stream is None:
+            return response
+
+        try:
+            conn = stream._connection
+        except AttributeError:
+            return response
+
+        try:
+            sock: Optional[socket.socket] = conn.network_stream.get_extra_info("socket")
+        except AttributeError:
+            sock = None
+
+        if sock is not None:
+            _apply_keepalive(sock)
+            if _adaptive_timeout.rtt_estimate_s > 0:
+                _apply_tcp_buffers(sock, _adaptive_timeout.rtt_estimate_s)
+
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +593,17 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     updated per-request inside the fetch helpers — the session timeout serves
     only as a safety net for any request that bypasses the helpers.
 
+    ALPN (Application-Layer Protocol Negotiation) is configured to enable
+    automatic HTTP/2 protocol negotiation with supporting remote servers. The
+    client will negotiate HTTP/2 frame multiplexing when the server supports it,
+    falling back to HTTP/1.1 gracefully when HTTP/2 is not available.
+
+    TLS session resumption (session tickets) is enabled to allow abbreviated
+    handshakes on reconnection, reducing CPU usage and latency.
+
+    Uses the custom ``_KeepAliveTransport`` which applies TCP keep-alive and
+    dynamic buffer tuning to all new sockets.
+
     Parameters
     ----------
     **kwargs:
@@ -169,6 +618,32 @@ def make_session(**kwargs: Any) -> httpx.AsyncClient:
     kwargs["timeout"] = _adaptive_timeout.as_httpx_timeout()
     kwargs["limits"] = _LIMITS
     kwargs.setdefault("http2", True)
+    
+    # Create shared SSL context with TLS session resumption enabled
+    ssl_context = ssl.create_default_context()
+    # Enable client-side TLS session caching to support session resumption
+    ssl_context.set_session_cache_mode(ssl.SESS_CACHE_CLIENT)
+    # Ensure session tickets are enabled (don't set OP_NO_TICKET which disables them)
+    ssl_context.options &= ~ssl.OP_NO_TICKET
+    
+    # If a transport is already provided (e.g., with local_address set for interface binding),
+    # update its SSL context to use our TLS resumption-enabled context
+    if "transport" in kwargs:
+        transport = kwargs["transport"]
+        if hasattr(transport, "_ssl_context"):
+            transport._ssl_context = ssl_context
+    else:
+        # Use our custom keep-alive transport by default, with our SSL context
+        kwargs["transport"] = _KeepAliveTransport(ssl_context=ssl_context)
+    
+    # Explicitly configure ALPN for HTTP/2 protocol negotiation
+    # httpx handles ALPN automatically when http2=True, but we ensure
+    # the verification is logged for monitoring purposes
+    if kwargs.get("http2"):
+        logger.debug("[HttpClient] HTTP/2 with ALPN protocol negotiation enabled")
+    
+    logger.debug("[HttpClient] TLS session resumption enabled for reduced handshake latency")
+    
     return httpx.AsyncClient(**kwargs)
 
 
@@ -372,7 +847,7 @@ def _normalise_metric_request(
     return url, dict(params)
 
 
-def _log_timeout(url: str) -> None:
+def _log_timeout(url: str, timeout_s: float) -> None:
     """Emit a structured warning for a timed-out request.
 
     Always logs:
@@ -400,7 +875,12 @@ __all__ = [
     "REQUEST_TIMEOUT_S",
     "AdaptiveTimeout",
     "FetchTimeoutError",
+    "InterfaceConfig",
+    "InterfaceState",
+    "FailoverConfig",
+    "MultiInterfaceClient",
     "MetricRequest",
+    "compute_buffer_size",
     "make_session",
     "fetch_json",
     "fetch_json_many",

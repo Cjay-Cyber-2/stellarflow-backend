@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout";
 import { MarketRateFetcher, MarketRate, RawApiResponse } from "./types";
 import { withRetry } from "../../utils/retryUtil";
@@ -20,11 +20,8 @@ export class GHSRateFetcher implements MarketRateFetcher {
     try {
       const response = await withRetry(
         () =>
-          axios.get(this.coinGeckoUrl, {
+          httpClient.get(this.coinGeckoUrl, {
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
-            headers: {
-              "User-Agent": "StellarFlow-Oracle/1.0",
-            },
           }),
         { maxRetries: 3, retryDelay: 1000 },
       );

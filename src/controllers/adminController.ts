@@ -316,7 +316,6 @@ export const deleteRelayerRegistry = async (req: Request, res: Response) => {
         ? { userAgent: adminInfo.userAgent }
         : {}),
     };
-
     await logAuditEvent(deleteAuditPayload);
 
     await prisma.relayerRegistry.delete({

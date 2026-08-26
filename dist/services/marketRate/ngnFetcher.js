@@ -1,4 +1,4 @@
-import axios from "axios";
+import { httpClient } from "../../lib/httpClient.js";
 import { OUTGOING_HTTP_TIMEOUT_MS } from "../../utils/httpTimeout.js";
 import { filterOutliers, } from "./types";
 import { withRetry } from "../../utils/retryUtil.js";
@@ -52,12 +52,11 @@ export class NGNRateFetcher {
         const headers = this.vtpassHeaders();
         if (!headers)
             return null;
-        const response = await withRetry(() => axios.get(`${this.vtpassBase()}/service-variations`, {
+        const response = await withRetry(() => httpClient.get(`${this.vtpassBase()}/service-variations`, {
             params: { serviceID: serviceId },
             timeout: OUTGOING_HTTP_TIMEOUT_MS,
             headers: {
                 ...headers,
-                "User-Agent": "StellarFlow-Oracle/1.0",
             },
         }), { maxRetries: 3, retryDelay: 1000 });
         if (response.data.response_description !== "000") {
@@ -90,11 +89,8 @@ export class NGNRateFetcher {
                     payload: vt.rawResponse,
                     receivedAt: new Date(),
                 });
-                const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
+                const coinGeckoResponse = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                     timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                    headers: {
-                        "User-Agent": "StellarFlow-Oracle/1.0",
-                    },
                 }), { maxRetries: 3, retryDelay: 1000 });
                 rawResponses.push({
                     provider: "CoinGecko",
@@ -117,14 +113,13 @@ export class NGNRateFetcher {
             }
         }
         catch (error) {
-            this.logger.debug("VTpass + CoinGecko XLM/USD failed", { error: error instanceof Error ? error.message : error });
+            this.logger.debug("VTpass + CoinGecko XLM/USD failed", {
+                error: error instanceof Error ? error.message : error,
+            });
         }
         try {
-            const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
+            const coinGeckoResponse = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                 timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                headers: {
-                    "User-Agent": "StellarFlow-Oracle/1.0",
-                },
             }), { maxRetries: 3, retryDelay: 1000 });
             rawResponses.push({
                 provider: "CoinGecko",
@@ -147,14 +142,13 @@ export class NGNRateFetcher {
             }
         }
         catch (error) {
-            this.logger.debug("CoinGecko direct NGN failed", { error: error instanceof Error ? error.message : error });
+            this.logger.debug("CoinGecko direct NGN failed", {
+                error: error instanceof Error ? error.message : error,
+            });
         }
         try {
-            const coinGeckoResponse = await withRetry(() => axios.get(this.coinGeckoUrl, {
+            const coinGeckoResponse = await withRetry(() => httpClient.get(this.coinGeckoUrl, {
                 timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                headers: {
-                    "User-Agent": "StellarFlow-Oracle/1.0",
-                },
             }), { maxRetries: 3, retryDelay: 1000 });
             rawResponses.push({
                 provider: "CoinGecko",
@@ -166,11 +160,8 @@ export class NGNRateFetcher {
             if (stellarPrice &&
                 typeof stellarPrice.usd === "number" &&
                 stellarPrice.usd > 0) {
-                const fxResponse = await withRetry(() => axios.get(this.usdToNgnUrl, {
+                const fxResponse = await withRetry(() => httpClient.get(this.usdToNgnUrl, {
                     timeout: OUTGOING_HTTP_TIMEOUT_MS,
-                    headers: {
-                        "User-Agent": "StellarFlow-Oracle/1.0",
-                    },
                 }), { maxRetries: 3, retryDelay: 1000 });
                 rawResponses.push({
                     provider: "ExchangeRate API",
@@ -197,11 +188,16 @@ export class NGNRateFetcher {
             }
         }
         catch (error) {
-            this.logger.debug("CoinGecko + ExchangeRate API (NGN) failed", { error: error instanceof Error ? error.message : error });
+            this.logger.debug("CoinGecko + ExchangeRate API (NGN) failed", {
+                error: error instanceof Error ? error.message : error,
+            });
         }
         if (prices.length === 0) {
             const error = new Error("All NGN rate sources failed");
-            this.logger.fetcherError(error, "All price sources failed - no rates obtained", { attemptedSources: 3, pricesLength: prices.length });
+            this.logger.fetcherError("All price sources failed - no rates obtained", {
+                attemptedSources: 3,
+                pricesLength: prices.length,
+            });
             throw error;
         }
         const rateValues = prices
@@ -212,10 +208,7 @@ export class NGNRateFetcher {
         const pricesToUse = filteredPrices.length >= 3 ? filteredPrices : prices;
         if (pricesToUse.length < 3) {
             const error = new Error(`Need at least 3 price sources for median calculation, got ${pricesToUse.length}`);
-            this.logger.fetcherError(error.message, {
-                attemptedSources: 3,
-                pricesLength: pricesToUse.length,
-            });
+            this.logger.fetcherError(`Need at least 3 price sources for median calculation, got ${pricesToUse.length}`, { attemptedSources: 3, pricesLength: pricesToUse.length });
             throw error;
         }
         const mostRecentTimestamp = pricesToUse.reduce((latest, p) => (p.timestamp > latest ? p.timestamp : latest), pricesToUse[0]?.timestamp ?? new Date());
@@ -231,7 +224,10 @@ export class NGNRateFetcher {
     async isHealthy() {
         try {
             const rate = await this.fetchRate();
-            this.logger.info("Health check passed", { rate: rate.rate, source: rate.source });
+            this.logger.info("Health check passed", {
+                rate: rate.rate,
+                source: rate.source,
+            });
             return rate.rate > 0;
         }
         catch (error) {

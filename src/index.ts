@@ -23,7 +23,7 @@ import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
-import { getRegionalHealthService } from "./services/regionalHealthService";
+import { ohlcvAggregator } from "./jobs/ohlcvJob";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
@@ -35,6 +35,10 @@ import { providerSecretRotationService } from "./services/providerSecretRotation
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { getCircuitBreakerService } from "./services/circuitBreakerService";
+import { governanceTimelockService } from "./services/governanceTimelockService";
+import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getRegionalHealthService } from "./services/regionalHealthService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
 // Load environment variables
 dotenv.config();
@@ -299,12 +303,14 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
   try {
     sorobanEventListener?.stop();
     multiSigSubmissionService.stop();
+    governanceTimelockService.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
+    storageRentBumpService.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -348,6 +354,9 @@ httpServer.listen(PORT, async () => {
   );
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
   console.log(`🔌 Socket.io ready for dashboard connections`);
+
+  redisOperationsWorker.start();
+  console.log(`🧹 Redis operations worker started`);
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
@@ -415,12 +424,27 @@ httpServer.listen(PORT, async () => {
     }
   }
 
+  try {
+    governanceTimelockService.start().catch((err: Error) => {
+      console.error("Failed to start governance timelock service:", err);
+    });
+    console.log("Governance timelock service started");
+  } catch (err) {
+    console.warn(
+      "Governance timelock service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   // Start background hourly average job
   try {
     hourlyAverageService.start().catch((err: Error) => {
-      console.error("Failed to start hourly average service:", err);
+      console.error(`Failed to start hourly average service:`, err);
     });
     console.log(`📊 Hourly average service started`);
+    // Start OHLCV aggregator
+    ohlcvAggregator.start();
+    console.log(`📈 OHLCV aggregator started`);
   } catch (err) {
     console.warn(
       "Hourly average service not started:",
@@ -469,6 +493,18 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Circuit breaker service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Start storage rent bump service
+  try {
+    storageRentBumpService.start().catch((err: Error) => {
+      console.error("Failed to start storage rent bump service:", err);
+    });
+  } catch (err) {
+    console.warn(
+      "Storage rent bump service not started:",
       err instanceof Error ? err.message : err,
     );
   }

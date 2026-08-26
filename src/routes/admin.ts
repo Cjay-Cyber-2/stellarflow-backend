@@ -9,16 +9,25 @@ import {
   renderPDF,
 } from "../services/reportService";
 import { updateSecretKey } from "../services/secretManager";
-import { appConfig, CONFIG_PATH } from "../config/configWatcher";
+import { getAppConfig, CONFIG_PATH } from "../config/configWatcher";
 import { refreshWhitelistCache } from "../middleware/rateLimitMiddleware";
-import { getRelayerRegistry, getRelayerRegistryById } from "../controllers/adminController";
+import {
+  getRelayerRegistry,
+  getRelayerRegistryById,
+} from "../controllers/adminController";
+import {
+  getDLQEntries,
+  getDLQStats,
+  replayDLQEntry,
+  replayAllDLQEntries,
+  getKmsRotationStatus,
+} from "../controllers/dlqController";
 
 const rateLimitUpdateSchema = Joi.object({
   windowMs: Joi.number().integer().min(1000).max(86400000).optional(),
   maxRequests: Joi.number().integer().min(1).max(100000).optional(),
   enabled: Joi.boolean().optional(),
 });
-
 
 const router = Router();
 
@@ -70,7 +79,12 @@ router.get("/reports/summary", async (req, res) => {
   const month = req.query.month as string | undefined;
 
   if (month && !/^\d{4}-\d{2}$/.test(month)) {
-    sendApiError(res, 400, "BAD_REQUEST", "Invalid month format. Use YYYY-MM (e.g. 2025-03).");
+    sendApiError(
+      res,
+      400,
+      "BAD_REQUEST",
+      "Invalid month format. Use YYYY-MM (e.g. 2025-03).",
+    );
     return;
   }
 
@@ -101,7 +115,20 @@ router.get("/reports/summary", async (req, res) => {
     res.send(renderHTML(summary));
   } catch (error) {
     console.error("[AdminReports] Failed to generate report:", error);
-    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", typeof (error instanceof Error ? error.message : "Failed to generate report") === "string" ? String(error instanceof Error ? error.message : "Failed to generate report") : undefined);
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Failed to generate report") === "string"
+        ? String(
+            error instanceof Error
+              ? error.message
+              : "Failed to generate report",
+          )
+        : undefined,
+    );
   }
 });
 
@@ -143,7 +170,12 @@ router.post("/reload-secret", async (req, res) => {
       const envKey =
         process.env.ORACLE_SECRET_KEY || process.env.SOROBAN_ADMIN_SECRET;
       if (!envKey) {
-        return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Failed to reload secret key");
+        return sendApiError(
+          res,
+          500,
+          "INTERNAL_SERVER_ERROR",
+          "Failed to reload secret key",
+        );
       }
       updateSecretKey(envKey, "admin-endpoint");
     }
@@ -159,10 +191,20 @@ router.post("/reload-secret", async (req, res) => {
       message === "Invalid Stellar secret key format";
 
     if (isValidationError) {
-      return sendApiError(res, 400, "BAD_REQUEST", typeof (message) === "string" ? String(message) : undefined);
+      return sendApiError(
+        res,
+        400,
+        "BAD_REQUEST",
+        typeof message === "string" ? String(message) : undefined,
+      );
     }
 
-    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Failed to reload secret key");
+    return sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      "Failed to reload secret key",
+    );
   }
 });
 
@@ -258,10 +300,7 @@ router.put("/rate-limit", async (req, res) => {
     });
   }
 
-  // Apply to in-memory config immediately (takes effect on next request)
-  Object.assign(appConfig.rateLimit, value);
-
-  // Persist to config.json so the change survives a restart
+  // Persist to config.json — watchConfig will reload and replace the frozen snapshot atomically
   try {
     let fileConfig: Record<string, unknown> = {};
     try {
@@ -282,18 +321,23 @@ router.put("/rate-limit", async (req, res) => {
     );
   } catch (err) {
     console.error("[AdminRateLimit] Failed to persist config.json:", err);
-    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Rate-limit updated in memory but failed to persist to disk");
+    return sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      "Rate-limit updated in memory but failed to persist to disk",
+    );
   }
 
   console.info(
     "[AdminRateLimit] Rate-limit config updated:",
-    appConfig.rateLimit,
+    getAppConfig().rateLimit,
   );
 
   return res.json({
     success: true,
     message: "Rate-limit configuration updated",
-    rateLimit: appConfig.rateLimit,
+    rateLimit: getAppConfig().rateLimit,
   });
 });
 
@@ -320,8 +364,164 @@ router.post("/rate-limit/whitelist/refresh", async (_req, res) => {
     });
   } catch (err) {
     console.error("[AdminRateLimit] Whitelist refresh failed:", err);
-    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "Failed to refresh whitelist cache");
+    return sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      "Failed to refresh whitelist cache",
+    );
   }
 });
+
+// ---------------------------------------------------------------------------
+// DLQ Inspection & Replay Endpoints (Issue #717)
+// ---------------------------------------------------------------------------
+
+/**
+ * @swagger
+ * /api/v1/admin/dlq:
+ *   get:
+ *     tags:
+ *       - Admin
+ *     summary: Inspect Dead-Letter Queue entries
+ *     description: >
+ *       Returns failed ingestion payload entries from the Redis Dead-Letter
+ *       Queue.  Supports optional pagination and filtering by failure status.
+ *     parameters:
+ *       - in: query
+ *         name: start
+ *         schema:
+ *           type: integer
+ *           default: 0
+ *         description: Redis list start index (0-based).
+ *       - in: query
+ *         name: end
+ *         schema:
+ *           type: integer
+ *           default: 99
+ *         description: Redis list end index (inclusive).
+ *       - in: query
+ *         name: include_failed
+ *         schema:
+ *           type: boolean
+ *           default: true
+ *         description: Include permanently-failed entries when true.
+ *     responses:
+ *       '200':
+ *         description: DLQ entries and stats returned successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:
+ *                   type: boolean
+ *                 stats:
+ *                   type: object
+ *                 entries:
+ *                   type: array
+ *                 page:
+ *                   type: object
+ *       '500':
+ *         description: Internal server error
+ */
+router.get("/dlq", getDLQEntries);
+
+/**
+ * @swagger
+ * /api/v1/admin/dlq/stats:
+ *   get:
+ *     tags:
+ *       - Admin
+ *     summary: Get Dead-Letter Queue statistics
+ *     description: Returns aggregate counts and timestamp metadata for the DLQ.
+ *     responses:
+ *       '200':
+ *         description: DLQ stats retrieved successfully
+ *       '500':
+ *         description: Internal server error
+ */
+router.get("/dlq/stats", getDLQStats);
+
+/**
+ * @swagger
+ * /api/v1/admin/dlq/replay:
+ *   post:
+ *     tags:
+ *       - Admin
+ *     summary: Replay Dead-Letter Queue payloads
+ *     description: >
+ *       Manually re-enqueues one or all pending DLQ payloads back into
+ *       the ingestion pipeline.  Applies exponential backoff retry policy.
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               entry_id:
+ *                 type: integer
+ *                 description: >
+ *                   Replay a single entry by ID.  Omit to replay all
+ *                   pending entries.
+ *               purge_on_success:
+ *                 type: boolean
+ *                 description: Purge the DLQ after successful full replay.
+ *     responses:
+ *       '200':
+ *         description: Replay results returned
+ *       '404':
+ *         description: Entry not found (when entry_id is provided)
+ *       '500':
+ *         description: Internal server error
+ */
+router.post("/dlq/replay", replayDLQEntry);
+
+/**
+ * @swagger
+ * /api/v1/admin/dlq/replay/all:
+ *   post:
+ *     tags:
+ *       - Admin
+ *     summary: Replay all pending Dead-Letter Queue payloads
+ *     description: Shorthand to replay every pending DLQ entry without specifying entry_id.
+ *     requestBody:
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               purge_on_success:
+ *                 type: boolean
+ *                 default: false
+ *     responses:
+ *       '200':
+ *         description: Bulk replay results returned
+ *       '500':
+ *         description: Internal server error
+ */
+router.post("/dlq/replay/all", replayAllDLQEntries);
+
+// ---------------------------------------------------------------------------
+// KMS Key Rotation Status Endpoint (Issue #718)
+// ---------------------------------------------------------------------------
+
+/**
+ * @swagger
+ * /api/v1/admin/kms/rotation-status:
+ *   get:
+ *     tags:
+ *       - Admin
+ *     summary: Get KMS key rotation status
+ *     description: >
+ *       Returns the currently active key handle metadata and the last
+ *       N rotation events for observability and audit purposes.
+ *     responses:
+ *       '200':
+ *         description: KMS rotation status returned successfully
+ *       '500':
+ *         description: Internal server error
+ */
+router.get("/kms/rotation-status", getKmsRotationStatus);
 
 export default router;
