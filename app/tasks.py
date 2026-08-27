@@ -95,3 +95,45 @@ def aggregate_ledger_analytics(
     DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=lookback_hours)
     return asyncio.run(_aggregate(granularity, cutoff))
+
+
+async def _export_user_activity(user_id: str) -> dict[str, object]:
+    database_url = DatabaseTask._database_url
+    if not database_url:
+        raise RuntimeError("DATABASE_URL or DB_URL must be configured")
+
+    from app.services.user_activity_export import export_user_activity
+
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                rows = connection.cursor(
+                    """
+                    SELECT event_hash, ledger_sequence, tx_hash, event_type,
+                           created_at, payload
+                    FROM ledger_events
+                    WHERE payload->>'user_id' = $1
+                    ORDER BY created_at ASC, event_hash ASC
+                    """,
+                    user_id,
+                )
+                return await export_user_activity(rows, user_id)
+    finally:
+        await pool.close()
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.export_user_activity_csv",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def export_user_activity_csv(self: DatabaseTask, user_id: str) -> dict[str, object]:
+    """Create a user activity CSV in S3 and return its signed download URL."""
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+    return asyncio.run(_export_user_activity(user_id.strip()))
