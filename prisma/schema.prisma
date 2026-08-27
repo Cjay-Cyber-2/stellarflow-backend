@@ -311,3 +311,16 @@ model GovernanceProposal {
   @@index([contractId])
   @@index([actionType])
 }
+
+model VaultApyMetric {
+  id        String   @id @default(uuid())
+  vaultId   String   @db.VarChar(50)
+  ledgerSeq Int
+  sharePrice Decimal @db.Decimal(20, 10)
+  apy7d     Decimal? @db.Decimal(10, 6)
+  apy30d    Decimal? @db.Decimal(10, 6)
+  timestamp DateTime @db.Timestamp(3)
+  
+  @@unique([vaultId, ledgerSeq])
+  @@index([vaultId, timestamp])
+}
