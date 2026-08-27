@@ -293,66 +293,21 @@ model PoolLiquidity {
   @@index([poolId, timestamp])
 }
 
-// Issue: Anchor Multi-Asset Payment Routing & FX Conversion Service
-// Stores execution route parameters for Stellar asset -> fiat payout routing.
+model GovernanceProposal {
+  id              Int       @id @default(autoincrement())
+  proposalId      String    @unique
+  contractId      String
+  actionType      String?
+  actionData      String?
+  expiresAt       DateTime
+  status          String    @default("Queued")
+  transactionHash String?
+  executedAt      DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-model PaymentRoute {
-  id              String   @id @default(uuid())
-  senderCurrency  String   // e.g., "XLM", "USDC"
-  receiverCurrency String  // e.g., "NGN", "KES", "GHS"
-  sourceAsset     String   // Stellar asset issuer or native identifier
-  targetRail      String   // Partner payout rail identifier (e.g., "MOBILE_MONEY", "BANK_TRANSFER")
-  provider        String   // Liquidity provider name
-  rate            Decimal  @db.Decimal(20, 10)
-  fee             Decimal  @db.Decimal(20, 10)
-  estimatedAmount Decimal  @db.Decimal(20, 10)
-  slippageBps     Int      @default(0) // Slippage in basis points
-  liquidityPoolId String?  // Optional AMM pool identifier
-  status          String   @default("ACTIVE") // ACTIVE, PAUSED, RETIRED
-  priority        Int      @default(0) // Higher priority routes are preferred
-
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  fxQuotes        FxQuote[]
-
-  @@index([senderCurrency, receiverCurrency])
-  @@index([targetRail])
-  @@index([status, priority])
-  @@unique([senderCurrency, receiverCurrency, provider, targetRail])
-}
-
-// Stores FX conversion quotes verified against live feeds before locking.
-
-model FxQuote {
-  id              String   @id @default(uuid())
-  paymentRouteId  String
-  paymentRoute    PaymentRoute @relation(fields: [paymentRouteId], references: [id])
-
-  senderCurrency  String
-  receiverCurrency String
-  inputAmount     Decimal  @db.Decimal(20, 10)
-  outputAmount    Decimal  @db.Decimal(20, 10)
-  rate            Decimal  @db.Decimal(20, 10)
-  fee             Decimal  @db.Decimal(20, 10)
-  slippageBps     Int      @default(0)
-
-  // Live FX feed verification
-  liveFeedRate    Decimal  @db.Decimal(20, 10) // Rate fetched from live feed
-  feedSource      String   // Source of the live FX feed
-  feedTimestamp   DateTime // When the feed was fetched
-  rateDeviationBps Int     @default(0) // Deviation between locked rate and feed rate
-
-  status          String   @default("PENDING") // PENDING, LOCKED, EXPIRED, EXECUTED, FAILED
-  expiresAt       DateTime // Quote validity window
-  lockedAt        DateTime? // When the quote was locked
-  executedAt      DateTime? // When the quote was executed
-
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  @@index([paymentRouteId])
-  @@index([senderCurrency, receiverCurrency])
-  @@index([status])
-  @@index([expiresAt])
+  @@index([status, expiresAt])
+  @@index([contractId])
+  @@index([actionType])
 }
