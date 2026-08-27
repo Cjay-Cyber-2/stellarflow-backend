@@ -14,6 +14,7 @@
     "style:check": "lint-staged",
     "prepare": "husky",
     "test": "tsx test/marketRates.test.ts",
+    "test:liquidity": "tsx --test test/liquidityRebalancer.test.ts",
     "test:jest": "node --experimental-vm-modules ./node_modules/.bin/jest",
     "test:e2e": "node --experimental-vm-modules ./node_modules/.bin/jest --config jest.config.e2e.ts",
     "test:cache": "node --experimental-vm-modules ./node_modules/.bin/jest cache.test.ts",
