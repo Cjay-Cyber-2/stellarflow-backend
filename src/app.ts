@@ -210,6 +210,8 @@ app.use("/api/v1/zk", zkRouter);
 app.use("/api/v1/governance", governanceRouter);
 app.use("/api/v1/proof", proofRouter);
 
+app.use("/api/v1/governance", governanceRouter);
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
