@@ -293,31 +293,21 @@ model PoolLiquidity {
   @@index([poolId, timestamp])
 }
 
-enum RebalancingSwapStatus {
-  QUEUED
-  PROCESSING
-  COMPLETED
-  FAILED
-  CANCELLED
-}
+model GovernanceProposal {
+  id              Int       @id @default(autoincrement())
+  proposalId      String    @unique
+  contractId      String
+  actionType      String?
+  actionData      String?
+  expiresAt       DateTime
+  status          String    @default("Queued")
+  transactionHash String?
+  executedAt      DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 
-// Durable queue consumed by the component that executes cross-border swaps.
-model RebalancingSwap {
-  id                String                @id @default(cuid())
-  poolKey           String                @db.VarChar(100)
-  anchorAccount     String                @db.VarChar(56)
-  fromCurrency      String                @db.VarChar(12)
-  toCurrency        String                @db.VarChar(12)
-  fromAmount        Decimal               @db.Decimal(30, 7)
-  estimatedToAmount Decimal               @db.Decimal(30, 7)
-  normalizedVolume  Decimal               @db.Decimal(30, 7)
-  fromReserveRatio  Decimal               @db.Decimal(8, 7)
-  toReserveRatio    Decimal               @db.Decimal(8, 7)
-  status            RebalancingSwapStatus @default(QUEUED)
-  managerAccounts   String[]
-  createdAt         DateTime              @default(now())
-  updatedAt         DateTime              @updatedAt
-
-  @@index([poolKey, status])
-  @@index([status, createdAt])
+  @@index([status, expiresAt])
+  @@index([contractId])
+  @@index([actionType])
 }
