@@ -212,6 +212,9 @@ app.use("/api/v1/proof", proofRouter);
 
 app.use("/api/v1/governance", governanceRouter);
 
+// Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
+app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
