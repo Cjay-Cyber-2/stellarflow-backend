@@ -22,6 +22,12 @@ from app.services.proof_verification_engine import (
     verify_proof_batch,
 )
 
+try:
+    from app.routers import revenue as revenue_router
+    _HAS_REVENUE_ROUTER = True
+except ImportError:
+    _HAS_REVENUE_ROUTER = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -118,3 +124,6 @@ try:
     app.include_router(anchor_router, prefix="/webhook", tags=["Webhooks"])
 except ImportError:
     pass
+
+if _HAS_REVENUE_ROUTER:
+    app.include_router(revenue_router.router, tags=["Analytics"])
