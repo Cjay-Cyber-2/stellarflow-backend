@@ -293,58 +293,21 @@ model PoolLiquidity {
   @@index([poolId, timestamp])
 }
 
-// ─── Governance ────────────────────────────────────────────────────────────
-
-// Governance Proposal – formalises the table already used in GovernanceTimelockService
 model GovernanceProposal {
   id              Int       @id @default(autoincrement())
-  proposalId      String    @unique         // On-chain UUID / hash from Soroban
+  proposalId      String    @unique
   contractId      String
-  title           String?
-  description     String?
-  status          String    @default("Pending") // Pending | Queued | Executed | Rejected
-  transactionHash String?
+  actionType      String?
+  actionData      String?
   expiresAt       DateTime
+  status          String    @default("Queued")
+  transactionHash String?
   executedAt      DateTime?
+  cancelledAt     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
-  votes           GovernanceVote[]
-
   @@index([status, expiresAt])
   @@index([contractId])
-}
-
-// Governance Vote – one record per (voter account, proposal); written by SorobanEventListener
-model GovernanceVote {
-  id         Int                @id @default(autoincrement())
-  accountId  String                              // Stellar public key (G...) of the voter
-  proposalId String                              // FK → GovernanceProposal.proposalId
-  proposal   GovernanceProposal @relation(fields: [proposalId], references: [proposalId])
-  choice     String                              // "For" | "Against" | "Abstain"
-  weight     Decimal            @db.Decimal(20, 7) // Voting weight at time of vote (XLM)
-  txHash     String?                             // On-chain tx that cast the vote
-  votedAt    DateTime                            // Ledger timestamp of the vote
-  createdAt  DateTime           @default(now())
-
-  @@unique([accountId, proposalId])
-  @@index([accountId, votedAt])
-  @@index([proposalId])
-}
-
-// Governance Delegation – maps delegator → delegate (supports recursive chains)
-model GovernanceDelegation {
-  id        Int      @id @default(autoincrement())
-  delegator String                              // Stellar account that delegated power
-  delegate  String                              // Stellar account receiving power
-  weight    Decimal  @default(1) @db.Decimal(10, 7) // Multiplier (1.0 = full delegation)
-  isActive  Boolean  @default(true)
-  expiresAt DateTime?                           // null = permanent delegation
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([delegator, delegate])
-  @@index([delegator])
-  @@index([delegate])
-  @@index([isActive, expiresAt])
+  @@index([actionType])
 }

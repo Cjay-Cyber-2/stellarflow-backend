@@ -512,6 +512,29 @@ export class NotificationService {
     });
   }
 
+  public async sendGovernanceTimelockReadyAlert(details: {
+    proposalId: string;
+    contractId: string;
+    expiresAt: Date;
+    correlationId?: string;
+  }): Promise<boolean> {
+    return this.sendAlert({
+      type: AlertType.GOVERNANCE_TIMELOCK_READY,
+      severity: AlertSeverity.HIGH,
+      title: "⏰ GOVERNANCE TIMELOCK ACTION READY FOR EXECUTION",
+      message: `Queued governance proposal ${details.proposalId} has passed its timelock window and is ready to be executed on-chain.`,
+      details: {
+        proposal_id: details.proposalId,
+        contract_id: details.contractId,
+        timelock_expired_at: details.expiresAt.toISOString(),
+        action_required: "Execute the governance proposal transaction",
+      },
+      timestamp: new Date(),
+      service: "governance-timelock-service",
+      correlationId: details.correlationId,
+    });
+  }
+
   public clearRateLimit(alertKey?: string): void {
     if (alertKey) {
       this.lastSentTimes.delete(alertKey);
