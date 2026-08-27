@@ -215,6 +215,9 @@ app.use("/api/v1/governance", governanceRouter);
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
 app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
 
+// Governance: voter history, delegation tree – Issue #<this issue>
+app.use("/api/v1/governance", governanceRouter);
+
 app.get("/", (req, res) => {
   res.json({
     success: true,

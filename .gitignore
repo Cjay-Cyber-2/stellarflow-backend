@@ -21,3 +21,6 @@ __pycache__/
 
 # Generated release-readiness reports
 reports/
+
+# Rust / Soroban contract build artifacts
+contracts/target/

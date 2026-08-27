@@ -8,6 +8,7 @@ export const CACHE_CONFIG = {
     derivedAssets: 300, // 5 minutes
     status: 60, // 1 minute
     feeEstimate: 30, // 30 seconds (fees change rapidly)
+    governance: 300, // 5 minutes – voting data is near-realtime but not instant
   },
   l1: {
     enabled: true,
@@ -51,5 +52,8 @@ export const CACHE_KEYS = {
   },
   feeEstimate: {
     current: () => "fee-estimate:current",
+  },
+  governance: {
+    voter: (accountId: string) => `governance:voter:${accountId}`,
   },
 } as const;
