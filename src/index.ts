@@ -37,6 +37,9 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getCacheInvalidationManager } from "./cache/CacheInvalidationManager";
+import { getRegionalHealthService } from "./services/regionalHealthService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
 // Load environment variables
 dotenv.config();
@@ -309,6 +312,11 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    getCacheInvalidationManager()
+      .stop()
+      .catch((err) => {
+        console.error("Failed to stop cache invalidation manager:", err);
+      });
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -355,6 +363,10 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  // Issue #789 – Consume events:* streams to purge stale caches off-chain
+  getCacheInvalidationManager().start();
+  console.log(`♻️ Cache invalidation manager started`);
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
