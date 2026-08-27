@@ -269,6 +269,16 @@ app.get("/", (req, res) => {
           refreshWhitelist: "POST /api/admin/rate-limit/whitelist/refresh",
         },
       },
+      paymentRouting: {
+        findRoutes: "POST /api/v1/payment-routing/routes",
+        createRoute: "POST /api/v1/payment-routing/routes/create",
+        listRoutes: "GET /api/v1/payment-routing/routes",
+        getRoute: "GET /api/v1/payment-routing/routes/:id",
+        updateRouteStatus: "PATCH /api/v1/payment-routing/routes/:id/status",
+        requestQuote: "POST /api/v1/payment-routing/quotes",
+        lockQuote: "POST /api/v1/payment-routing/quotes/:id/lock",
+        getQuote: "GET /api/v1/payment-routing/quotes/:id",
+      },
     },
   });
 });
