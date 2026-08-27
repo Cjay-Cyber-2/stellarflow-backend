@@ -66,10 +66,20 @@ async function run() {
     }) as typeof axios.get;
 
     const rate = await fetcher.fetchRate();
+    const expectedRate = 300;
+
     assert.equal(rate.currency, "NGN");
-    // VTpass path: 1500 * 0.2 = 300; CoinGecko NGN: 300; FX path: 0.2 * 7500 = 1500 → median 300
-    assert.equal(rate.rate, 300);
-    assert.match(rate.source, /^Median of \d+ sources$/);
+    assert.equal(rate.rate, expectedRate);
+    assert.equal(
+      rate.source,
+      "Weighted average of 3 sources (outliers filtered)",
+    );
+    assert.equal(Array.isArray(rate.rawResponses), true);
+    assert.equal(rate.rawResponses?.length, 5);
+    assert.deepEqual(
+      rate.rawResponses?.map((entry) => entry.provider),
+      ["VTpass", "CoinGecko", "CoinGecko", "CoinGecko", "ExchangeRate API"],
+    );
   } finally {
     axios.get = originalGet;
     for (const [key, val] of Object.entries(savedEnv)) {

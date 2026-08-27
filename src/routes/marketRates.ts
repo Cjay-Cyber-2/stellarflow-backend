@@ -1,124 +1,255 @@
 import { Router } from "express";
+import { sendApiError } from "../lib/apiError.js";
+import { getRate, getAllRates } from "../controllers/marketRatesController";
 import { MarketRateService } from "../services/marketRate";
+import { cacheMiddleware, invalidateCache } from "../cache/CacheMiddleware";
+import { CACHE_CONFIG, CACHE_KEYS } from "../config/redis.config";
+import { isLockdownError } from "../state/appState";
+import { sanitizeMarketRateQuery } from "../middleware/payloadSanitizer";
 
-const router = Router();
 const marketRateService = new MarketRateService();
 
-// Get rate for specific currency
-router.get("/rate/:currency", async (req, res) => {
-  try {
-    const { currency } = req.params;
-    const result = await marketRateService.getRate(currency);
+const router = Router();
 
-    if (result.success) {
-      res.json({
-        success: true,
-        data: result.data,
-      });
-    } else {
-      res.status(404).json({
-        success: false,
-        error: result.error,
-      });
-    }
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
-  }
-});
+// Get rate for specific currency
+router.get(
+  "/rate/:currency",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: (req) =>
+      CACHE_KEYS.marketRates.single(req.params.currency as string),
+  }),
+  getRate,
+);
 
 // Get all available rates
-router.get("/rates", async (req, res) => {
-  try {
-    const results = await marketRateService.getAllRates();
+router.get(
+  "/rates",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.all(),
+  }),
+  getAllRates,
+);
 
-    const rates = results
-      .filter((result) => result.success)
-      .map((result) => result.data);
+// GET /api/v1/market-rates/latest
+router.get(
+  "/latest",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.latest(),
+  }),
+  async (req, res) => {
+    try {
+      const result = await marketRateService.getLatestPrices();
 
-    const errors = results.filter((result) => !result.success);
+      if (result.success) {
+        res.json({
+          success: true,
+          data: result.data,
+          ...(result.errors && { errors: result.errors }),
+        });
+      } else {
+        sendApiError(
+          res,
+          500,
+          "INTERNAL_SERVER_ERROR",
+          typeof result.error === "string" ? String(result.error) : undefined,
+        );
+      }
+    } catch (error) {
+      console.error("Error fetching latest prices:", error);
 
-    res.json({
-      success: true,
-      data: rates,
-      errors: errors.length > 0 ? errors.map((e) => e.error) : undefined,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
-  }
-});
-
-// GET /api/market-rates/latest
-router.get("/latest", async (req, res) => {
-  try {
-    const result = await marketRateService.getLatestPrices();
-
-    if (result.success) {
-      res.json({
-        success: true,
-        data: result.data,
-        ...(result.errors && { errors: result.errors }),
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: result.error,
-      });
-    }
-  } catch (error) {
-    console.error("Error fetching latest prices:", error);
-
-    res.status(500).json({
-      success: false,
-      error:
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
         error instanceof Error
           ? error.message
           : "Failed to fetch latest prices",
-    });
-  }
-});
+      );
+    }
+  },
+);
 
-// Health check for all fetchers
-router.get("/health", async (req, res) => {
-  try {
-    const health = await marketRateService.healthCheck();
+// Pending reviews
+router.get(
+  "/reviews/pending",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.pendingReviews(),
+  }),
+  async (req, res) => {
+    try {
+      const reviews = await marketRateService.getPendingReviews();
 
-    res.json({
-      success: true,
-      data: health,
-      overallHealthy: Object.values(health).every((status) => status),
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
-  }
-});
+      res.json({
+        success: true,
+        data: reviews,
+      });
+    } catch (error) {
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to fetch pending price reviews",
+      );
+    }
+  },
+);
 
-// Get supported currencies
-router.get("/currencies", (req, res) => {
-  try {
-    const currencies = marketRateService.getSupportedCurrencies();
+// Approve review
+router.post(
+  "/reviews/:id/approve",
+  invalidateCache("market-rates:*"),
+  async (req, res) => {
+    try {
+      const reviewId = Number.parseInt(req.params.id as string, 10);
+      if (!Number.isFinite(reviewId)) {
+        sendApiError(
+          res,
+          400,
+          "BAD_REQUEST",
+          "Review ID must be a valid number",
+        );
+        return;
+      }
 
-    res.json({
-      success: true,
-      data: currencies,
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
-  }
-});
+      const { reviewedBy, note } = req.body ?? {};
+      const review = await marketRateService.approvePendingReview(
+        reviewId,
+        reviewedBy,
+        note,
+      );
 
-// Get cache status
+      res.json({
+        success: true,
+        data: review,
+      });
+    } catch (error) {
+      const statusCode = isLockdownError(error) ? (error.statusCode as number) : 500;
+      const is403 = statusCode === 403;
+      sendApiError(
+        res,
+        statusCode,
+        isLockdownError(error) ? "LOCKDOWN_ACTIVE" : "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to approve price review",
+      );
+    }
+  },
+);
+
+// Reject review
+router.post(
+  "/reviews/:id/reject",
+  invalidateCache("market-rates:*"),
+  async (req, res) => {
+    try {
+      const reviewId = Number.parseInt(req.params.id as string, 10);
+      if (!Number.isFinite(reviewId)) {
+        sendApiError(
+          res,
+          400,
+          "BAD_REQUEST",
+          "Review ID must be a valid number",
+        );
+        return;
+      }
+
+      const { reviewedBy, note } = req.body ?? {};
+      const review = await marketRateService.rejectPendingReview(
+        reviewId,
+        reviewedBy,
+        note,
+      );
+
+      res.json({
+        success: true,
+        data: review,
+      });
+    } catch (error) {
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        error instanceof Error
+          ? error.message
+          : "Failed to reject price review",
+      );
+    }
+  },
+);
+
+// Health check
+router.get(
+  "/health",
+  cacheMiddleware({
+    ttl: 60,
+    keyGenerator: () => CACHE_KEYS.marketRates.health(),
+  }),
+  async (req, res) => {
+    try {
+      const health = await marketRateService.healthCheck();
+
+      res.json({
+        success: true,
+        data: health,
+        overallHealthy: Object.values(health).every((status) => status),
+      });
+    } catch (error) {
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        typeof (error instanceof Error
+          ? error.message
+          : "Internal server error") === "string"
+          ? String(
+              error instanceof Error ? error.message : "Internal server error",
+            )
+          : undefined,
+      );
+    }
+  },
+);
+
+// Supported currencies
+router.get(
+  "/currencies",
+  cacheMiddleware({
+    ttl: CACHE_CONFIG.ttl.marketRates,
+    keyGenerator: () => CACHE_KEYS.marketRates.currencies(),
+  }),
+  (req, res) => {
+    try {
+      const currencies = marketRateService.getSupportedCurrencies();
+
+      res.json({
+        success: true,
+        data: currencies,
+      });
+    } catch (error) {
+      sendApiError(
+        res,
+        500,
+        "INTERNAL_SERVER_ERROR",
+        typeof (error instanceof Error
+          ? error.message
+          : "Internal server error") === "string"
+          ? String(
+              error instanceof Error ? error.message : "Internal server error",
+            )
+          : undefined,
+      );
+    }
+  },
+);
+
+// Cache status
 router.get("/cache", (req, res) => {
   try {
     const cacheStatus = marketRateService.getCacheStatus();
@@ -128,10 +259,18 @@ router.get("/cache", (req, res) => {
       data: cacheStatus,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Internal server error") === "string"
+        ? String(
+            error instanceof Error ? error.message : "Internal server error",
+          )
+        : undefined,
+    );
   }
 });
 
@@ -145,10 +284,18 @@ router.post("/cache/clear", (req, res) => {
       message: "Cache cleared successfully",
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : "Internal server error",
-    });
+    sendApiError(
+      res,
+      500,
+      "INTERNAL_SERVER_ERROR",
+      typeof (error instanceof Error
+        ? error.message
+        : "Internal server error") === "string"
+        ? String(
+            error instanceof Error ? error.message : "Internal server error",
+          )
+        : undefined,
+    );
   }
 });
 

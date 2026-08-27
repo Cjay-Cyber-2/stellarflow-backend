@@ -1,18 +1,33 @@
-export class ErrorTracker {
-  private failureCounters: Map<string, { count: number; errors: any[] }> = new Map();
-  private readonly threshold = 3;
+import prisma from "../lib/prisma";
+import { generateKsuid } from "../utils/ksuid.js";
 
-  trackFailure(serviceKey: string, errorDetails: any): boolean {
+type FailureRecord = {
+  count: number;
+  errors: unknown[];
+};
+
+export class ErrorTracker {
+  private failureCounters = new Map<string, FailureRecord>();
+  private readonly threshold = 3;
+  /**
+   * Track a failure for a specific service key.
+   * Returns true when the configured threshold of consecutive failures is reached.
+   * Also triggers a non-blocking DB write to record the failure.
+   */
+  trackFailure(serviceKey: string, errorDetails: unknown): boolean {
     const existing = this.failureCounters.get(serviceKey);
+
     if (existing) {
-      existing.count++;
+      existing.count += 1;
       existing.errors.push(errorDetails);
       this.failureCounters.set(serviceKey, existing);
+      this.logError(serviceKey, errorDetails);
       return existing.count >= this.threshold;
-    } else {
-      this.failureCounters.set(serviceKey, { count: 1, errors: [errorDetails] });
-      return false;
     }
+
+    this.failureCounters.set(serviceKey, { count: 1, errors: [errorDetails] });
+    this.logError(serviceKey, errorDetails);
+    return false;
   }
 
   trackSuccess(serviceKey: string): void {
@@ -21,6 +36,35 @@ export class ErrorTracker {
 
   reset(serviceKey: string): void {
     this.failureCounters.delete(serviceKey);
+  }
+
+  // Write an error log without breaking the caller if DB logging fails.
+  private async logError(
+    serviceKey: string,
+    errorDetails: unknown,
+  ): Promise<void> {
+    try {
+      const clientAny = prisma as any;
+
+      if (
+        clientAny?.errorLog &&
+        typeof clientAny.errorLog.create === "function"
+      ) {
+        await clientAny.errorLog.create({
+          data: {
+            id: generateKsuid(),
+            providerName: serviceKey,
+            errorMessage:
+              errorDetails instanceof Error
+                ? errorDetails.message
+                : JSON.stringify(errorDetails),
+            occurredAt: new Date(),
+          },
+        });
+      }
+    } catch {
+      // Swallow DB errors to avoid breaking the service.
+    }
   }
 }
 

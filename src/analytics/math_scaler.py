@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal, InvalidOperation
+from typing import NamedTuple, Union, Sequence
+from fractions import Fraction
+from typing import NamedTuple, Sequence, Union
+
+
+# ---------------------------------------------------------------------------
+# Scale constants
+# ---------------------------------------------------------------------------
+# 10^7  — standard precision for single-hop exchange rate values sent to the
+#          Soroban smart contract layer.  All payload integers MUST use this
+#          base before transmission.
+# 10^14 — extended precision used during cross-feed multiplication so that
+#          two 10^7-scaled values can be combined without intermediate loss.
+
+SCALE_7: int = 10_000_000            # 10^7
+SCALE_14: int = 100_000_000_000_000  # 10^14
+
+# Fixed-point rescale depth: each level multiplies or divides by SCALE_7 (10^7).
+SCALE_SHIFT: int = 7
+
+_D_SCALE_7 = Decimal(SCALE_7)
+_D_SCALE_14 = Decimal(SCALE_14)
+
+Number = Union[int, float, Decimal]
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _validate_positive_int(value: int, name: str) -> int:
+    """Reject non-integer or non-positive values for fixed-point scaling."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer.")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive.")
+    return value
+
+
+def _to_decimal(value: Number, name: str = "value") -> Decimal:
+    """Coerce *value* to a finite Decimal using its string representation.
+
+    String coercion is intentional: it avoids inheriting the binary-float
+    approximation that would be introduced by ``Decimal(float_value)`` directly,
+    which is the root cause of the determinism bugs this module addresses.
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be numeric, not bool.")
+    try:
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError(f"{name} is not a valid number: {value!r}") from exc
+    if not d.is_finite():
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    return d
+
+
+def _shift_scale_int(value: int, shift_levels: int) -> int:
+    """Rescale a fixed-point integer by *shift_levels* decimal-scale steps.
+
+    Each step applies a deterministic multiply (left shift) or floor-divide
+    (right shift) by ``SCALE_7``, keeping the entire pipeline in integer space.
+    """
+    if shift_levels == 0:
+        return value
+
+    result = value
+    if shift_levels > 0:
+        for _ in range(shift_levels):
+            result *= SCALE_7
+        return result
+
+    for _ in range(-shift_levels):
+        result //= SCALE_7
+    return result
+
+
+def _multiply_hop_chain(hops: tuple[int, ...]) -> int:
+    """Fold a corridor hop chain into a single ``SCALE_14`` rate integer."""
+    if not hops:
+        return SCALE_14
+    product = 1
+    for hop in hops:
+        product *= hop
+    return _shift_scale_int(product, -(len(hops) - 2))
+
+
+def _apply_route_weight(scaled_rate: int, weight: int) -> int:
+    """Apply a ``SCALE_7`` corridor weight to a ``SCALE_7`` route rate."""
+    return scaled_rate * weight
+
+
+def _normalize_weighted_sum(weighted_sum: int, weight_total: int) -> int:
+    """Collapse a ``SCALE_21`` weighted sum back to ``SCALE_14`` precision."""
+    if weight_total == 0:
+        raise ZeroDivisionError("Total route weight scales to zero at SCALE_7.")
+    return weighted_sum // weight_total
+
+
+class ArbitrageRouteMatrix(NamedTuple):
+    """Integer-only matrix layout for multi-hop cross-corridor arbitrage routes.
+
+    ``hops`` stores one corridor per row; every cell is a ``SCALE_7`` rate.
+    ``weights`` holds one ``SCALE_7`` corridor weight per row.
+    """
+
+    hops: tuple[tuple[int, ...], ...]
+    weights: tuple[int, ...]
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def scale_up(
+    value: Number,
+    factor: int = SCALE_7,
+    rounding: str = ROUND_HALF_EVEN,
+) -> int:
+    """Scale *value* to its fixed-integer representation at *factor* precision.
+
+    Uses ``Decimal`` arithmetic and a selectable rounding mode to guarantee
+    bit-identical results across all Python environments and CPU architectures.
+
+    Parameters
+    ----------
+    value:
+        The raw rate or price to scale (int, float, or Decimal).
+    factor:
+        The integer base to scale to.  Defaults to ``SCALE_7`` (10^7).
+    rounding:
+        The rounding mode, as defined in the ``decimal`` module. Defaults to
+        ``ROUND_HALF_EVEN`` (banker's rounding).
+
+    Returns
+    -------
+    int
+        The deterministic integer representation ready for payload packing.
+    """
+    factor = _validate_positive_int(factor, "factor")
+    d = _to_decimal(value) * Decimal(factor)
+    return int(d.to_integral_value(rounding=rounding))
+
+
+def to_fixed(value: Number) -> int:
+    """Convert a numeric input into a ``SCALE_7`` fixed-point integer."""
+    return scale_up(value, SCALE_7)
+
+
+def from_fixed(value: int) -> float:
+    """Convert a ``SCALE_7`` fixed-point integer back into a float."""
+    return float(scale_down(value, SCALE_7))
+
+
+def fixed_point_sqrt(value: int) -> int:
+    """Compute the fixed-point square root using integer-only arithmetic."""
+    if isinstance(value, bool):
+        raise TypeError("value must be an integer, not bool.")
+    if not isinstance(value, int):
+        raise TypeError("value must be a scaled integer.")
+    if value < 0:
+        raise ValueError("Cannot compute the fixed-point square root of a negative value.")
+    if value == 0:
+        return 0
+    return sqrt_scaled(value, SCALE_7)
+
+
+def calculate_slippage_variance(current_price: int, expected_price: int) -> int:
+    """Calculate slippage variance while preserving integer-only fixed-point math."""
+    if expected_price <= 0:
+        raise ValueError("Expected price must be greater than zero for variance analytics.")
+
+    delta = ((current_price - expected_price) * SCALE_7) // expected_price
+    variance_input = (delta * delta) // SCALE_7
+    return fixed_point_sqrt(variance_input)
+
+
+def scale_down(value: int, factor: int = SCALE_7) -> Decimal:
+    """Restore a scaled integer to a high-precision ``Decimal`` representation.
+
+    Returns ``Decimal`` rather than ``float`` so callers can chain further
+    Decimal operations without reintroducing binary-float imprecision.
+
+    Parameters
+    ----------
+    value:
+        A previously scaled integer (e.g. from ``scale_up``).
+    factor:
+        The base that was used when scaling up.  Defaults to ``SCALE_7``.
+    """
+    factor = _validate_positive_int(factor, "factor")
+    return Decimal(value) / Decimal(factor)
+
+
+def multiply_rates(rate_a: Number, rate_b: Number) -> int:
+    """Multiply two exchange rates and return a ``SCALE_14``-scaled integer.
+
+    Both inputs are independently coerced to ``Decimal`` via their string
+    representations before being scaled to 10^7.  The product of two 10^7
+    integers is implicitly at 10^14 precision and is returned as-is so
+    callers can chain further integer operations without precision loss.
+
+    Example
+    -------
+    >>> multiply_rates(1500.0, 0.00065)  # NGN/USD × USD/XLM → NGN/XLM (×10^14)
+    975000000000
+    """
+    a_int = scale_up(rate_a, SCALE_7)
+    b_int = scale_up(rate_b, SCALE_7)
+    return a_int * b_int  # implicitly SCALE_14
+
+
+def cross_feed_multiply(
+    rate_a: Number,
+    rate_b: Number,
+    output_scale: int = SCALE_7,
+) -> int:
+    """Compute an implied cross-feed rate at *output_scale* precision.
+
+    Internally uses the full 10^14 product then performs integer floor-division
+    back to *output_scale*, keeping every step in integer arithmetic.
+
+    Parameters
+    ----------
+    rate_a, rate_b:
+        Raw (unscaled) exchange rates.
+    output_scale:
+        The desired output precision base.  Defaults to ``SCALE_7``.
+
+    Returns
+    -------
+    int
+        A deterministic integer at *output_scale* precision.
+    """
+    output_scale = _validate_positive_int(output_scale, "output_scale")
+    product_14 = multiply_rates(rate_a, rate_b)
+    return product_14 // (SCALE_14 // output_scale)
+
+
+def floor_divide(scaled_value: int, divisor: Number) -> int:
+    """Integer floor-divide a ``SCALE_7``-scaled value by *divisor*.
+
+    *divisor* is scaled to ``SCALE_7`` via ``Decimal`` arithmetic before
+    the division so the entire operation stays in integer space.
+
+    Parameters
+    ----------
+    scaled_value:
+        A ``SCALE_7``-scaled integer numerator.
+    divisor:
+        The raw (unscaled) divisor.
+
+    Returns
+    -------
+    int
+        Floor-divided result at ``SCALE_7`` precision.
+    """
+    divisor_int = scale_up(divisor, SCALE_7)
+    if divisor_int == 0:
+        raise ZeroDivisionError(f"Divisor {divisor!r} scales to zero at SCALE_7.")
+    return (scaled_value * SCALE_7) // divisor_int
+
+
+def sqrt_scaled(value: int, scale: int = SCALE_7) -> int:
+    """Return the fixed-point square root of a scaled integer using Newton-Raphson.
+
+    ``value`` is expected to be scaled by *scale*, and the returned integer uses
+    the same scale.  The calculation is strictly integer-only:
+
+    ``floor(sqrt(value / scale)) * scale``
+
+    The square root is calculated using the Newton-Raphson method (also known as
+    Heron's method) with integer arithmetic only. The iteration formula is:
+
+        x_{n+1} = (x_n + S / x_n) // 2
+
+    Where S is the radicand (value // scale) and x_n is the current estimate. This
+    converges quadratically and floors toward zero, matching the truncation behavior
+    used across this module.
+    """
+    if isinstance(value, bool):
+        raise TypeError("value must be an integer, not bool.")
+    if not isinstance(value, int):
+        raise TypeError("value must be a scaled integer.")
+    if isinstance(scale, bool) or not isinstance(scale, int):
+        raise TypeError("scale must be an integer.")
+    if value < 0:
+        raise ValueError("Cannot calculate square root of a negative value.")
+    if scale <= 0:
+        raise ValueError("scale must be positive.")
+
+    # Calculate the unscaled radicand: value // scale
+    radicand = value // scale
+    if radicand < 2:
+        return radicand * scale
+
+    # Initial estimate using bit length for faster convergence
+    # For a number with bit length n, sqrt is approximately 2^(n/2)
+    x = 1 << ((radicand.bit_length() + 1) // 2)
+    
+    # Newton-Raphson iteration with integer arithmetic
+    # x_{n+1} = (x_n + S // x_n) // 2
+    while True:
+        next_x = (x + radicand // x) // 2
+        if next_x >= x:
+            # Converged: next estimate is not smaller, so x is the floor sqrt
+            break
+        x = next_x
+
+    # Scale the result back
+    return x * scale
+
+
+def build_arbitrage_route_matrix(
+    routes: Sequence[Sequence[Number]],
+    weights: Sequence[Number] | None = None,
+) -> ArbitrageRouteMatrix:
+    """Build an integer-only route matrix from raw corridor hop rates.
+
+    Parameters
+    ----------
+    routes:
+        Each inner sequence is one cross-corridor hop chain.
+    weights:
+        Optional corridor weights scaled to ``SCALE_7``.  Defaults to equal
+        weight ``1.0`` per corridor.
+    """
+    if not routes:
+        raise ValueError("At least one corridor route is required.")
+
+    hop_matrix = tuple(tuple(scale_up(rate) for rate in route) for route in routes)
+    if any(len(route) == 0 for route in hop_matrix):
+        raise ValueError("Each corridor route must contain at least one hop rate.")
+
+    if weights is None:
+        weight_ints = tuple(SCALE_7 for _ in routes)
+    else:
+        if len(weights) != len(routes):
+            raise ValueError("weights length must match the number of routes.")
+        weight_ints = tuple(scale_up(weight) for weight in weights)
+
+    return ArbitrageRouteMatrix(hops=hop_matrix, weights=weight_ints)
+
+
+def solve_multi_hop_corridor(rates: Sequence[Number]) -> int:
+    """Calculate a single multi-hop corridor rate at ``SCALE_7`` precision.
+
+    All hop products and rescaling steps use integer-only fixed-point math.
+    """
+    hops = tuple(scale_up(rate) for rate in rates)
+    if not hops:
+        raise ValueError("At least one hop rate is required.")
+    return _multiply_hop_chain(hops)
+
+
+def solve_arbitrage_route(matrix: ArbitrageRouteMatrix) -> int:
+    """Solve weighted multi-hop cross-corridor rates from an integer matrix.
+
+    Corridor hop chains are multiplied in integer space, weights are applied
+    via fixed-point shift scaling, and the aggregate result is normalized back
+    to ``SCALE_7`` for on-chain payload compatibility.
+    """
+    weighted_sum = 0
+    weight_total = 0
+
+    for route, weight in zip(matrix.hops, matrix.weights):
+        route_rate = _multiply_hop_chain(route)
+        weighted_sum += _apply_route_weight(route_rate, weight)
+        weight_total += weight
+
+    return _normalize_weighted_sum(weighted_sum, weight_total)
+
+
+def pack_rate(value: Number) -> int:
+    """Convenience wrapper: scale *value* to a ``SCALE_7`` integer for payload packing.
+
+    This is the canonical entry-point used before serialising a rate into any
+    Soroban contract data payload. It enforces the ``10^7`` fixed-integer base
+    contract and rejects non-finite or boolean inputs early.
+    """
+    return scale_up(value, SCALE_7)
+
+
+ConversionMatrix = dict[str, dict[str, Fraction]]
+
+
+def build_conversion_matrix(
+    rates: dict[tuple[str, str], Number],
+) -> ConversionMatrix:
+    """
+    Build an exact fraction-based conversion matrix.
+    """
+    matrix: ConversionMatrix = {}
+
+    for (source, target), rate in rates.items():
+        matrix.setdefault(source, {})
+
+        decimal_rate = _to_decimal(rate)
+        matrix[source][target] = Fraction(decimal_rate)
+
+    return matrix
+
+
+def convert_path(
+    matrix: ConversionMatrix,
+    path: list[str],
+) -> Fraction:
+    """
+    Compute an exact conversion along a multi-hop path.
+    """
+    if len(path) < 2:
+        return Fraction(1)
+
+    result = Fraction(1)
+
+    for src, dst in zip(path, path[1:]):
+        try:
+            result *= matrix[src][dst]
+        except KeyError as exc:
+            raise KeyError(f"Missing conversion rate: {src} -> {dst}") from exc
+
+    return result
+
+
+def fraction_to_scaled(
+    value: Fraction,
+    factor: int = SCALE_7,
+) -> int:
+    """
+    Convert an exact Fraction into a SCALE_7 integer.
+    """
+    return scale_up(
+        Decimal(value.numerator) / Decimal(value.denominator),
+        factor,
+    )
+
+
+def scaled_to_fraction(
+    value: int,
+    factor: int = SCALE_7,
+) -> Fraction:
+    """
+    Convert a SCALE_7 integer into an exact Fraction.
+    """
+    return Fraction(value, factor)
+
+
+__all__ = [
+    "SCALE_7",
+    "SCALE_14",
+    "SCALE_SHIFT",
+    "Number",
+    "ConversionMatrix",
+    "scale_up",
+    "to_fixed",
+    "from_fixed",
+    "fixed_point_sqrt",
+    "calculate_slippage_variance",
+    "scale_down",
+    "multiply_rates",
+    "cross_feed_multiply",
+    "floor_divide",
+    "sqrt_scaled",
+    "build_arbitrage_route_matrix",
+    "solve_multi_hop_corridor",
+    "solve_arbitrage_route",
+    "pack_rate",
+    "build_conversion_matrix",
+    "convert_path",
+    "fraction_to_scaled",
+    "scaled_to_fraction",
+]

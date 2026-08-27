@@ -1,82 +1,296 @@
-// Prisma Schema for StellarFlow Backend
-// PostgreSQL database schema for price history tracking
-
 generator client {
   provider = "prisma-client-js"
 }
-
 datasource db {
   provider = "postgresql"
 }
 
-// Price History Model
-// Stores historical exchange rates for sparkline charts
 model PriceHistory {
-  id        Int      @id @default(autoincrement())
-  currency  String   @db.VarChar(10) // e.g., "GHS", "KES"
-  rate      Decimal  @db.Decimal(20, 10) // High precision for exchange rates
-  source    String   @db.VarChar(100) // Source API name
-  timestamp DateTime @db.Timestamp(3) // When the rate was recorded
+  id          Int       @id @default(autoincrement())
+  currency    String
+  rate        Decimal
+  bid         Decimal? // Buy price (optional)
+  ask         Decimal? // Sell price (optional)
+  source      String
+  timestamp   DateTime
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  currencyRef Currency? @relation(fields: [currency], references: [code])
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  // Unique constraint to prevent duplicate entries at same timestamp from same source
-  @@unique([currency, source, timestamp])
-  // Indexes for efficient sparkline queries
   @@index([currency, timestamp])
   @@index([timestamp])
+  @@unique([currency, source, timestamp])
 }
 
-// Currency Configuration Model
-// Stores supported currencies and their metadata
 model Currency {
-  code     String  @id @db.VarChar(10) // e.g., "GHS", "KES"
-  name     String  @db.VarChar(100) // Full name e.g., "Ghanaian Cedi"
-  symbol   String  @db.VarChar(5) // Currency symbol e.g., "₵", "KES"
-  decimals Int     @default(2) // Decimal places for display
-  isActive Boolean @default(true) // Whether this currency is currently supported
+  code        String    @id  // e.g., "GHS", "KES"
+  name        String      // Full name e.g., "Ghanaian Cedi"
+  symbol      String      // Currency symbol e.g., "₵", "KES"
+  decimals    Int       @default(2)           // Decimal places for display
+  isActive    Boolean   @default(true)        // Whether this currency is currently supported
+  
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  priceHistory PriceHistory[]
 }
 
-model PriceRecord {
-  id        Int      @id @default(autoincrement())
-  currency  String
-  value     Float
-  timestamp DateTime
+// On-Chain Confirmed Price Model
+// Stores prices confirmed on Stellar via manageData or Soroban contract events
+model OnChainPrice {
+  id            Int       @id @default(autoincrement())
+  currency      String    // e.g., "NGN", "KES", "GHS"
+  rate          Decimal   // The confirmed price
+  txHash        String    // Stellar transaction hash
+  memoId        String?   // Memo ID from transaction (e.g., SF-NGN-1234567890-001)
+  ledgerSeq     Int                          // Ledger sequence number
+  confirmedAt   DateTime   // When transaction was confirmed on-chain
+
+  @@index([currency, confirmedAt])
+  @@index([txHash])
+  @@index([ledgerSeq])
+  @@unique([txHash, currency])
+
+  createdAt     DateTime  @default(now())
 }
 
-// Provider Reputation Model
-// Tracks API reliability and performance
 model ProviderReputation {
-  id                   Int       @id @default(autoincrement())
-  providerName         String    @db.VarChar(100) // e.g., "CoinGecko", "ExchangeRateAPI"
-  endpoint             String?   @db.VarChar(255) // Specific endpoint URL or identifier
-  status               String    @db.VarChar(20) // "online", "offline", "degraded"
-  totalRequests        Int       @default(0) // Total API calls made
-  successfulRequests   Int       @default(0) // Successful responses
-  failedRequests       Int       @default(0) // Failed responses
-  incorrectResponses   Int       @default(0) // Responses with invalid/incorrect data
-  averageLatency       Float? // Average response time in ms
-  lastSuccess          DateTime? // Last successful response timestamp
-  lastFailure          DateTime? // Last failed response timestamp
-  lastIncorrect        DateTime? // Last incorrect response timestamp
-  consecutiveFailures  Int       @default(0) // Current streak of consecutive failures
-  consecutiveIncorrect Int       @default(0) // Current streak of consecutive incorrect responses
-
+  id              Int       @id @default(autoincrement())
+  providerName    String  // e.g., "CoinGecko", "ExchangeRateAPI"
+  endpoint        String?  // Specific endpoint URL or identifier
+  status          String   // "online", "offline", "degraded"
+  totalRequests   Int       @default(0)       // Total API calls made
+  successfulRequests Int    @default(0)       // Successful responses
+  failedRequests  Int       @default(0)       // Failed responses
+  incorrectResponses Int   @default(0)        // Responses with invalid/incorrect data
+  averageLatency  Float?    // Average response time in ms
+  lastSuccess     DateTime?                    // Last successful response timestamp
+  lastFailure     DateTime?                    // Last failed response timestamp
+  lastIncorrect   DateTime?                    // Last incorrect response timestamp
+  consecutiveFailures Int  @default(0)        // Current streak of consecutive failures
+  consecutiveIncorrect Int @default(0)        // Current streak of consecutive incorrect responses
+  
   // Reliability metrics
-  reliabilityScore Float? // Calculated score (0-100)
-  lastUpdated      DateTime @updatedAt
-
-  createdAt DateTime @default(now())
-
-  @@unique([providerName, endpoint])
+  reliabilityScore Float?   // Calculated score (0-100)
+  lastUpdated     DateTime  @updatedAt
+  
+  createdAt       DateTime  @default(now())
+  
   // Indexes for quick lookups
   @@index([providerName])
   @@index([status])
   @@index([reliabilityScore])
+  @@unique([providerName, endpoint])
+}
+
+// Multi-Sig Price Approval Model
+// Tracks price updates that require signatures from multiple oracle servers
+model MultiSigPrice {
+  id                Int       @id @default(autoincrement())
+  priceReviewId     Int       // Reference to the price_review_records with contract_status tracking
+  currency          String   // e.g., "NGN", "KES", "GHS"
+  rate              Decimal   // The price to be updated
+  source            String   // Price source (e.g., "CoinGecko")
+  
+  // Multi-sig status
+  status            String   // "PENDING", "APPROVED", "REJECTED", "EXPIRED"
+  requiredSignatures Int      @default(2)       // Number of signatures needed (typically 2)
+  collectedSignatures Int     @default(0)       // Number of signatures collected so far
+  
+  // Stellar transaction details (set when fully signed)
+  memoId            String?   // Memo ID from transaction
+  stellarTxHash     String?   // Submitted transaction hash
+  submittedAt       DateTime?                    // When transaction was submitted to Stellar
+  
+  // Timestamps
+  requestedAt       DateTime  @default(now())   // When the multi-sig request was created
+  expiresAt         DateTime                     // Expiration time for the signature request
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  
+  @@index([currency, status, requestedAt])
+  @@index([status, expiresAt])
+  @@index([priceReviewId])
+
+  multiSigSignatures MultiSigSignature[]
+}
+
+// Multi-Sig Signature Model
+// Records individual signatures from oracle servers
+model MultiSigSignature {
+  id                Int       @id @default(autoincrement())
+  multiSigPriceId   Int       // Reference to MultiSigPrice
+  multiSigPrice     MultiSigPrice @relation(fields: [multiSigPriceId], references: [id], onDelete: Cascade)
+  
+  // Server/Signer information
+  signerPublicKey   String    // Stellar public key of the signer
+  signerName        String    // Human-readable name (e.g., "oracle-server-1")
+  
+  // Signature details
+  signature         String    // The actual XDR signature (can be long)
+  signedAt          DateTime  @default(now())   // When the signature was created
+  
+  createdAt         DateTime  @default(now())
+  
+  @@unique([multiSigPriceId, signerPublicKey])  // Prevent duplicate signatures from same signer
+  @@index([multiSigPriceId])
+  @@index([signerPublicKey])
+}
+
+// Error log table for tracking provider/fetcher failures
+model ErrorLog {
+  id           String   @id  // K-sortable KSUID (26-char Crockford Base32)
+  providerName String   // e.g., "CoinGecko", "KESRateFetcher"
+  errorMessage String?
+  occurredAt   DateTime
+  createdAt    DateTime  @default(now())
+
+  @@index([providerName])
+  @@index([occurredAt])
+}
+
+model RawData {
+  id        Int      @id @default(autoincrement())
+  currency  String
+  provider  String
+  endpoint  String?
+  payload   String
+  fetchedAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([currency, fetchedAt])
+  @@index([provider, fetchedAt])
+  @@index([createdAt])
+}
+
+model Relayer {
+  id            Int      @id @default(autoincrement())
+  name          String
+  apiKey        String   @unique
+  isActive      Boolean  @default(true)
+  allowedAssets String
+  whitelistedIps  String[]
+  email           String?  @unique
+  passwordHash    String?
+  role            String?  @default("VIEWER")
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  permissionChanges PermissionChange[]
+  sessions          UserSession[]
+  registry          RelayerRegistry?
+}
+
+model RelayerRegistry {
+  id               Int      @id @default(autoincrement())
+  relayerId        Int      @unique
+  relayer          Relayer  @relation(fields: [relayerId], references: [id], onDelete: Cascade)
+  contactName      String
+  email            String
+  organizationName String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+}
+
+model ApiKey {
+  id         String    @id @default(uuid())
+  key        String    @unique
+  label      String?
+  scopes     String[]
+  ownerId    String?
+  isActive   Boolean   @default(true)
+  expiresAt  DateTime?
+  lastUsedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+model UserSession {
+  id           Int       @id @default(autoincrement())
+  relayerId   Int
+  relayer     Relayer   @relation(fields: [relayerId], references: [id])
+  token       String    @unique
+  ipAddress   String
+  userAgent   String
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  isActive    Boolean   @default(true)
+}
+
+model PermissionChange {
+  id          Int       @id @default(autoincrement())
+  relayerId  Int
+  relayer    Relayer   @relation(fields: [relayerId], references: [id])
+  changedBy  Int
+  targetId   Int?
+  field      String
+  oldValue   String?
+  newValue   String?
+  reason     String?
+  createdAt  DateTime  @default(now())
+}
+
+// OHLC Candle Model – Issue #208: Analytics | Time-Series Data Aggregation Service
+// Stores Open/High/Low/Close aggregates produced by the PriceAggregator worker.
+// Granularity is one of "MINUTE" | "HOUR" | "DAY".
+model OhlcCandle {
+  id          Int      @id @default(autoincrement())
+  currency    String   // e.g., "NGN", "KES", "GHS"
+  granularity String   // "MINUTE" | "HOUR" | "DAY"
+  openTime    DateTime // Start of the candle window (UTC, truncated to granularity)
+  closeTime   DateTime // End of the candle window (exclusive)
+
+  open        Decimal  // First price in the window
+  high        Decimal  // Highest price in the window
+  low         Decimal  // Lowest price in the window
+  close       Decimal  // Last price in the window
+  count       Int      @default(0) // Number of raw ticks aggregated
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Composite unique – one candle per (currency, granularity, openTime)
+  @@unique([currency, granularity, openTime])
+
+  // Primary query pattern: fetch candles for a currency/granularity over a time range
+  @@index([currency, granularity, openTime])
+  // Secondary: sweep all candles in a time range (e.g. backfill checks)
+  @@index([granularity, openTime])
+}
+
+// Hourly Statistics for smoothing out price spikes
+model HourlyStats {
+  id           Int      @id @default(autoincrement())
+  currency     String
+  averageRate  Decimal
+  hour         DateTime // The start of the hour this average represents
+  createdAt    DateTime  @default(now())
+
+  @@unique([currency, hour])
+  @@index([hour])
+}
+model OhlcvCandle {
+  id        String   @id @default(uuid())
+  pair      String   @db.VarChar(10)
+  timeframe String   // e.g., "1m", "15m", "1h", "1d"
+  open      Decimal  @db.Decimal(20, 10)
+  high      Decimal  @db.Decimal(20, 10)
+  low       Decimal  @db.Decimal(20, 10)
+  close     Decimal  @db.Decimal(20, 10)
+  volume    Decimal  @db.Decimal(20, 10)
+  timestamp DateTime @db.Timestamp(3)
+  @@unique([pair, timeframe, timestamp])
+  @@index([pair, timeframe, timestamp])
+}
+
+model PoolLiquidity {
+  id        String   @id @default(uuid())
+  poolId    String   @db.VarChar(50)
+  timestamp DateTime @db.Timestamp(3)
+  liquidity Decimal  @db.Decimal(20, 10)
+  @@unique([poolId, timestamp])
+  @@index([poolId, timestamp])
 }
 
 enum RebalancingSwapStatus {

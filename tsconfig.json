@@ -1,6 +1,11 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
   "compilerOptions": {
+
+    "baseUrl": ".",
+    "paths": {
+      "csv-writer": ["./src/types/csv-writer.d.ts"]
+    },
     // File Layout
     "rootDir": "./src",
     "outDir": "./dist",
@@ -9,6 +14,7 @@
     "module": "ESNext",
     "target": "ESNext",
     "moduleResolution": "node",
+    "ignoreDeprecations": "5.0",
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "types": ["node"],
@@ -40,5 +46,11 @@
     "skipLibCheck": true
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test",
+    "src/modules",
+    "src/cache/price-cache.service.ts"
+  ]
 }
