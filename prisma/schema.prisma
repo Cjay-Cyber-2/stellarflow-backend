@@ -311,3 +311,23 @@ model GovernanceProposal {
   @@index([contractId])
   @@index([actionType])
 }
+
+model HarvestExecution {
+  id              String    @id @default(uuid())
+  strategyId      String
+  asset           String
+  yieldAmount     Decimal   @db.Decimal(38, 18)
+  gasCost         Decimal   @db.Decimal(38, 18)
+  netProfit       Decimal   @db.Decimal(38, 18)
+  minimumProfit   Decimal   @db.Decimal(38, 18)
+  status          String
+  returnAmount    Decimal?  @db.Decimal(38, 18)
+  transactionHash String?
+  error           String?
+  evaluatedAt     DateTime
+  executedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([strategyId, evaluatedAt])
+  @@index([status, evaluatedAt])
+}
