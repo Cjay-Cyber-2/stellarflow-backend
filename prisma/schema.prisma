@@ -292,3 +292,22 @@ model PoolLiquidity {
   @@unique([poolId, timestamp])
   @@index([poolId, timestamp])
 }
+
+model GovernanceProposal {
+  id              Int       @id @default(autoincrement())
+  proposalId      String    @unique
+  contractId      String
+  actionType      String?
+  actionData      String?
+  expiresAt       DateTime
+  status          String    @default("Queued")
+  transactionHash String?
+  executedAt      DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status, expiresAt])
+  @@index([contractId])
+  @@index([actionType])
+}
