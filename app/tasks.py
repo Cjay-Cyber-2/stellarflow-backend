@@ -97,6 +97,7 @@ def aggregate_ledger_analytics(
     return asyncio.run(_aggregate(granularity, cutoff))
 
 
+async def _export_user_activity(user_id: str) -> dict[str, object]:
 # ---------------------------------------------------------------------------
 # Flash-loan revenue accounting tasks
 # ---------------------------------------------------------------------------
@@ -177,6 +178,23 @@ async def _ingest_flash_loan_events(lookback_minutes: int = 60) -> int:
     if not database_url:
         raise RuntimeError("DATABASE_URL or DB_URL must be configured")
 
+    from app.services.user_activity_export import export_user_activity
+
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                rows = connection.cursor(
+                    """
+                    SELECT event_hash, ledger_sequence, tx_hash, event_type,
+                           created_at, payload
+                    FROM ledger_events
+                    WHERE payload->>'user_id' = $1
+                    ORDER BY created_at ASC, event_hash ASC
+                    """,
+                    user_id,
+                )
+                return await export_user_activity(rows, user_id)
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=lookback_minutes)
     pool = await asyncpg.create_pool(database_url)
     try:
@@ -313,6 +331,7 @@ async def _compute_yield_snapshots(granularity: str = "DAILY") -> int:
 @celery_app.task(
     bind=True,
     base=DatabaseTask,
+    name="app.tasks.export_user_activity_csv",
     name="app.tasks.ingest_flash_loan_revenue",
     autoretry_for=(OSError, asyncpg.PostgresError),
     retry_backoff=True,
@@ -337,6 +356,12 @@ def ingest_flash_loan_revenue(
     retry_backoff=True,
     max_retries=3,
 )
+def export_user_activity_csv(self: DatabaseTask, user_id: str) -> dict[str, object]:
+    """Create a user activity CSV in S3 and return its signed download URL."""
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+    return asyncio.run(_export_user_activity(user_id.strip()))
 def compute_yield_snapshots(
     self: DatabaseTask,
     granularity: str = "DAILY",
