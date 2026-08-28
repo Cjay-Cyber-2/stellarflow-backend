@@ -36,5 +36,20 @@ celery_app.conf.update(
             "schedule": crontab(minute="*/15"),
             "kwargs": {"granularity": "DAY", "lookback_hours": 73},
         },
+        "ingest-flash-loan-revenue": {
+            "task": "app.tasks.ingest_flash_loan_revenue",
+            "schedule": crontab(minute="*/5"),
+            "kwargs": {"lookback_minutes": 60},
+        },
+        "compute-daily-yield-snapshots": {
+            "task": "app.tasks.compute_yield_snapshots",
+            "schedule": crontab(minute="*/15"),
+            "kwargs": {"granularity": "DAILY"},
+        },
+        "compute-hourly-yield-snapshots": {
+            "task": "app.tasks.compute_yield_snapshots",
+            "schedule": crontab(minute="*/5"),
+            "kwargs": {"granularity": "HOURLY"},
+        },
     },
 )

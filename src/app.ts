@@ -56,6 +56,8 @@ import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
 import zkRouter from "./routes/zk";
 import governanceRouter from "./routes/governance";
+import proofRouter from "./routes/proof";
+import remittanceRouter from "./routes/remittance";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -207,6 +209,19 @@ app.use("/api/v1/analytics", analyticsRouter);
 
 app.use("/api/v1/zk", zkRouter);
 app.use("/api/v1/governance", governanceRouter);
+app.use("/api/v1/proof", proofRouter);
+
+// Issue #815 – Remittance transaction history endpoint
+app.use("/api/v1/remittance", remittanceRouter);
+
+app.use("/api/v1/governance", governanceRouter);
+
+// Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
+// eslint-disable-next-line no-undef
+app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
+
+// Governance: voter history, delegation tree – Issue #<this issue>
+app.use("/api/v1/governance", governanceRouter);
 
 app.get("/", (req, res) => {
   res.json({
@@ -266,6 +281,16 @@ app.get("/", (req, res) => {
           updateConfig: "PUT /api/admin/rate-limit",
           refreshWhitelist: "POST /api/admin/rate-limit/whitelist/refresh",
         },
+      },
+      paymentRouting: {
+        findRoutes: "POST /api/v1/payment-routing/routes",
+        createRoute: "POST /api/v1/payment-routing/routes/create",
+        listRoutes: "GET /api/v1/payment-routing/routes",
+        getRoute: "GET /api/v1/payment-routing/routes/:id",
+        updateRouteStatus: "PATCH /api/v1/payment-routing/routes/:id/status",
+        requestQuote: "POST /api/v1/payment-routing/quotes",
+        lockQuote: "POST /api/v1/payment-routing/quotes/:id/lock",
+        getQuote: "GET /api/v1/payment-routing/quotes/:id",
       },
     },
   });

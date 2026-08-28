@@ -1,0 +1,15 @@
+{
+  "keep": {
+    "days": false,
+    "amount": 10
+  },
+  "auditLog": "/home/stanley-owoh/doradrips/stellarflow-backend/logs/.3eb5e242503081da494c0fb397a8dac9aaaf6003-audit.json",
+  "files": [
+    {
+      "date": 1787790772001,
+      "name": "/home/stanley-owoh/doradrips/stellarflow-backend/logs/system-2026-08-27.log",
+      "hash": "bc7745a14bb87158fbf4aa1d521b7e6cc66a933947c192183f3e0d1c8093bbc9"
+    }
+  ],
+  "hashType": "sha256"
+}

@@ -13,6 +13,7 @@ import app from "./app";
 import prisma from "./lib/prisma";
 import { disconnectRedis } from "./lib/redis";
 import { initSocket } from "./lib/socket";
+import { startLiquidityRebalancingWorker } from "./services/liquidity/bootstrap";
 import { SorobanEventListener } from "./services/sorobanEventListener";
 import { multiSigSubmissionService } from "./services/multiSigSubmissionService";
 import {
@@ -37,6 +38,7 @@ import { contractSanityCheckService } from "./services/contractSanityCheckServic
 import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
@@ -253,6 +255,7 @@ app.get("/", (req, res) => {
 // Start server
 const httpServer = createServer(app);
 initSocket(httpServer);
+const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
 let sorobanEventListener: SorobanEventListener | null = null;
 
 // FIX 1: Typed as nullable — constructor is not called at module level,
@@ -304,6 +307,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     sorobanEventListener?.stop();
     multiSigSubmissionService.stop();
     governanceTimelockService.stop();
+    liquidityRebalancingWorker?.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -311,6 +315,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    getOrderBookSnapshotEngine().stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -357,6 +362,21 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  // Start the order book snapshot engine (Issue #796)
+  try {
+    getOrderBookSnapshotEngine()
+      .start()
+      .catch((err) => {
+        console.error("Failed to start order book snapshot engine:", err);
+      });
+    console.log(`📖 Order book snapshot engine started`);
+  } catch (err) {
+    console.warn(
+      "Order book snapshot engine not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;

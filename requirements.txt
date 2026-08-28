@@ -41,3 +41,16 @@ PyNaCl>=1.5.0
 
 # Alternative Ed25519 / ECDSA verification backend (fallback if PyNaCl absent)
 cryptography>=42.0.0
+
+# ---------------------------------------------------------------------------
+# Issue #824 — Shielded Transaction Proof Verification Offloading Engine
+# ---------------------------------------------------------------------------
+
+# Async web framework for proof verification endpoints
+fastapi>=0.104.0
+
+# ASGI server for the Python service
+uvicorn[standard]>=0.24.0
+
+# Process pool executor for CPU-intensive ZK proof verification
+# (uses stdlib concurrent.futures, no extra package needed)

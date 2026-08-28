@@ -4,6 +4,10 @@ import {
   verifyPassword,
   createUserSession,
   invalidateSession,
+  generateRefreshToken,
+  verifyRefreshToken,
+  isRefreshTokenBlacklisted,
+  blacklistRefreshToken,
 } from "../utils/jwt.js";
 import {
   logLoginSuccess,
@@ -110,7 +114,9 @@ router.post(
         userId: relayer.id,
         email: relayer.email!,
         role: relayer.role || "VIEWER",
-      });
+      }, "15m"); // generate short-lived access token by default now
+
+      const refreshTokenData = generateRefreshToken(relayer.id);
 
       await createUserSession(
         relayer.id,
@@ -134,6 +140,7 @@ router.post(
         success: true,
         data: {
           token,
+          refreshToken: refreshTokenData.token,
           user: {
             id: relayer.id,
             email: relayer.email,
@@ -205,6 +212,80 @@ router.post(
       });
     }
   },
+);
+
+router.post(
+  "/refresh",
+  async (req: express.Request, res: express.Response): Promise<void> => {
+    try {
+      const { refreshToken } = req.body as { refreshToken?: string };
+      if (!refreshToken) {
+        res.status(400).json({
+          success: false,
+          error: { code: "MISSING_TOKEN", message: "Refresh token is required" },
+        });
+        return;
+      }
+
+      const decoded = verifyRefreshToken(refreshToken);
+      if (!decoded) {
+        res.status(401).json({
+          success: false,
+          error: { code: "INVALID_TOKEN", message: "Invalid or expired refresh token" },
+        });
+        return;
+      }
+
+      const isBlacklisted = await isRefreshTokenBlacklisted(decoded.jti);
+      if (isBlacklisted) {
+        res.status(401).json({
+          success: false,
+          error: { code: "TOKEN_REVOKED", message: "Refresh token has been revoked" },
+        });
+        return;
+      }
+
+      const relayer = await prisma.relayer.findUnique({
+        where: { id: decoded.userId },
+      });
+
+      if (!relayer || !relayer.isActive) {
+        res.status(401).json({
+          success: false,
+          error: { code: "USER_INVALID", message: "User not found or disabled" },
+        });
+        return;
+      }
+
+      const expiresInSec = decoded.exp ? decoded.exp - Math.floor(Date.now() / 1000) : 7 * 24 * 60 * 60;
+      if (expiresInSec > 0) {
+        await blacklistRefreshToken(decoded.jti, expiresInSec);
+      }
+
+      const accessToken = generateToken({
+        userId: relayer.id,
+        email: relayer.email!,
+        role: relayer.role || "VIEWER",
+      }, "15m");
+
+      const newRefreshTokenData = generateRefreshToken(relayer.id);
+
+      res.json({
+        success: true,
+        data: {
+          accessToken,
+          refreshToken: newRefreshTokenData.token,
+        },
+      });
+
+    } catch (error) {
+      console.error("[AUTH] Refresh error:", error);
+      res.status(500).json({
+        success: false,
+        error: { code: "INTERNAL_ERROR", message: "An error occurred during token refresh" },
+      });
+    }
+  }
 );
 
 export default router;

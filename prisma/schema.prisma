@@ -443,6 +443,39 @@ model HourlyStats {
   @@unique([currency, hour])
   @@index([hour])
 }
+
+// Remittance Transaction Model – Issue #815
+// Records individual remittance transactions for the /api/v1/remittance/history endpoint.
+// Supports cursor-based pagination and compound filter queries by status, asset, and date.
+model RemittanceTransaction {
+  id              String   @id @default(uuid())
+  userId          String   // Relayer / end-user identifier
+  asset           String   @db.VarChar(20)  // e.g., "XLM", "USDC", "NGN"
+  senderCurrency  String   @db.VarChar(10)
+  receiverCurrency String  @db.VarChar(10)
+  amount          Decimal  @db.Decimal(24, 10)  // Amount in sender currency
+  outputAmount    Decimal  @db.Decimal(24, 10)  // Amount in receiver currency
+  fee             Decimal  @db.Decimal(24, 10)  @default(0)
+  rate            Decimal  @db.Decimal(24, 10)  // Exchange rate applied
+  status          String   @db.VarChar(20)  // PENDING | COMPLETED | FAILED | REVERSED
+  provider        String?  @db.VarChar(128) // Liquidity provider / rail used
+  stellarTxHash   String?  // Stellar transaction hash when submitted on-chain
+  reference       String?  @db.VarChar(128) // External reference / correlation ID
+  errorMessage    String?  // Populated when status = FAILED
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Compound index for primary query: filter by userId + status + date range (cursor pagination)
+  @@index([userId, status, createdAt])
+  // Compound index: filter by userId + asset + date range
+  @@index([userId, asset, createdAt])
+  // Compound index: filter by userId + date range only (broadest query)
+  @@index([userId, createdAt])
+  // Allow status-only scans (admin dashboards, reporting)
+  @@index([status, createdAt])
+  // Asset-level reporting
+  @@index([asset, createdAt])
+}
 model OhlcvCandle {
   id        String   @id @default(uuid())
   pair      String   @db.VarChar(10)
@@ -464,4 +497,43 @@ model PoolLiquidity {
   liquidity Decimal  @db.Decimal(20, 10)
   @@unique([poolId, timestamp])
   @@index([poolId, timestamp])
+}
+
+model GovernanceProposal {
+  id              Int       @id @default(autoincrement())
+  proposalId      String    @unique
+  contractId      String
+  actionType      String?
+  actionData      String?
+  expiresAt       DateTime
+  status          String    @default("Queued")
+  transactionHash String?
+  executedAt      DateTime?
+  cancelledAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status, expiresAt])
+  @@index([contractId])
+  @@index([actionType])
+}
+
+model HarvestExecution {
+  id              String    @id @default(uuid())
+  strategyId      String
+  asset           String
+  yieldAmount     Decimal   @db.Decimal(38, 18)
+  gasCost         Decimal   @db.Decimal(38, 18)
+  netProfit       Decimal   @db.Decimal(38, 18)
+  minimumProfit   Decimal   @db.Decimal(38, 18)
+  status          String
+  returnAmount    Decimal?  @db.Decimal(38, 18)
+  transactionHash String?
+  error           String?
+  evaluatedAt     DateTime
+  executedAt      DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([strategyId, evaluatedAt])
+  @@index([status, evaluatedAt])
 }
