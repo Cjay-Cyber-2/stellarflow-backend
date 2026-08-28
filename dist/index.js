@@ -260,7 +260,6 @@ const shutdown = async (signal) => {
         multiSigSubmissionService.stop();
         governanceTimelockService.stop();
         liquidityRebalancingWorker?.stop();
-        apyWorker.stop();
         // FIX 2: Optional chaining — safe to call even if service never started
         gasBalanceMonitorService?.stop();
         hourlyAverageService.stop();

@@ -35,13 +35,7 @@
   "author": "",
   "license": "ISC",
   "type": "module",
-  "lint-staged": {
-    "*.{ts,js,mjs,cjs}": [
-      "eslint --fix",
-      "prettier --write"
-    ],
-    "*.{json,md,yml,yaml}": "prettier --write"
-  },
+  
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1037.0",
     "@msgpack/msgpack": "^2.8.0",
