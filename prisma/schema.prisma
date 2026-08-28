@@ -499,6 +499,18 @@ model PoolLiquidity {
   @@index([poolId, timestamp])
 }
 
+model PoolVolumeAnalytics {
+  id        String   @id @default(uuid())
+  poolId    String   @db.VarChar(50)
+  timestamp DateTime @db.Timestamp(3)
+  volume24h Decimal  @db.Decimal(30, 10)
+  fees24h   Decimal  @db.Decimal(30, 10)
+  tvl       Decimal  @db.Decimal(30, 10)
+
+  @@unique([poolId, timestamp])
+  @@index([poolId, timestamp])
+}
+
 model GovernanceProposal {
   id              Int       @id @default(autoincrement())
   proposalId      String    @unique
