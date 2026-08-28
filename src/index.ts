@@ -9,6 +9,7 @@ import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
 import priceUpdatesRouter from "./routes/priceUpdates";
 import statsRouter from "./routes/stats";
+import vaultRoutes from "./routes/vaults";
 import app from "./app";
 import prisma from "./lib/prisma";
 import { disconnectRedis } from "./lib/redis";
@@ -118,6 +119,7 @@ app.use("/api/market-rates", marketRatesRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/price-updates", priceUpdatesRouter);
 app.use("/api/stats", statsRouter);
+app.use("/api/v1/vaults", vaultRoutes);
 
 // Health check endpoint
 /**
