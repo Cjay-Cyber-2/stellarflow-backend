@@ -22,6 +22,8 @@ export enum AlertType {
   POOL_RESERVE_DEVIATION = "pool_reserve_deviation",
   REDIS_MEMORY_THRESHOLD = "redis_memory_threshold",
   VAULT_LIQUIDATION_RISK = "vault_liquidation_risk",
+  SUPPLY_INVARIANT_DRIFT = "supply_invariant_drift",
+  GOVERNANCE_TIMELOCK_READY = "governance_timelock_ready",
 }
 
 export interface SystemAlert {
@@ -39,7 +41,8 @@ export interface SystemAlert {
 export interface NotificationConfig {
   discordWebhookUrl?: string | undefined;
   slackWebhookUrl?: string | undefined;
-  enabledPlatforms: ("discord" | "slack")[];
+  pagerdutyIntegrationKey?: string | undefined;
+  enabledPlatforms: ("discord" | "slack" | "pagerduty")[];
   rateLimitMinutes: number;
   retryAttempts: number;
   timeoutMs: number;
@@ -570,6 +573,33 @@ export class NotificationService {
     });
   }
 
+  public async sendSupplyInvariantDriftAlert(details: {
+    poolId: string;
+    physicalBalance: number;
+    internalBalance: number;
+    variancePercent: number;
+    blockHeight?: number;
+    correlationId?: string;
+  }): Promise<boolean> {
+    return this.sendAlert({
+      type: AlertType.SUPPLY_INVARIANT_DRIFT,
+      severity: AlertSeverity.CRITICAL,
+      title: "🚨 SUPPLY INVARIANT DRIFT DETECTED",
+      message: `Pool ${details.poolId} physical reserve (${details.physicalBalance}) drifts ${details.variancePercent.toFixed(4)}% from internal balance (${details.internalBalance}).`,
+      details: {
+        pool_id: details.poolId,
+        physical_balance: details.physicalBalance,
+        internal_balance: details.internalBalance,
+        variance_percent: details.variancePercent,
+        block_height: details.blockHeight ?? 0,
+        action_required: "Trigger high-priority PagerDuty alert and investigate smart contract pool accounting",
+      },
+      timestamp: new Date(),
+      service: "supply-invariant-worker",
+      correlationId: details.correlationId,
+    });
+  }
+
   public clearRateLimit(alertKey?: string): void {
     if (alertKey) {
       this.lastSentTimes.delete(alertKey);
@@ -627,3 +657,6 @@ export const sendPriceAnomalyAlert =
   notificationService.sendPriceAnomalyAlert.bind(notificationService);
 export const sendInvariantBreachAlert =
   notificationService.sendInvariantBreachAlert.bind(notificationService);
+export const sendSupplyInvariantDriftAlert =
+  notificationService.sendSupplyInvariantDriftAlert.bind(notificationService);
+
