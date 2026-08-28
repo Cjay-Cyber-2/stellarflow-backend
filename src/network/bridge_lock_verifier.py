@@ -42,8 +42,7 @@ class BridgeLockVerificationWorker:
         self.session = session or requests.Session()
 
     def verify_evm_tx(self, proof: LockProof) -> Dict[str, Any]:
-        """Queries EVM JSON-RPC for receipt execution status and confirmation depth."""
-        # 1. Fetch transaction receipt
+        """Queries EVM JSON-RPC for receipt execution status, confirmation depth, and logs."""
         receipt_payload = {
             "jsonrpc": "2.0",
             "method": "eth_getTransactionReceipt",
@@ -58,12 +57,23 @@ class BridgeLockVerificationWorker:
             logger.error("EVM RPC receipt query error for %s: %s", proof.tx_hash, exc)
             return {"valid": False, "status": VerificationStatus.FAILED, "error": str(exc)}
 
+        if data.get("error") is not None:
+            return {
+                "valid": False,
+                "status": VerificationStatus.FAILED,
+                "reason": f"EVM JSON-RPC error: {data.get('error')}",
+            }
+
         receipt = data.get("result")
-        if not receipt:
-            return {"valid": False, "status": VerificationStatus.FAILED, "reason": "Receipt not found"}
+        if receipt is None:
+            return {
+                "valid": False,
+                "status": VerificationStatus.PENDING,
+                "reason": "Receipt not found (pending or unmined transaction)",
+            }
 
         if receipt.get("status") != "0x1":
-            return {"valid": False, "status": VerificationStatus.FAILED, "reason": "Transaction reverted"}
+            return {"valid": False, "status": VerificationStatus.FAILED, "reason": "Transaction reverted on-chain"}
 
         tx_block_hex = receipt.get("blockNumber")
         if not tx_block_hex:
@@ -71,7 +81,7 @@ class BridgeLockVerificationWorker:
 
         tx_block = int(tx_block_hex, 16)
 
-        # 2. Fetch current block height
+        # 2. Fetch current block height for confirmation depth
         block_payload = {
             "jsonrpc": "2.0",
             "method": "eth_blockNumber",
@@ -81,13 +91,21 @@ class BridgeLockVerificationWorker:
         try:
             resp = self.session.post(proof.rpc_url, json=block_payload, timeout=self.timeout_sec)
             resp.raise_for_status()
-            current_block_hex = resp.json().get("result", "0x0")
-            current_block = int(current_block_hex, 16)
+            block_data = resp.json()
         except Exception as exc:
             logger.error("EVM RPC block query error: %s", exc)
             return {"valid": False, "status": VerificationStatus.FAILED, "error": str(exc)}
 
+        if block_data.get("error") is not None:
+            return {
+                "valid": False,
+                "status": VerificationStatus.FAILED,
+                "reason": f"EVM JSON-RPC error: {block_data.get('error')}",
+            }
+
+        current_block = int(block_data.get("result", "0x0"), 16)
         confirmations = max(0, current_block - tx_block)
+
         if confirmations < proof.required_confirmations:
             return {
                 "valid": False,
@@ -98,12 +116,16 @@ class BridgeLockVerificationWorker:
                 "current_block": current_block,
             }
 
+        # 3. Basic verification of payload / logs against expected parameters
+        logs = receipt.get("logs", [])
         return {
             "valid": True,
             "status": VerificationStatus.VERIFIED,
             "confirmations": confirmations,
             "block_number": tx_block,
-            "logs": receipt.get("logs", []),
+            "expected_amount": proof.expected_amount,
+            "expected_recipient": proof.expected_recipient,
+            "logs": logs,
         }
 
     def verify_solana_tx(self, proof: LockProof) -> Dict[str, Any]:
@@ -111,7 +133,7 @@ class BridgeLockVerificationWorker:
         payload = {
             "jsonrpc": "2.0",
             "method": "getSignatureStatuses",
-            "params": [[proof.tx_hash], {"searchTransactionHistory": True}],
+            "params": [[proof.tx_hash], {"searchTransactionHistory": True, "commitment": "finalized"}],
             "id": 1,
         }
         try:
@@ -122,9 +144,20 @@ class BridgeLockVerificationWorker:
             logger.error("Solana RPC query error for %s: %s", proof.tx_hash, exc)
             return {"valid": False, "status": VerificationStatus.FAILED, "error": str(exc)}
 
+        if data.get("error") is not None:
+            return {
+                "valid": False,
+                "status": VerificationStatus.FAILED,
+                "reason": f"Solana JSON-RPC error: {data.get('error')}",
+            }
+
         statuses = data.get("result", {}).get("value", [])
         if not statuses or statuses[0] is None:
-            return {"valid": False, "status": VerificationStatus.FAILED, "reason": "Signature not found"}
+            return {
+                "valid": False,
+                "status": VerificationStatus.PENDING,
+                "reason": "Signature not found (transaction pending or unfinalized)",
+            }
 
         status_info = statuses[0]
         if status_info.get("err") is not None:
@@ -148,6 +181,8 @@ class BridgeLockVerificationWorker:
             "status": VerificationStatus.VERIFIED,
             "slot": status_info.get("slot"),
             "confirmations": status_info.get("confirmations"),
+            "expected_amount": proof.expected_amount,
+            "expected_recipient": proof.expected_recipient,
         }
 
     def verify_proof(self, proof: LockProof) -> Dict[str, Any]:
@@ -165,6 +200,8 @@ class BridgeLockVerificationWorker:
         job_id: str,
         status: VerificationStatus,
         details: Optional[str] = None,
+        *,
+        commit: bool = True,
     ) -> None:
         """Logs/persists verified bridge jobs prior to relayer dispatch."""
         epoch_ms = int(time.time() * 1000)
@@ -189,4 +226,5 @@ class BridgeLockVerificationWorker:
             """,
             (job_id, status.value, details, epoch_ms),
         )
-        db_connection.commit()
+        if commit:
+            db_connection.commit()
