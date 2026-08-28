@@ -59,6 +59,7 @@ import governanceRouter from "./routes/governance";
 import proofRouter from "./routes/proof";
 import ordersRouter from "./routes/orders";
 import sorobanSimulationRouter from "./routes/sorobanSimulation";
+import remittanceRouter from "./routes/remittance";
 import { sendApiError } from "./lib/apiError.js";
 
 dotenv.config();
@@ -213,9 +214,13 @@ app.use("/api/v1/governance", governanceRouter);
 app.use("/api/v1/proof", proofRouter);
 app.use("/api/v1/orders", ordersRouter);
 
+// Issue #815 – Remittance transaction history endpoint
+app.use("/api/v1/remittance", remittanceRouter);
+
 app.use("/api/v1/governance", governanceRouter);
 
 // Issue #836 – Soroban Contract Instruction & Storage Rent Estimator
+// eslint-disable-next-line no-undef
 app.use("/api/v1/soroban/rent", sorobanRentEstimateRouter);
 app.use("/api/v1/soroban/simulate", sorobanSimulationRouter);
 

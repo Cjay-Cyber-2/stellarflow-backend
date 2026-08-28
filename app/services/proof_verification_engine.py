@@ -28,6 +28,10 @@ Architecture
    - L2: Redis sorted set with per-entry TTL.
    - A cached hit short-circuits the pool entirely and returns within the
      latency budget.
+
+5. **Event-loop latency tracking**
+   - ``verify_proof_async`` measures the event-loop overhead of dispatching
+     to the pool so that latency regressions are visible in logs.
 """
 
 from __future__ import annotations
@@ -40,6 +44,8 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.services.executor_pool import get_heavy_pool, shutdown_pools
 
 logger = logging.getLogger(__name__)
 
@@ -69,20 +75,11 @@ _MAX_PUBLIC_INPUTS: int = 64
 _MAX_PUBLIC_INPUT_LENGTH: int = 1024
 
 # ---------------------------------------------------------------------------
-# Module-level singletons (lazy-initialised)
+# Module-level singletons (lazy-initialised via executor_pool)
 # ---------------------------------------------------------------------------
 
+# Legacy globals kept for backward-compatibility with existing tests / callers.
 _process_pool: Optional[ProcessPoolExecutor] = None
-_pool_lock: Any = None  # replaced at import time with asyncio.Lock or threading.Lock
-
-try:
-    import asyncio as _asyncio
-
-    _pool_lock = _asyncio.Lock()
-except ImportError:  # pragma: no cover
-    import threading
-
-    _pool_lock = threading.Lock()
 
 # L1 cache: {proof_hash: ProofValidationResult}
 _l1_cache: Dict[str, Any] = {}
@@ -270,14 +267,17 @@ def _cpu_intensive_verify(proof_hex: str, public_inputs: List[str]) -> bool:
 
 
 def get_process_pool() -> ProcessPoolExecutor:
-    """Return (or lazily create) the module-level process pool."""
+    """Return (or lazily create) the module-level process pool.
+
+    Delegates to :func:`app.services.executor_pool.get_heavy_pool` so that
+    pool lifecycle is managed centrally.
+    """
     global _process_pool
     if _process_pool is None:
-        _process_pool = ProcessPoolExecutor(
-            max_workers=PROOF_PROCESS_POOL_WORKERS
-        )
+        _process_pool = get_heavy_pool()
         logger.info(
-            "[ProofEngine] Process pool started with %d workers",
+            "[ProofEngine] Process pool initialised via executor_pool "
+            "(%d workers)",
             PROOF_PROCESS_POOL_WORKERS,
         )
     return _process_pool
@@ -403,6 +403,17 @@ async def verify_proof_async(
 
     elapsed_ms = (time.monotonic() - start) * 1000
     pool_time_ms = (time.monotonic() - loop_start) * 1000
+
+    # Track event-loop scheduling overhead (time spent dispatching to pool).
+    # With ``run_in_executor`` the event loop should only be blocked for
+    # a handful of microseconds while the Future is created.
+    if pool_time_ms > 5.0:
+        logger.warning(
+            "[ProofEngine] Event-loop pool dispatch took %.2fms "
+            "(proof=%s)",
+            pool_time_ms,
+            proof_hash[:16],
+        )
 
     # 7. Build result
     contract_sim_ready = False
@@ -569,12 +580,15 @@ async def verify_proof_batch(
 
 
 def shutdown_process_pool() -> None:
-    """Cleanly shut down the process pool.  Intended for graceful shutdown."""
+    """Cleanly shut down the process pool.  Intended for graceful shutdown.
+
+    Delegates to :func:`app.services.executor_pool.shutdown_pools` so that
+    both heavy and light pools are torn down together.
+    """
     global _process_pool
-    if _process_pool is not None:
-        _process_pool.shutdown(wait=True, cancel_futures=False)
-        _process_pool = None
-        logger.info("[ProofEngine] Process pool shut down")
+    shutdown_pools()
+    _process_pool = None
+    logger.info("[ProofEngine] Process pool reference cleared")
 
 
 __all__ = [
