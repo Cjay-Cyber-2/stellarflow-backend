@@ -11,8 +11,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from app.models.proof import ProofVerificationRequest, ProofVerificationResponse
+from app.services.auth_challenge import (
+    consume_auth_challenge,
+    create_auth_challenge,
+)
 from app.services.proof_verification_engine import (
     PROOF_CACHE_TTL_SECONDS,
     PROOF_PROCESS_POOL_WORKERS,
@@ -39,6 +44,42 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+class AuthChallengeConsumeRequest(BaseModel):
+    nonce: str
+
+
+@app.post("/api/v1/auth/challenge")
+async def auth_challenge() -> JSONResponse:
+    """Issue a one-time authentication challenge nonce."""
+    try:
+        nonce = await create_auth_challenge()
+        return JSONResponse({"success": True, "data": {"nonce": nonce}})
+    except Exception as exc:
+        logger.exception("Auth challenge creation failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Authentication unavailable"
+        ) from exc
+
+
+@app.post("/api/v1/auth/challenge/consume")
+async def auth_challenge_consume(
+    request: AuthChallengeConsumeRequest,
+) -> JSONResponse:
+    """Atomically consume an authentication challenge nonce exactly once."""
+    try:
+        consumed = await consume_auth_challenge(request.nonce)
+    except Exception as exc:
+        logger.exception("Auth challenge consumption failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Authentication unavailable"
+        ) from exc
+
+    if not consumed:
+        raise HTTPException(status_code=401, detail="Invalid or expired challenge")
+
+    return JSONResponse({"success": True, "data": {"consumed": True}})
 
 
 @app.get("/health")
@@ -118,3 +159,10 @@ try:
     app.include_router(anchor_router, prefix="/webhook", tags=["Webhooks"])
 except ImportError:
     pass
+
+try:
+    from app.graphql import graphql_app
+
+    app.include_router(graphql_app, prefix="/graphql", tags=["GraphQL"])
+except ImportError:
+    logger.warning("GraphQL dependencies are unavailable; /graphql is disabled")
