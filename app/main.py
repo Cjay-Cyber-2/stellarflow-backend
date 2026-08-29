@@ -1,157 +1,38 @@
-"""FastAPI entrypoint for the StellarFlow Python service.
+from fastapi import FastAPI, Request, HTTPException
+from app.routers import revenue
+from app.sentry import init_sentry, set_sentry_context
+import sentry_sdk
 
-Issue #824 — Shielded Transaction Proof Verification Offloading Engine
+init_sentry()
 
-The Dockerfile starts this module with:
-    uvicorn app.main:app --host 0.0.0.0 --port 8000
-"""
+app = FastAPI(title="StellarFlow FastAPI Service")
 
-import logging
-from contextlib import asynccontextmanager
+@app.middleware("http")
+async def sentry_context_middleware(request: Request, call_next):
+    ledger_sequence = request.headers.get("X-Ledger-Sequence")
+    user_id = request.headers.get("X-User-ID")
+    trace_id = request.headers.get("X-Trace-ID") or request.headers.get("X-Correlation-ID")
+    
+    set_sentry_context(
+        ledger_sequence=int(ledger_sequence) if ledger_sequence else None,
+        user_id=user_id,
+        trace_id=trace_id
+    )
+    
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        status_code = getattr(e, "status_code", 500)
+        if isinstance(e, HTTPException):
+            status_code = e.status_code
+        if status_code in (401, 404):
+            raise e
+        sentry_sdk.capture_exception(e)
+        raise e
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-
-from app.models.proof import ProofVerificationRequest, ProofVerificationResponse
-from app.services.executor_pool import (
-    LATENCY_BUDGET_MS,
-    get_heavy_pool,
-    get_latency_monitor,
-    shutdown_pools,
-    start_latency_monitor,
-    stop_latency_monitor,
-)
-from app.services.proof_verification_engine import (
-    PROOF_CACHE_TTL_SECONDS,
-    PROOF_PROCESS_POOL_WORKERS,
-    get_process_pool,
-    shutdown_process_pool,
-    verify_proof_async,
-    verify_proof_batch,
-)
-
-try:
-    from app.routers import revenue as revenue_router
-    _HAS_REVENUE_ROUTER = True
-except ImportError:
-    _HAS_REVENUE_ROUTER = False
-
-logger = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage executor pools and latency monitor lifecycle."""
-    get_process_pool()
-    get_heavy_pool()
-    await start_latency_monitor()
-    yield
-    await stop_latency_monitor()
-    shutdown_process_pool()
-    shutdown_pools()
-
-
-app = FastAPI(
-    title="StellarFlow Proof Verification Engine",
-    description="Issue #824 — Offloaded ZK proof verification with async process pools",
-    version="1.0.0",
-    lifespan=lifespan,
-)
-
+app.include_router(revenue.router, prefix="/api/v1")
 
 @app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse(
-        {
-            "success": True,
-            "service": "proof-verification",
-            "processPoolWorkers": PROOF_PROCESS_POOL_WORKERS,
-            "cacheTtlSeconds": PROOF_CACHE_TTL_SECONDS,
-        }
-    )
-
-
-@app.post("/proof/verify", response_model=ProofVerificationResponse)
-async def verify_proof(request: ProofVerificationRequest) -> ProofVerificationResponse:
-    """Verify a single shielded transaction proof.
-
-    Offloads CPU-intensive ZK proof checks to a background worker process pool.
-    Returns cached results within the 100ms latency budget when available.
-    """
-    try:
-        result = await verify_proof_async(
-            proof_hex=request.proof.proof_hex,
-            public_inputs=request.proof.public_inputs,
-            contract_params=request.proof.contract_params,
-            proof_scheme=request.proof.proof_scheme.value,
-            simulate_contract=request.simulate_contract,
-        )
-        return ProofVerificationResponse(
-            success=True,
-            result=result,
-        )
-    except Exception as exc:
-        logger.exception("Proof verification endpoint error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/proof/verify-batch")
-async def verify_proof_batch_endpoint(
-    requests: list[ProofVerificationRequest],
-) -> JSONResponse:
-    """Verify multiple shielded transaction proofs concurrently."""
-    if not requests:
-        raise HTTPException(status_code=400, detail="requests list is empty")
-
-    try:
-        payloads = [req.model_dump() for req in requests]
-        results = await verify_proof_batch(payloads)
-        return JSONResponse(
-            {
-                "success": True,
-                "results": [r.to_dict() for r in results],
-            }
-        )
-    except Exception as exc:
-        logger.exception("Batch proof verification endpoint error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.get("/proof/pool-status")
-async def pool_status() -> JSONResponse:
-    """Return process pool status for observability."""
-    pool = get_process_pool()
-    return JSONResponse(
-        {
-            "success": True,
-            "maxWorkers": PROOF_PROCESS_POOL_WORKERS,
-        }
-    )
-
-
-@app.get("/proof/latency")
-async def latency_status() -> JSONResponse:
-    """Return event-loop latency monitor status."""
-    monitor = get_latency_monitor()
-    return JSONResponse(
-        {
-            "success": True,
-            "budgetMs": LATENCY_BUDGET_MS,
-            "maxLatencyMs": round(monitor.max_latency_ms, 3),
-            "avgLatencyMs": round(monitor.avg_latency_ms, 3),
-            "violationCount": monitor.violation_count,
-            "isHealthy": monitor.is_healthy,
-        }
-    )
-
-
-# Include existing routers (if any)
-try:
-    from app.adapters.anchor import router as anchor_router
-
-    app.include_router(anchor_router, prefix="/webhook", tags=["Webhooks"])
-except ImportError:
-    pass
-
-if _HAS_REVENUE_ROUTER:
-    app.include_router(revenue_router.router, tags=["Analytics"])
+def health_check():
+    return {"status": "ok"}
