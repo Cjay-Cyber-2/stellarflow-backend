@@ -16,6 +16,10 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+try:
+    from sqlalchemy.dialects.postgresql import JSONB
+except ImportError:
+    JSONB = sa.JSON
 
 # ---------------------------------------------------------------------------
 # Revision identifiers
@@ -33,7 +37,12 @@ depends_on: Union[str, Sequence[str], None] = None
 def _table_exists(name: str) -> bool:
     """Return True when *name* already exists in the public schema."""
     bind = op.get_bind()
-    return sa.inspect(bind).has_table(name)
+    if bind is None or getattr(bind, "dialect", None) is None:
+        return False
+    try:
+        return sa.inspect(bind).has_table(name)
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
