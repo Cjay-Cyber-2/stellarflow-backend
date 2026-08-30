@@ -4,10 +4,11 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const redisUrl = process.env.REDIS_URL;
+const isTestEnvironment = process.env.NODE_ENV === "test" || Boolean(process.env.JEST_WORKER_ID);
 
 let redisClient: RedisClientType | null = null;
 
-if (redisUrl) {
+if (redisUrl && !isTestEnvironment) {
   redisClient = createClient({
     url: redisUrl,
     socket: {
@@ -34,8 +35,10 @@ if (redisUrl) {
       error,
     );
   });
-} else {
+} else if (!redisUrl) {
   console.info("[Redis] REDIS_URL not set. Redis caching is disabled.");
+} else {
+  console.info("[Redis] Test environment detected. Redis client is disabled for CI-safe execution.");
 }
 
 export function getRedisClient(): RedisClientType | null {

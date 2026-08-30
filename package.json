@@ -83,6 +83,7 @@
     "raw-body": "^3.0.2",
     "redis": "^5.12.1",
     "socket.io": "^4.8.3",
+    "supertest": "^7.0.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "ts-node": "^10.9.2",
