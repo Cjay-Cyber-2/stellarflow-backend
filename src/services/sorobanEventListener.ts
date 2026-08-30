@@ -9,6 +9,7 @@ import { logger } from "../utils/logger";
 import { parseBase64ToPositiveNumber } from "../serialization/helpers.js";
 import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
 import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
+import { getCacheInvalidationManager } from "../cache/CacheInvalidationManager";
 
 dotenv.config();
 
@@ -129,7 +130,22 @@ export class SorobanEventListener {
           // Broadcast all successful updates (Essential or Metric) to UI
           broadcastToSessions("price_update", price);
 
-          // Trigger cache warming on new price update
+          // Issue #789 – Purge stale Redis response caches before warming so
+          // the warming worker repopulates with fresh data.
+          try {
+            await getCacheInvalidationManager().onLedgerEvent(
+              price.ledgerSeq,
+              price,
+            );
+          } catch (err) {
+            logger.error("[EventListener] Cache invalidation failed:", err);
+          }
+
+          // Trigger cache warming on new price update. Dynamically imported
+          // because the warming worker pulls in the signer, which performs
+          // secret retrieval at module load.
+          const { getCacheWarmingWorker } =
+            await import("./cacheWarmingWorker.js");
           const cacheWarmingWorker = getCacheWarmingWorker();
           cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
             logger.error("[EventListener] Cache warming failed:", err);
@@ -223,8 +239,9 @@ export class SorobanEventListener {
    * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
    */
   private async pollGovernanceVoteEvents(): Promise<void> {
-    const contractId =
-      (process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID)?.trim();
+    const contractId = (
+      process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID
+    )?.trim();
     if (!contractId) return;
 
     const rpc = stellarProvider.getRpcServer() as any;
@@ -243,7 +260,9 @@ export class SorobanEventListener {
         limit: 200,
       });
     } catch (err) {
-      logger.networkError("[EventListener] GovernanceVoted poll failed:", { err });
+      logger.networkError("[EventListener] GovernanceVoted poll failed:", {
+        err,
+      });
       return;
     }
 
@@ -251,18 +270,18 @@ export class SorobanEventListener {
       try {
         // Topics: [eventName, accountId, proposalId]
         const topics: string[] = event.topic ?? [];
-        const accountId  = topics[1];
+        const accountId = topics[1];
         const proposalId = topics[2];
 
         if (!accountId || !proposalId) continue;
 
         // Data value is a Soroban SCVal map – coerce to plain object
         const dataVal = event.value?.value ?? event.value ?? {};
-        const choice: string  = dataVal.choice  ?? "Abstain";
-        const weight: string  = dataVal.weight  ?? "0";
-        const txHash: string  = event.txHash    ?? event.id ?? null;
-        const ledger: number  = Number(event.ledger ?? 0);
-        const closedAt: Date  = event.ledgerClosedAt
+        const choice: string = dataVal.choice ?? "Abstain";
+        const weight: string = dataVal.weight ?? "0";
+        const txHash: string = event.txHash ?? event.id ?? null;
+        const ledger: number = Number(event.ledger ?? 0);
+        const closedAt: Date = event.ledgerClosedAt
           ? new Date(event.ledgerClosedAt)
           : new Date();
 
@@ -275,9 +294,13 @@ export class SorobanEventListener {
           votedAt: closedAt,
         });
 
-        if (ledger > this.lastProcessedLedger) this.lastProcessedLedger = ledger;
+        if (ledger > this.lastProcessedLedger)
+          this.lastProcessedLedger = ledger;
       } catch (err) {
-        logger.error("[EventListener] Failed to ingest GovernanceVoted event:", err);
+        logger.error(
+          "[EventListener] Failed to ingest GovernanceVoted event:",
+          err,
+        );
       }
     }
   }

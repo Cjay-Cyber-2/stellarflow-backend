@@ -28,6 +28,8 @@
     "db:migrate": "prisma migrate dev",
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts",
+    "db:validate": "python3 scripts/validate_migrations.py",
+    "test:migrations": "python3 -m pytest tests/test_alembic_migrations.py",
     "docs": "typedoc",
     "docs:watch": "typedoc --watch"
   },
@@ -67,6 +69,7 @@
     "cors": "^2.8.6",
     "crypto": "^1.0.1",
     "csv-writer": "^1.6.0",
+    "date-fns": "^4.4.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.3.1",
