@@ -42,6 +42,7 @@ import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { emergencyPauseListener } from "./services/emergencyPauseListener";
 
 // Load environment variables
 dotenv.config();
@@ -318,6 +319,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
     getOrderBookSnapshotEngine().stop();
+    emergencyPauseListener.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -530,6 +532,19 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Storage rent bump service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Start emergency pause listener
+  try {
+    emergencyPauseListener.start().catch((err: Error) => {
+      console.error("Failed to start emergency pause listener:", err);
+    });
+    console.log(`🚨 Emergency pause listener started`);
+  } catch (err) {
+    console.warn(
+      "Emergency pause listener not started:",
       err instanceof Error ? err.message : err,
     );
   }
