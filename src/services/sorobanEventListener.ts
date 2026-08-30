@@ -150,6 +150,12 @@ export class SorobanEventListener {
           cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
             logger.error("[EventListener] Cache warming failed:", err);
           });
+
+          // Trigger order book snapshot on new ledger (every N ledgers)
+          const orderBookSnapshotEngine = getOrderBookSnapshotEngine();
+          orderBookSnapshotEngine.onNewLedger(price.ledgerSeq).catch((err) => {
+            logger.error("[EventListener] Order book snapshot failed:", err);
+          });
         } catch (err) {
           logger.error("[Worker] Failed to process queued price:", err);
         }

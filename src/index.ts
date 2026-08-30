@@ -25,6 +25,7 @@ import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
+import { apyWorker } from "./jobs/apyWorker";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
@@ -35,9 +36,10 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
+import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
-import { getCacheInvalidationManager } from "./cache/CacheInvalidationManager";
+import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 
@@ -260,6 +262,7 @@ let sorobanEventListener: SorobanEventListener | null = null;
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
+const circuitBreakerService = getCircuitBreakerService();
 
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
@@ -306,17 +309,15 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     multiSigSubmissionService.stop();
     governanceTimelockService.stop();
     liquidityRebalancingWorker?.stop();
+    apyWorker.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
+    circuitBreakerService.stop();
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
-    getCacheInvalidationManager()
-      .stop()
-      .catch((err) => {
-        console.error("Failed to stop cache invalidation manager:", err);
-      });
+    getOrderBookSnapshotEngine().stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -364,9 +365,20 @@ httpServer.listen(PORT, async () => {
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
 
-  // Issue #789 – Consume events:* streams to purge stale caches off-chain
-  getCacheInvalidationManager().start();
-  console.log(`♻️ Cache invalidation manager started`);
+  // Start the order book snapshot engine (Issue #796)
+  try {
+    getOrderBookSnapshotEngine()
+      .start()
+      .catch((err) => {
+        console.error("Failed to start order book snapshot engine:", err);
+      });
+    console.log(`📖 Order book snapshot engine started`);
+  } catch (err) {
+    console.warn(
+      "Order book snapshot engine not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
@@ -455,6 +467,9 @@ httpServer.listen(PORT, async () => {
     // Start OHLCV aggregator
     ohlcvAggregator.start();
     console.log(`📈 OHLCV aggregator started`);
+    // Start APY Calculation Worker
+    apyWorker.start();
+    console.log(`🏦 APY Calculation Worker started`);
   } catch (err) {
     console.warn(
       "Hourly average service not started:",
@@ -487,6 +502,22 @@ httpServer.listen(PORT, async () => {
   } catch (err) {
     console.warn(
       "Gas balance monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Invariant Violation Automated Circuit Breaker (Issue #829):
+  // monitors balance invariants off-chain and auto-submits a pause()
+  // transaction signed by the emergency keeper key when a CRITICAL breach
+  // is detected. Opt-in via CIRCUIT_BREAKER_ENABLED=true.
+  try {
+    circuitBreakerService.start().catch((err: Error) => {
+      console.error("Failed to start circuit breaker service:", err);
+    });
+    console.log(`🚨 Circuit breaker service started`);
+  } catch (err) {
+    console.warn(
+      "Circuit breaker service not started:",
       err instanceof Error ? err.message : err,
     );
   }
