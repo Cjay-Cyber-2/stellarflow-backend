@@ -1,64 +1,49 @@
 ## Description
 
-Introduce PgBouncer as a PostgreSQL connection-pooling proxy for StellarFlow. The runtime database path uses transaction-level pooling to support high-concurrency API traffic while keeping PostgreSQL connection counts and CPU utilization under control.
+This change adds a durable webhook retry worker to StellarFlow using Celery and RabbitMQ. The worker ensures that transient webhook delivery errors are retried with bounded exponential backoff while preserving endpoint health state across process restarts, and it moves permanent or exhausted failures to a terminal DLQ.
 
-The implementation adds a configurable PgBouncer service, routes application database traffic through the pooler, preserves a direct database URL for migrations where required, and provides reproducible k6 load-test scenarios for baseline and pooled performance comparison.
+The implementation adds a retry policy with capped exponential delay and jitter, endpoint health tracking that disables endpoints after 24 hours of continuous failures, and task registration for the queue and dead-letter flow. It also adds a Node-side RabbitMQ publisher so webhook retry messages can be enqueued with the same routing and durability conventions as the worker.
 
 ## Type of Change
 
 - [ ] Bug fix
 - [x] New feature
 - [ ] Breaking change
-- [x] Documentation update
+- [ ] Documentation update
 
 ## Testing
 
 - [x] Tested locally
 - [x] Added unit tests
 - [ ] Tested on Stellar Testnet (for wallet/contract changes)
-- [ ] Baseline load test completed (requires k6 against a running API)
-- [ ] PgBouncer load test completed (requires k6 against a running API)
-- [ ] PostgreSQL CPU and connection metrics compared (requires sustained benchmark)
+- [ ] Live RabbitMQ queue publish probe completed (blocked by Docker Desktop image pull environment issue)
 
 ## Screenshots (if applicable)
 
 ## Related Issues
 
-Closes #913
+Addresses the automated webhook retry worker task.
 
-### Implementation plan
+### Implementation plan and execution summary
 
-1. Add PgBouncer configuration with transaction-level pooling, client limits, pool sizing, reserve capacity, health checks, and configurable credentials.
-2. Add PgBouncer to the local Docker Compose stack and route runtime application connections through it.
-3. Keep migration and administrative database operations on a direct PostgreSQL URL when transaction pooling is incompatible with those operations.
-4. Tune Prisma and SQLAlchemy client-side pooling so the application does not create an oversized pool in front of PgBouncer.
-5. Review transaction, advisory-lock, prepared-statement, and session-state usage for transaction-pool compatibility.
-6. Add PgBouncer and PostgreSQL observability for client connections, server connections, waiting clients, pool utilization, latency, and errors.
-7. Use the existing k6 load-test structure to add baseline and PgBouncer stress scenarios covering representative read and authenticated API traffic.
-8. Compare throughput, p50/p95/p99 latency, error rates, PostgreSQL connection counts, and CPU behavior under sustained and burst traffic.
-9. Document configuration, startup, migration, benchmark, and rollback procedures.
+1. Added a durable retry message model and validation in `app/services/webhook_retry.py`.
+2. Implemented a bounded exponential backoff policy with jitter and a 24-hour endpoint disable window.
+3. Added Celery task routing and queue configuration for `webhook.retry` and `webhook.dead` in `app/celery_app.py`.
+4. Wired the worker task flow in `app/tasks.py` to deliver webhooks, retry transient failures, and move terminal failures to the DLQ.
+5. Added a Node RabbitMQ publisher in `src/services/webhookRetryPublisher.ts` to publish retry events into the same exchange/queue contract.
+6. Added focused regression tests covering backoff behavior, message validation, and endpoint failure tracking.
 
-### Tests to carry out
+### Tests carried out
 
-- Validate PgBouncer configuration and Docker health checks.
-- Run database migrations through the supported direct connection path.
-- Run the existing backend test suites with PgBouncer enabled.
-- Run a low-concurrency k6 smoke test.
-- Run sustained high-concurrency stress tests against direct PostgreSQL and PgBouncer.
-- Record PostgreSQL CPU, active connections, PgBouncer pool statistics, latency percentiles, throughput, and error rates.
-
-### Implementation completed
-
-- Added `pgbouncer/pgbouncer.ini` with transaction pooling, a 10,000-client limit, bounded default/reserve pools, health checks, and timeout controls.
-- Added PgBouncer to `docker-compose.yml` on port `6432` and routed the Compose runtime database URL through it.
-- Preserved `DIRECT_DATABASE_URL` for migrations and administrative database operations.
-- Bounded Node `pg` and SQLAlchemy client pools and disabled asyncpg statement caching when PgBouncer is enabled.
-- Added `tests/load/pgbouncer-stress.js` for repeatable high-concurrency comparison testing.
+- `python -m pytest tests/test_webhook_retry.py -q`
 
 ### Verification completed
 
-- Docker Compose configuration validation passed.
-- PostgreSQL reached a healthy state.
-- PgBouncer reached a healthy state and listened on port `6432`.
-- A real SQL query through PgBouncer returned the expected database and user.
-- `npm run build` passed.
+- Retry policy regression tests passed.
+- Delivery message validation passed.
+- Continuous-failure disable logic passed.
+- Success reset behavior passed.
+
+### Environment note
+
+A live Docker/RabbitMQ publish probe was attempted, but Docker Desktop stalled during the RabbitMQ image pull, so the live queue verification is currently environment-limited rather than code-limited. The implementation and task-registration checks themselves are passing.
