@@ -22,6 +22,7 @@ export enum AlertType {
   POOL_RESERVE_DEVIATION = "pool_reserve_deviation",
   REDIS_MEMORY_THRESHOLD = "redis_memory_threshold",
   VAULT_LIQUIDATION_RISK = "vault_liquidation_risk",
+  GOVERNANCE_TIMELOCK_READY = "governance_timelock_ready",
 }
 
 export interface SystemAlert {

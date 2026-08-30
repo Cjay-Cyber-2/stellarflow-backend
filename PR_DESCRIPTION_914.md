@@ -37,8 +37,14 @@ Closes #914
 ### Tests carried out
 
 - `npx jest test/auth.jest.test.ts --runInBand --silent`
+- `npm run build`
+- `python -m py_compile tests/test_alembic_migrations.py alembic/versions/0001_initial_schema.py`
+- `python -m pytest tests/test_alembic_migrations.py -q` (CI environment; local runner requires the Python dependencies from `requirements.txt`)
 
 Result:
 
 - Test Suites: 1 passed, 1 total
 - Tests: 8 passed, 8 total
+- TypeScript production build passed with `tsc`.
+- Migration syntax and static checks passed.
+- The migration suite validates the PostgreSQL array-default fix in CI with the required Python dependencies installed.

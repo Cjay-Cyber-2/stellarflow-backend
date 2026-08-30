@@ -1,4 +1,4 @@
-import jwt from "jsonwebtoken";
+import jwt, { type SignOptions } from "jsonwebtoken";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
 import { prisma } from "../lib/prisma.js";
@@ -21,6 +21,7 @@ export interface SessionRedisRecord {
   email: string;
   role: string;
   sid: string;
+  sessionId?: string;
   group?: string;
   permissions?: string[];
   ipAddress?: string;
@@ -48,8 +49,8 @@ function getSessionRevocationKey(userId: number, sid: string): string {
   return `${SESSION_REVOCATION_PREFIX}${userId}:${sid}`;
 }
 
-function getSessionSecret(): string {
-  return crypto.createHash("sha256").update(getJwtSecret()).digest();
+function getSessionSecret(): Buffer {
+  return Buffer.from(crypto.createHash("sha256").update(getJwtSecret()).digest());
 }
 
 export function encryptSessionPayload(payload: Record<string, unknown>): string {
@@ -61,7 +62,7 @@ export function encryptSessionPayload(payload: Record<string, unknown>): string 
     cipher.final(),
   ]);
   const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, encrypted]).toString("base64url");
+  return Buffer.from(Buffer.concat([iv, tag, encrypted])).toString("base64url");
 }
 
 export function decryptSessionPayload(ciphertext: string): SessionRedisRecord {
@@ -166,7 +167,7 @@ export async function storeEncryptedSession(
   };
 
   const key = getSessionKey(sessionRecord.userId, sid);
-  await writeSessionValue(key, encryptSessionPayload(sessionRecord), ttlSeconds);
+  await writeSessionValue(key, encryptSessionPayload(sessionRecord as unknown as Record<string, unknown>), ttlSeconds);
 
   return { key, ttlSeconds, sid };
 }
@@ -235,7 +236,7 @@ export function generateToken(payload: Omit<JwtPayload, "iat" | "exp">, expiresI
   const sessionId = payload.sid ?? payload.sessionId ?? crypto.randomUUID();
 
   return jwt.sign({ ...payload, sid: sessionId }, secret, {
-    expiresIn: expiresIn || `${expiryHours}h`,
+    expiresIn: (expiresIn || `${expiryHours}h`) as NonNullable<SignOptions["expiresIn"]>,
   });
 }
 
