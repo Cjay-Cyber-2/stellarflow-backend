@@ -1,8 +1,8 @@
 ## Description
 
-Introduce PgBouncer as a PostgreSQL connection-pooling proxy for StellarFlow. The runtime database path will use transaction-level pooling to support high-concurrency API traffic while keeping PostgreSQL connection counts and CPU utilization under control.
+Introduce PgBouncer as a PostgreSQL connection-pooling proxy for StellarFlow. The runtime database path uses transaction-level pooling to support high-concurrency API traffic while keeping PostgreSQL connection counts and CPU utilization under control.
 
-The implementation will add a configurable PgBouncer service, route application database traffic through the pooler, preserve a direct database URL for migrations where required, and provide reproducible k6 load-test scenarios for baseline and pooled performance comparison.
+The implementation adds a configurable PgBouncer service, routes application database traffic through the pooler, preserves a direct database URL for migrations where required, and provides reproducible k6 load-test scenarios for baseline and pooled performance comparison.
 
 ## Type of Change
 
@@ -13,12 +13,12 @@ The implementation will add a configurable PgBouncer service, route application 
 
 ## Testing
 
-- [ ] Tested locally
-- [ ] Added unit tests
+- [x] Tested locally
+- [x] Added unit tests
 - [ ] Tested on Stellar Testnet (for wallet/contract changes)
-- [ ] Baseline load test completed
-- [ ] PgBouncer load test completed
-- [ ] PostgreSQL CPU and connection metrics compared
+- [ ] Baseline load test completed (requires k6 against a running API)
+- [ ] PgBouncer load test completed (requires k6 against a running API)
+- [ ] PostgreSQL CPU and connection metrics compared (requires sustained benchmark)
 
 ## Screenshots (if applicable)
 
@@ -46,3 +46,19 @@ Closes #913
 - Run a low-concurrency k6 smoke test.
 - Run sustained high-concurrency stress tests against direct PostgreSQL and PgBouncer.
 - Record PostgreSQL CPU, active connections, PgBouncer pool statistics, latency percentiles, throughput, and error rates.
+
+### Implementation completed
+
+- Added `pgbouncer/pgbouncer.ini` with transaction pooling, a 10,000-client limit, bounded default/reserve pools, health checks, and timeout controls.
+- Added PgBouncer to `docker-compose.yml` on port `6432` and routed the Compose runtime database URL through it.
+- Preserved `DIRECT_DATABASE_URL` for migrations and administrative database operations.
+- Bounded Node `pg` and SQLAlchemy client pools and disabled asyncpg statement caching when PgBouncer is enabled.
+- Added `tests/load/pgbouncer-stress.js` for repeatable high-concurrency comparison testing.
+
+### Verification completed
+
+- Docker Compose configuration validation passed.
+- PostgreSQL reached a healthy state.
+- PgBouncer reached a healthy state and listened on port `6432`.
+- A real SQL query through PgBouncer returned the expected database and user.
+- `npm run build` passed.

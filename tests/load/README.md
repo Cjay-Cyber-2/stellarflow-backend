@@ -25,6 +25,7 @@ docker pull grafana/k6
 | `latest-prices.js` | 1,000 RPS sustained on `/api/v1/market-rates/latest` | 1m |
 | `stress.js` | Ramp up past 1,000 RPS to find breaking point | ~8m |
 | `soak.js` | 1,000 RPS for 30 minutes (memory/leak detection) | ~30m |
+| `pgbouncer-stress.js` | Compare high-concurrency reads through PgBouncer | ~7m |
 
 ## Running
 
@@ -57,6 +58,18 @@ Soak test (sustained 30 minutes):
 ```bash
 k6 run tests/load/soak.js
 ```
+
+PgBouncer comparison test:
+
+```bash
+k6 run -e BASE_URL=http://localhost:3000 tests/load/pgbouncer-stress.js
+```
+
+The Compose backend uses PgBouncer on port `6432` for runtime database
+traffic. Compare this scenario with the same backend configured with
+`DIRECT_DATABASE_URL` and record PostgreSQL CPU, `pg_stat_activity` connection
+counts, and PgBouncer `SHOW POOLS` / `SHOW STATS` output. The comparison should
+use the same host resources, dataset, request rate, and duration.
 
 ## Thresholds
 
