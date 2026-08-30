@@ -15,6 +15,9 @@ aiohttp>=3.9.0
 # Async PostgreSQL driver for high-performance bulk inserts
 asyncpg>=0.28.0
 
+# Structured JSON logging for ELK/Datadog ingestion (Issue #logging)
+structlog>=24.0.0
+
 # Distributed workers for heavy analytics jobs
 celery[rabbitmq]>=5.4.0,<6.0.0
 flower>=2.0.1

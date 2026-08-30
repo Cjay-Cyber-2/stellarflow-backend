@@ -6,12 +6,24 @@ The Dockerfile starts this module with:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
 
-import logging
+# ---------------------------------------------------------------------------
+# Logging MUST be configured before any other app imports so that every
+# module that calls logging.getLogger() at import time is already wired to
+# the structlog JSON pipeline.
+# ---------------------------------------------------------------------------
+from app.core.logging import configure_logging  # noqa: E402 — intentional first import
+
+configure_logging()
+
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+import structlog
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.core.logging import bind_request_context, clear_contextvars
 from app.models.proof import ProofVerificationRequest, ProofVerificationResponse
 from app.services.executor_pool import (
     LATENCY_BUDGET_MS,
@@ -36,20 +48,82 @@ try:
 except ImportError:
     _HAS_REVENUE_ROUTER = False
 
-logger = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Request-scoped logging middleware
+# ---------------------------------------------------------------------------
+
+class StructlogRequestMiddleware(BaseHTTPMiddleware):
+    """Inject a per-request trace_id into the structlog context.
+
+    For every inbound HTTP request:
+    - Reads ``X-Trace-Id`` from the request headers (set by a gateway or
+      load-balancer upstream), or generates a fresh UUID4 when absent.
+    - Binds ``trace_id``, ``method``, and ``path`` into the context so every
+      log line emitted during that request carries those fields.
+    - Clears the context after the response is sent to prevent leakage.
+    - Logs a single ``request.completed`` record with the HTTP status code and
+      wall-clock duration (ms) at the end of each request.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        trace_id = request.headers.get("x-trace-id") or str(uuid.uuid4())
+
+        bind_request_context(trace_id=trace_id)
+        # Bind method + path for the lifetime of this request
+        structlog.contextvars.bind_contextvars(
+            http_method=request.method,
+            http_path=request.url.path,
+        )
+
+        import time
+        start = time.monotonic()
+        try:
+            response = await call_next(request)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+            log.info(
+                "request.completed",
+                status_code=response.status_code,
+                duration_ms=elapsed_ms,
+            )
+            # Echo the trace_id back to the caller so it can be correlated
+            response.headers["x-trace-id"] = trace_id
+            return response
+        except Exception:
+            elapsed_ms = round((time.monotonic() - start) * 1000, 2)
+            log.exception("request.failed", duration_ms=elapsed_ms)
+            raise
+        finally:
+            clear_contextvars()
+
+
+# ---------------------------------------------------------------------------
+# Application lifespan
+# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage executor pools and latency monitor lifecycle."""
+    log.info(
+        "stellarflow.startup",
+        process_pool_workers=PROOF_PROCESS_POOL_WORKERS,
+        cache_ttl_seconds=PROOF_CACHE_TTL_SECONDS,
+    )
     get_process_pool()
     get_heavy_pool()
     await start_latency_monitor()
     yield
+    log.info("stellarflow.shutdown")
     await stop_latency_monitor()
     shutdown_process_pool()
     shutdown_pools()
 
+
+# ---------------------------------------------------------------------------
+# Application instance
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="StellarFlow Proof Verification Engine",
@@ -58,6 +132,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(StructlogRequestMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health() -> JSONResponse:
@@ -91,7 +171,7 @@ async def verify_proof(request: ProofVerificationRequest) -> ProofVerificationRe
             result=result,
         )
     except Exception as exc:
-        logger.exception("Proof verification endpoint error: %s", exc)
+        log.exception("proof.verify.error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -113,7 +193,7 @@ async def verify_proof_batch_endpoint(
             }
         )
     except Exception as exc:
-        logger.exception("Batch proof verification endpoint error: %s", exc)
+        log.exception("proof.verify_batch.error", error=str(exc))
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -145,7 +225,10 @@ async def latency_status() -> JSONResponse:
     )
 
 
-# Include existing routers (if any)
+# ---------------------------------------------------------------------------
+# Mount optional routers
+# ---------------------------------------------------------------------------
+
 try:
     from app.adapters.anchor import router as anchor_router
 
