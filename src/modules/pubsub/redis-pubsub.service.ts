@@ -9,7 +9,11 @@ export class RedisPubSubService implements MessageBus, OnModuleDestroy {
   private publisher: RedisClientType;
 
   constructor() {
-    if (process.env.NODE_ENV === "test" || process.env.CI === "true") {
+    const isCiOrTest =
+      process.env.NODE_ENV === "test" ||
+      process.env.CI?.toLowerCase() === "true" ||
+      process.env.GITHUB_ACTIONS?.toLowerCase() === "true";
+    if (isCiOrTest) {
       this.publisher = createClient({ url: "redis://127.0.0.1:6379" });
       return;
     }

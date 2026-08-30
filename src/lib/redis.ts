@@ -4,10 +4,13 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const redisUrl = process.env.REDIS_URL;
+const isCiEnvironment =
+  process.env.CI?.toLowerCase() === "true" ||
+  process.env.GITHUB_ACTIONS?.toLowerCase() === "true";
 const isTestEnvironment =
   process.env.NODE_ENV === "test" ||
   Boolean(process.env.JEST_WORKER_ID) ||
-  process.env.CI === "true";
+  isCiEnvironment;
 
 let redisClient: RedisClientType | null = null;
 

@@ -21,7 +21,11 @@ export class RedisSubscriberService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    if (process.env.NODE_ENV === "test" || process.env.CI === "true") {
+    const isCiOrTest =
+      process.env.NODE_ENV === "test" ||
+      process.env.CI?.toLowerCase() === "true" ||
+      process.env.GITHUB_ACTIONS?.toLowerCase() === "true";
+    if (isCiOrTest) {
       return;
     }
 
