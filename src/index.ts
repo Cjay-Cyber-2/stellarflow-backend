@@ -25,6 +25,7 @@ import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
+import { apyWorker } from "./jobs/apyWorker";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
@@ -308,6 +309,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     multiSigSubmissionService.stop();
     governanceTimelockService.stop();
     liquidityRebalancingWorker?.stop();
+    apyWorker.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -465,6 +467,9 @@ httpServer.listen(PORT, async () => {
     // Start OHLCV aggregator
     ohlcvAggregator.start();
     console.log(`📈 OHLCV aggregator started`);
+    // Start APY Calculation Worker
+    apyWorker.start();
+    console.log(`🏦 APY Calculation Worker started`);
   } catch (err) {
     console.warn(
       "Hourly average service not started:",

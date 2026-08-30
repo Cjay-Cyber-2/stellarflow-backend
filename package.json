@@ -38,6 +38,7 @@
   
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1037.0",
+    "@msgpack/msgpack": "^2.8.0",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/auto-instrumentations-node": "^0.73.0",
     "@opentelemetry/core": "^2.7.0",
@@ -63,6 +64,7 @@
     "cors": "^2.8.6",
     "crypto": "^1.0.1",
     "csv-writer": "^1.6.0",
+    "date-fns": "^4.4.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.3.1",
@@ -78,7 +80,6 @@
     "rate-limit-redis": "4.2.0",
     "raw-body": "^3.0.2",
     "redis": "^5.12.1",
-    "@msgpack/msgpack": "^2.8.0",
     "socket.io": "^4.8.3",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
@@ -89,7 +90,6 @@
     "winston-daily-rotate-file": "^5.0.0"
   },
   "devDependencies": {
-    "@types/bcrypt": "^5.0.2",
     "@types/bcrypt": "^5.0.2",
     "@types/compression": "^1.8.1",
     "@types/express": "^5.0.6",
