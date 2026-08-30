@@ -131,6 +131,16 @@ def _run_migration_step(engine: sa.engine.Engine, mod: types.ModuleType, action:
             ctx = MigrationContext.configure(conn)
             with Operations.context(ctx):
                 with mock.patch("alembic.op.get_bind", return_value=conn):
+                    orig_create_table = mod.op.create_table
+
+                    def _sqlite_create_table(table_name: str, *columns: Any, **kwargs: Any) -> Any:
+                        for column in columns:
+                            default = getattr(column, "server_default", None)
+                            default_sql = str(getattr(default, "arg", default))
+                            if "ARRAY[]::TEXT[]" in default_sql:
+                                column.server_default = sa.text("''")
+                        return orig_create_table(table_name, *columns, **kwargs)
+
                     # Intercept raw Postgres-specific DDL for SQLite in op.execute
                     orig_op_execute = mod.op.execute
 
@@ -149,17 +159,18 @@ def _run_migration_step(engine: sa.engine.Engine, mod: types.ModuleType, action:
                             conn.execute(sa.text(sql_str))
 
                     with mock.patch.object(mod.op, "execute", side_effect=_safe_op_execute):
-                        with mock.patch.object(
-                            mod.op,
-                            "create_unique_constraint",
-                            side_effect=lambda name, table_name, columns, **kw: mod.op.create_index(
-                                name, table_name, columns, unique=True
-                            ),
-                        ):
-                            if action == "upgrade":
-                                mod.upgrade()
-                            else:
-                                mod.downgrade()
+                        with mock.patch.object(mod.op, "create_table", side_effect=_sqlite_create_table):
+                            with mock.patch.object(
+                                mod.op,
+                                "create_unique_constraint",
+                                side_effect=lambda name, table_name, columns, **kw: mod.op.create_index(
+                                    name, table_name, columns, unique=True
+                                ),
+                            ):
+                                if action == "upgrade":
+                                    mod.upgrade()
+                                else:
+                                    mod.downgrade()
             conn.commit()
     finally:
         sa.ARRAY = orig_sa_array
