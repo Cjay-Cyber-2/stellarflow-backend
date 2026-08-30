@@ -21,6 +21,10 @@ export class RedisSubscriberService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
+    if (process.env.NODE_ENV === "test" || process.env.CI === "true") {
+      return;
+    }
+
     await this.subscriber.connect();
 
     await this.subscriber.subscribe(CHANNELS.PRICE_UPDATES, (message) => {

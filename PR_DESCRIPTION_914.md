@@ -38,6 +38,12 @@ Closes #914
 
 - `npx jest test/auth.jest.test.ts --runInBand --silent`
 - `npm run build`
+- `npm ci --no-audit --no-fund`
+- `npx tsx test/stroops.test.ts`
+- `npx tsx test/ghsFetcher.test.ts`
+- `npx tsx test/ngnFetcher.test.ts`
+- `npx tsx test/sorobanEventListener.test.ts`
+- `npx tsx test/circuitBreakerService.test.ts`
 - `python -m py_compile tests/test_alembic_migrations.py alembic/versions/0001_initial_schema.py`
 - `python -m pytest tests/test_alembic_migrations.py -q` (CI environment; local runner requires the Python dependencies from `requirements.txt`)
 
@@ -46,5 +52,7 @@ Result:
 - Test Suites: 1 passed, 1 total
 - Tests: 8 passed, 8 total
 - TypeScript production build passed with `tsc`.
+- Clean npm installation passed with 1,097 packages installed.
+- All five CI-configured TypeScript unit-test commands passed.
 - Migration syntax and static checks passed.
 - The migration suite validates the PostgreSQL array-default fix in CI with the required Python dependencies installed.
