@@ -42,6 +42,7 @@ import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { getCacheEvictionWorker } from "./services/cacheEvictionWorker";
 
 // Load environment variables
 dotenv.config();
@@ -318,6 +319,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
     getOrderBookSnapshotEngine().stop();
+    getCacheEvictionWorker().stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -364,6 +366,9 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  getCacheEvictionWorker().start();
+  console.log(`🧹 Cache eviction & memory purger worker started`);
 
   // Start the order book snapshot engine (Issue #796)
   try {
