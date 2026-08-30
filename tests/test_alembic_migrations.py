@@ -99,6 +99,13 @@ def _tables(engine: sa.engine.Engine) -> List[str]:
         return inspect(conn).get_table_names()
 
 
+def test_initial_schema_uses_sql_expression_for_empty_array_defaults() -> None:
+    migration_text = (_VERSIONS_DIR / "0001_initial_schema.py").read_text(encoding="utf-8")
+
+    assert 'server_default="ARRAY[]::TEXT[]"' not in migration_text
+    assert migration_text.count('server_default=sa.text("ARRAY[]::TEXT[]")') == 2
+
+
 def _run_migration_step(engine: sa.engine.Engine, mod: types.ModuleType, action: str) -> None:
     """Execute upgrade() or downgrade() for a migration module in SQLite-compatible mode."""
     from alembic.runtime.migration import MigrationContext
