@@ -39,6 +39,9 @@ class Xenc:
 
     def var_opaque(self, data: bytes) -> "Xenc":
         self.uint(len(data)).opaque(data)
+        pad = (-len(data)) % 4
+        if pad:
+            self.buf += b"\x00" * pad
         return self
 
     def string(self, text: str) -> "Xenc":
@@ -88,6 +91,37 @@ def push_memo(x: Xenc, memo: Tuple[Any, ...]) -> None:
         x.ulong(int(memo[1]))
     elif kind in (3, 4):  # MEMO_HASH / MEMO_RETURN
         x.opaque(memo[1] if isinstance(memo[1], bytes) else b"\x00" * 32)
+
+
+def push_preconditions(x: Xenc, precondition: Optional[Dict[str, Any]] = None) -> None:
+    """Write a modern ``Preconditions`` union (protocol >= 19).
+
+    ``None`` / ``{}`` encodes ``PRECOND_NONE``; ``{"type": "time"}`` encodes
+    ``PRECOND_TIME``; ``{"type": "v2", ...}`` encodes ``PRECOND_V2``.
+    """
+    if not precondition or precondition.get("type") in (None, "none", 0):
+        x.int(0)  # PRECOND_NONE
+        return
+    kind = precondition.get("type")
+    if kind == "time":
+        x.int(1)  # PRECOND_TIME
+        x.hyper(precondition.get("min_time", 0))
+        x.hyper(precondition.get("max_time", 0))
+        return
+    if kind == "v2":
+        x.int(2)  # PRECOND_V2
+        tb = precondition.get("time_bounds")
+        if tb:
+            x.boolean(True).hyper(tb[0]).hyper(tb[1])
+        else:
+            x.boolean(False)
+        x.boolean(False)  # ledger bounds absent
+        x.int(precondition.get("min_seq_num", 0))
+        x.hyper(precondition.get("min_seq_age", 0))
+        x.uint(precondition.get("min_seq_ledger_gap", 0))
+        x.int(0)  # ExtensionPoint
+        return
+    raise ValueError(f"unsupported test precondition: {kind}")
 
 
 def push_operations(x: Xenc, ops: List[Dict[str, Any]]) -> None:
@@ -197,6 +231,7 @@ def build_v1_envelope(
     fee: int = 100,
     seq: int = 4321,
     memo: Tuple[Any, ...] = (0,),
+    precondition: Optional[Dict[str, Any]] = None,
     num_signatures: int = 0,
 ) -> bytes:
     """Encode an ENVELOPE_TYPE_TX (v1, the modern) envelope."""
@@ -205,7 +240,7 @@ def build_v1_envelope(
     push_muxed(x, source)
     x.uint(fee)
     x.hyper(seq)
-    x.boolean(False)  # timeBounds absent
+    push_preconditions(x, precondition)
     push_memo(x, memo)
     push_operations(x, ops)
     x.int(0)  # TransactionExtension = 0
@@ -234,7 +269,7 @@ def build_fee_bump_envelope(
     push_muxed(x, inner_source)
     x.uint(100)
     x.hyper(inner_seq)
-    x.boolean(False)
+    push_preconditions(x)
     push_memo(x, (0,))
     push_operations(x, ops)
     x.int(0)  # TransactionExt

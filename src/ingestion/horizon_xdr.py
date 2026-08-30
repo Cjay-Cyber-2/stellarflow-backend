@@ -120,7 +120,10 @@ class XdrReader:
             raise XdrDecodeError(
                 f"opaque length {n} exceeds declared maximum {max_len}"
             )
-        return self._take(n)
+        data = self._take(n)
+        # XDR pads variable-length data to a 4-byte boundary.
+        self.pos += (-n) % 4
+        return data
 
     def read_string(self, max_len: Optional[int] = None) -> str:
         raw = self.read_var_opaque(max_len)
@@ -164,10 +167,14 @@ def _crc16_xmodem(data: bytes) -> int:
 
 
 def _encode_check(version_byte: int, payload: bytes) -> str:
-    """Encode *payload* using the Stellar versioned base32 checksum format."""
+    """Encode *payload* using the Stellar versioned base32 checksum format.
+
+    The CRC-16/XMODEM checksum is appended **little-endian** (as produced by
+    ``UInt16LE`` in the reference ``js-stellar-base`` implementation).
+    """
     buf = bytes([version_byte]) + payload
     checksum = _crc16_xmodem(buf)
-    buf += struct.pack(">H", checksum)
+    buf += struct.pack("<H", checksum)
     return base64.b32encode(buf).decode("ascii").rstrip("=")
 
 
@@ -295,6 +302,34 @@ def _decode_price(reader: XdrReader) -> Dict[str, int]:
 
 def _decode_time_bounds(reader: XdrReader) -> Dict[str, int]:
     return {"min_time": reader.read_hyper(), "max_time": reader.read_hyper()}
+
+
+def _decode_ledger_bounds(reader: XdrReader) -> Dict[str, int]:
+    return {"min_ledger": reader.read_uint(), "max_ledger": reader.read_uint()}
+
+
+def _decode_preconditions(reader: XdrReader) -> Dict[str, Any]:
+    """Decode the modern ``Preconditions`` union (protocol >= 19).
+
+    ``TransactionV0`` still carries a legacy optional ``TimeBounds*``, but
+    ``TransactionV1`` (and fee-bump inner transactions) use this union.
+    """
+    precond_type = reader.read_int()
+    if precond_type == 0:  # PRECOND_NONE
+        return {"type": "PRECOND_NONE"}
+    if precond_type == 1:  # PRECOND_TIME
+        return {"type": "PRECOND_TIME", "time_bounds": _decode_time_bounds(reader)}
+    if precond_type == 2:  # PRECOND_V2
+        return {
+            "type": "PRECOND_V2",
+            "time_bounds": reader.read_optional(_decode_time_bounds),
+            "ledger_bounds": reader.read_optional(_decode_ledger_bounds),
+            "min_seq_num": reader.read_int(),
+            "min_seq_age": reader.read_hyper(),
+            "min_seq_ledger_gap": reader.read_uint(),
+            "extension_point": reader.read_int(),
+        }
+    raise XdrDecodeError(f"unsupported PreconditionType: {precond_type}")
 
 
 _MEMO_TYPES = {
@@ -538,7 +573,7 @@ def _transaction_v1(reader: XdrReader) -> Dict[str, Any]:
     source = decode_muxed_account(reader)
     fee = reader.read_uint()
     sequence = reader.read_hyper()
-    time_bounds = reader.read_optional(_decode_time_bounds)
+    preconditions = _decode_preconditions(reader)
     memo = _decode_memo(reader)
     operations, complete, truncated_at = _decode_operations(reader)
     ext = reader.read_int()  # ExtensionPoint — 0 for version 0
@@ -546,7 +581,8 @@ def _transaction_v1(reader: XdrReader) -> Dict[str, Any]:
         "source_account": source.get("address"),
         "fee": fee,
         "sequence": sequence,
-        "time_bounds": time_bounds,
+        "preconditions": preconditions,
+        "time_bounds": preconditions.get("time_bounds"),
         "memo": memo,
         "operations": operations,
         "operation_count": len(operations),

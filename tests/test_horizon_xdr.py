@@ -164,6 +164,44 @@ class TestV0Envelope(unittest.TestCase):
         self.assertEqual(parsed["operations"][0]["value"], bytes("on", "ascii").hex())
 
 
+class TestPreconditions(unittest.TestCase):
+    def test_default_is_precond_none(self):
+        parsed = parse_transaction_envelope_bytes(build_v1_envelope(_PAYMENT_OPS))
+        self.assertEqual(parsed["preconditions"]["type"], "PRECOND_NONE")
+        self.assertIsNone(parsed["time_bounds"])
+
+    def test_precond_time(self):
+        payload = build_v1_envelope(
+            _PAYMENT_OPS,
+            precondition={"type": "time", "min_time": 1_000, "max_time": 2_000},
+        )
+        parsed = parse_transaction_envelope_bytes(payload)
+        self.assertEqual(parsed["preconditions"]["type"], "PRECOND_TIME")
+        self.assertEqual(parsed["preconditions"]["time_bounds"], {"min_time": 1000, "max_time": 2000})
+        self.assertEqual(parsed["time_bounds"], {"min_time": 1000, "max_time": 2000})
+        self.assertTrue(parsed["decode_complete"])
+
+    def test_precond_v2(self):
+        payload = build_v1_envelope(
+            _PAYMENT_OPS,
+            precondition={
+                "type": "v2",
+                "time_bounds": (1_000, 2_000),
+                "min_seq_num": 7,
+                "min_seq_age": 123,
+                "min_seq_ledger_gap": 3,
+            },
+        )
+        parsed = parse_transaction_envelope_bytes(payload)
+        pre = parsed["preconditions"]
+        self.assertEqual(pre["type"], "PRECOND_V2")
+        self.assertEqual(pre["time_bounds"], {"min_time": 1000, "max_time": 2000})
+        self.assertEqual(pre["min_seq_num"], 7)
+        self.assertEqual(pre["min_seq_age"], 123)
+        self.assertEqual(pre["min_seq_ledger_gap"], 3)
+        self.assertIsNone(pre["ledger_bounds"])
+
+
 class TestFeeBumpEnvelope(unittest.TestCase):
     def test_fee_bump_wraps_inner_v1(self):
         payload = build_fee_bump_envelope(_PAYMENT_OPS)
@@ -226,7 +264,7 @@ def _decode_strkey(value: str) -> bytes:
     assert value.startswith("G")
     pad = "=" * ((8 - (len(value) % 8)) % 8)
     raw = base64.b32decode(value + pad)
-    payload, checksum = raw[:-2], struct.unpack(">H", raw[-2:])[0]
+    payload, checksum = raw[:-2], struct.unpack("<H", raw[-2:])[0]
     crc = 0
     for byte in payload:
         crc ^= byte << 8

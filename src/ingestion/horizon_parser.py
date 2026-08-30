@@ -258,6 +258,11 @@ def extract_operation_logs(
     if parsed is None:
         return []
 
+    # Fee-bump envelopes wrap the actual operations inside the inner
+    # transaction envelope.
+    if parsed.get("envelope_type") == "ENVELOPE_TYPE_TX_FEE_BUMP":
+        parsed = parsed.get("inner_transaction") or parsed
+
     logs = []
     tx_sequence = parsed.get("sequence")
     for index, op in enumerate(parsed.get("operations", [])):
