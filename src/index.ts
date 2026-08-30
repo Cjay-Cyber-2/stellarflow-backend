@@ -42,6 +42,8 @@ import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { VolatilityService } from "./services/volatility.service";
+import { ArbitrageScanner } from "./services/arbitrageScanner";
 
 // Load environment variables
 dotenv.config();
@@ -318,6 +320,8 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
     getOrderBookSnapshotEngine().stop();
+    VolatilityService.stop();
+    ArbitrageScanner.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -532,6 +536,20 @@ httpServer.listen(PORT, async () => {
       "Storage rent bump service not started:",
       err instanceof Error ? err.message : err,
     );
+  }
+
+  // Start Volatility Service
+  try {
+    VolatilityService.start();
+  } catch (err) {
+    console.error("Failed to start volatility service:", err);
+  }
+
+  // Start Arbitrage Scanner
+  try {
+    ArbitrageScanner.start();
+  } catch (err) {
+    console.error("Failed to start arbitrage scanner:", err);
   }
 });
 
