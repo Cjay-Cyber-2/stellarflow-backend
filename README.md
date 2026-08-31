@@ -282,6 +282,27 @@ Warm up cache with popular data on startup:
 npm run cache:warm
 ```
 
+### Cache Invalidation (Issue #789)
+
+The **Off-Chain Cache Invalidation Manager** (`src/cache/CacheInvalidationManager.ts`)
+purges stale Redis response caches as soon as off-chain data changes:
+
+- **Ledger events** – the Soroban event listener purges price-derived caches
+  (`market-rates:*`, `history:*`, `stats:*`, `intelligence:*`, `derived:*`,
+  `assets:*`) before the cache warming worker repopulates them.
+- **Database modification triggers** – a Prisma query extension reports
+  create/update/delete operations on cache-relevant models, which purge the
+  matching key patterns.
+- **Stream event publications** – the manager consumes Redis `events:*` streams
+  (e.g. `events:cache-invalidation`, `events:pool-reserve-alerts`) so any
+  service or API instance can request a targeted purge via Redis.
+- **Selective route-key purging** – `purgeRoutePattern()` translates route
+  patterns such as `/api/v1/pools/123/*` into cache-key globs
+  (`pools:123:*`) so only the affected keys are removed.
+
+Invalidation counters are exposed at `GET /api/v1/cache/metrics` under
+`data.invalidations`.
+
 For detailed caching documentation, see [CACHING.md](./CACHING.md).
 
 ---
@@ -291,6 +312,7 @@ For detailed caching documentation, see [CACHING.md](./CACHING.md).
 See [ROADMAP.md](./ROADMAP.md) for the full product roadmap and milestone structure.
 
 **Current milestones:**
+
 - **v0.1** — Testnet MVP (Q2 2026)
 - **v0.2** — Security Hardening (Q3 2026)
 - **v1.0** — Mainnet Launch (Q4 2026)

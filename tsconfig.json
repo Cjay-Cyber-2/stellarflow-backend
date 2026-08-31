@@ -1,6 +1,8 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
   "compilerOptions": {
+
+    "baseUrl": ".",
     "paths": {
       "csv-writer": ["./src/types/csv-writer.d.ts"]
     },
@@ -11,7 +13,8 @@
     // Environment Settings
     "module": "ESNext",
     "target": "ESNext",
-    "moduleResolution": "bundler",
+    "moduleResolution": "node",
+    "ignoreDeprecations": "5.0",
     "allowSyntheticDefaultImports": true,
     "esModuleInterop": true,
     "types": ["node"],

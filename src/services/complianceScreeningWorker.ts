@@ -21,8 +21,8 @@ const DEFAULT_INTERVAL_MS = 15_000;
 
 type RemittanceRow = {
   id: string;
-  senderPublicKey: string;
-  recipientPublicKey: string;
+  senderPublicKey: string | null;
+  recipientPublicKey: string | null;
   status: string;
   payoutHalted: boolean;
 };
@@ -89,6 +89,10 @@ export class ComplianceScreeningWorker {
   }
 
   async screenTransaction(tx: RemittanceRow): Promise<void> {
+    if (!tx.senderPublicKey || !tx.recipientPublicKey) {
+      return;
+    }
+
     await this.db.remittanceTransaction.update({
       where: { id: tx.id },
       data: { status: REMITTANCE_STATUS.SCREENING },
@@ -203,7 +207,14 @@ export class ComplianceScreeningWorker {
   }
 
   private async relayIfCleared(tx: RemittanceRow): Promise<void> {
-    await this.payoutRelay.relay(tx);
+    if (!tx.senderPublicKey || !tx.recipientPublicKey) {
+      return;
+    }
+    await this.payoutRelay.relay({
+      ...tx,
+      senderPublicKey: tx.senderPublicKey,
+      recipientPublicKey: tx.recipientPublicKey,
+    });
     await this.db.remittanceTransaction.update({
       where: { id: tx.id },
       data: {

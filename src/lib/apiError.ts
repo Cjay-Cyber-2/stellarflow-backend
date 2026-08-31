@@ -57,6 +57,19 @@ export const ERROR_MESSAGES: Record<string, string> = {
   UNAUTHENTICATED: "Authentication middleware must run before this handler.",
   INVALID_ADMIN_KEY: "Invalid or missing admin API key.",
   ADMIN_IP_DENIED: "Admin access denied for this IP address.",
+
+  ROUTE_NOT_FOUND: "The requested payment route was not found.",
+  ROUTE_NOT_ACTIVE: "The payment route is not currently active.",
+  NO_ROUTES_FOUND: "No active routes found for this currency pair.",
+  CURRENCY_PAIR_SAME: "Sender and receiver currencies must differ.",
+  AMOUNT_NOT_POSITIVE: "Input amount must be positive.",
+
+  FX_QUOTE_NOT_FOUND: "The requested FX quote was not found.",
+  FX_QUOTE_EXPIRED: "The FX quote has expired.",
+  FX_QUOTE_LOCKED: "The FX quote is already locked.",
+  FX_QUOTE_PENDING: "The FX quote is still pending.",
+  FX_FEED_UNAVAILABLE: "Unable to fetch live FX feed rate.",
+  FX_DEVIATION_EXCEEDED: "Rate deviation exceeds the allowed threshold.",
 };
 
 export function buildHelpLink(errorCode: string): string {

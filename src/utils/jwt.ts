@@ -1,6 +1,8 @@
 import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
+import crypto from "crypto";
 import { prisma } from "../lib/prisma.js";
+import { getRedisClient } from "../lib/redis.js";
 
 export interface JwtPayload {
   userId: number;
@@ -27,12 +29,12 @@ export function getJwtExpiryHours(): number {
   return isNaN(parsed) ? 24 : parsed;
 }
 
-export function generateToken(payload: Omit<JwtPayload, "iat" | "exp">): string {
+export function generateToken(payload: Omit<JwtPayload, "iat" | "exp">, expiresIn?: string): string {
   const secret = getJwtSecret();
   const expiryHours = getJwtExpiryHours();
 
   return jwt.sign(payload, secret, {
-    expiresIn: `${expiryHours}h`,
+    expiresIn: expiresIn || `${expiryHours}h`,
   });
 }
 
@@ -111,4 +113,48 @@ export async function cleanupExpiredSessions(): Promise<number> {
     data: { isActive: false },
   });
   return result.count;
+}
+
+export interface RefreshTokenPayload {
+  userId: number;
+  jti: string;
+  iat?: number;
+  exp?: number;
+}
+
+export function generateRefreshToken(userId: number): { token: string, jti: string, expiresInSec: number } {
+  const secret = getJwtSecret();
+  const jti = crypto.randomUUID();
+  const expiresInSec = 7 * 24 * 60 * 60; // 7 days
+  const token = jwt.sign({ userId, jti }, secret, { expiresIn: expiresInSec });
+  return { token, jti, expiresInSec };
+}
+
+export function verifyRefreshToken(token: string): RefreshTokenPayload | null {
+  try {
+    const secret = getJwtSecret();
+    const decoded = jwt.verify(token, secret) as RefreshTokenPayload;
+    if (!decoded.jti) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+const BLACKLIST_PREFIX = "token_blacklist:";
+
+export async function blacklistRefreshToken(jti: string, expiresInSec: number): Promise<void> {
+  const redis = getRedisClient();
+  if (!redis) {
+    console.warn("[Redis] Not connected, cannot blacklist token");
+    return;
+  }
+  await redis.set(`${BLACKLIST_PREFIX}${jti}`, "revoked", { EX: expiresInSec });
+}
+
+export async function isRefreshTokenBlacklisted(jti: string): Promise<boolean> {
+  const redis = getRedisClient();
+  if (!redis) return false;
+  const status = await redis.get(`${BLACKLIST_PREFIX}${jti}`);
+  return status === "revoked";
 }

@@ -24,6 +24,15 @@ export declare class SorobanEventListener {
      */
     private startWorker;
     private pollTransactions;
+    private pollOrderFilledEvents;
+    /**
+     * Polls Soroban for GovernanceVoted events emitted by the governance contract
+     * and upserts a GovernanceVote row for each unique (accountId, proposalId) pair.
+     *
+     * Expected event topics: ["GovernanceVoted", accountId, proposalId]
+     * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
+     */
+    private pollGovernanceVoteEvents;
     private extractMemoId;
     private parseOperations;
     stop(): void;
