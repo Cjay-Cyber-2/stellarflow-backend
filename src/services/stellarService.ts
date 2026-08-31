@@ -10,6 +10,7 @@ import {
   Account,
   Contract,
   nativeToScVal,
+  rpc as SorobanRpc,
 } from "@stellar/stellar-sdk";
 import stellarProvider from "../lib/stellarProvider";
 import {
@@ -150,7 +151,7 @@ export class StellarService {
 
     const rpcServer = stellarProvider.getRpcServer();
     const simulation = await rpcServer.simulateTransaction(transaction);
-    const prepared = rpcServer.assembleTransaction(transaction, simulation).build();
+    const prepared = SorobanRpc.assembleTransaction(transaction, simulation).build();
     const signature = await signer.sign(prepared.hash());
     const keypair = Keypair.fromPublicKey(publicKey);
     prepared.signatures.push(
