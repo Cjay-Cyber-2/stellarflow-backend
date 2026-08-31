@@ -4,6 +4,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
 import { Horizon } from "@stellar/stellar-sdk";
+import stellarProvider from "./lib/stellarProvider";
 import { getStellarNetwork } from "./lib/stellarNetwork";
 import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
@@ -102,13 +103,8 @@ if (!dashboardUrl) {
 
 const PORT = process.env.PORT || 3000;
 
-// Horizon server for health checks
-const stellarNetwork = getStellarNetwork();
-const horizonUrl =
-  stellarNetwork === "PUBLIC"
-    ? "https://horizon.stellar.org"
-    : "https://horizon-testnet.stellar.org";
-const horizonServer = new Horizon.Server(horizonUrl);
+// Use shared StellarProvider for health checks (supports failover)
+const horizonServer = stellarProvider.getServer();
 
 // Middleware
 app.use(cors());
@@ -170,9 +166,9 @@ app.get("/health", async (req, res) => {
     checks.database = false;
   }
 
-  // Check Stellar Horizon reachability
+  // Check Stellar Horizon reachability using the provider
   try {
-    await horizonServer.root();
+    await stellarProvider.getServer().root();
     checks.horizon = true;
   } catch {
     checks.horizon = false;
