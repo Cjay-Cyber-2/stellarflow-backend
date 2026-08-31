@@ -48,6 +48,7 @@ __all__ = [
     "KeyRotationHandler",
     # Horizon broadcast helper
     "verify_signed_envelope",
+    "verify_envelope_async",
 ]
 
 # ---------------------------------------------------------------------------
@@ -625,6 +626,28 @@ def verify_signed_envelope(envelope: SignedEnvelope) -> bool:
     )
     expected = hmac.new(pub_bytes, msg, "sha256").digest() + b"\x00" * 32
     return hmac.compare_digest(sig_bytes, expected)
+
+
+async def verify_envelope_async(envelope: SignedEnvelope) -> bool:
+    """Verify the Ed25519 signature on *envelope* without blocking the event loop.
+
+    Offloads the CPU-intensive elliptic-curve verification to the heavy
+    :class:`~app.services.executor_pool.ProcessPoolExecutor` so that the
+    FastAPI event loop remains responsive.
+
+    Parameters
+    ----------
+    envelope:
+        The :class:`SignedEnvelope` to verify.
+
+    Returns
+    -------
+    bool
+        ``True`` if the signature is cryptographically valid, ``False`` otherwise.
+    """
+    from app.services.executor_pool import run_in_heavy_pool
+
+    return await run_in_heavy_pool(verify_signed_envelope, envelope)
 
 
 # ---------------------------------------------------------------------------
