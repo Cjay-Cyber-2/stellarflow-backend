@@ -4,6 +4,8 @@ import { broadcastToSessions } from "../lib/socket";
 import stellarProvider from "../lib/stellarProvider";
 import dotenv from "dotenv";
 import { logger } from "../utils/logger";
+import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
+import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
 dotenv.config();
 export class SorobanEventListener {
     bpManager = new BackpressureManager();
@@ -88,6 +90,11 @@ export class SorobanEventListener {
                     }
                     // Broadcast all successful updates (Essential or Metric) to UI
                     broadcastToSessions("price_update", price);
+                    // Trigger cache warming on new price update
+                    const cacheWarmingWorker = getCacheWarmingWorker();
+                    cacheWarmingWorker.onNewLedger(price.ledgerSeq).catch((err) => {
+                        logger.error("[EventListener] Cache warming failed:", err);
+                    });
                 }
                 catch (err) {
                     logger.error("[Worker] Failed to process queued price:", err);
@@ -102,6 +109,8 @@ export class SorobanEventListener {
     async pollTransactions() {
         try {
             this.server = stellarProvider.getServer();
+            await this.pollOrderFilledEvents();
+            await this.pollGovernanceVoteEvents();
             const transactions = await this.server
                 .transactions()
                 .forAccount(this.oraclePublicKey)
@@ -137,6 +146,86 @@ export class SorobanEventListener {
             if (error instanceof Error && error.message.includes("status code 404"))
                 return;
             throw error;
+        }
+    }
+    async pollOrderFilledEvents() {
+        const contractId = process.env.CONTRACT_ID?.trim();
+        if (!contractId)
+            return;
+        const rpc = stellarProvider.getRpcServer();
+        const response = await rpc.getEvents({
+            startLedger: Math.max(1, this.lastProcessedLedger),
+            filters: [{ type: "contract", contractIds: [contractId] }],
+            limit: 100,
+        });
+        for (const event of response.events ?? []) {
+            await verifyOrderFilledEvent(event);
+            const ledger = Number(event.ledger ?? 0);
+            if (ledger > this.lastProcessedLedger)
+                this.lastProcessedLedger = ledger;
+        }
+    }
+    /**
+     * Polls Soroban for GovernanceVoted events emitted by the governance contract
+     * and upserts a GovernanceVote row for each unique (accountId, proposalId) pair.
+     *
+     * Expected event topics: ["GovernanceVoted", accountId, proposalId]
+     * Expected event data:   { choice: "For"|"Against"|"Abstain", weight: string }
+     */
+    async pollGovernanceVoteEvents() {
+        const contractId = (process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID)?.trim();
+        if (!contractId)
+            return;
+        const rpc = stellarProvider.getRpcServer();
+        let response;
+        try {
+            response = await rpc.getEvents({
+                startLedger: Math.max(1, this.lastProcessedLedger),
+                filters: [
+                    {
+                        type: "contract",
+                        contractIds: [contractId],
+                        topics: [["GovernanceVoted", "*", "*"]],
+                    },
+                ],
+                limit: 200,
+            });
+        }
+        catch (err) {
+            logger.networkError("[EventListener] GovernanceVoted poll failed:", { err });
+            return;
+        }
+        for (const event of response.events ?? []) {
+            try {
+                // Topics: [eventName, accountId, proposalId]
+                const topics = event.topic ?? [];
+                const accountId = topics[1];
+                const proposalId = topics[2];
+                if (!accountId || !proposalId)
+                    continue;
+                // Data value is a Soroban SCVal map – coerce to plain object
+                const dataVal = event.value?.value ?? event.value ?? {};
+                const choice = dataVal.choice ?? "Abstain";
+                const weight = dataVal.weight ?? "0";
+                const txHash = event.txHash ?? event.id ?? null;
+                const ledger = Number(event.ledger ?? 0);
+                const closedAt = event.ledgerClosedAt
+                    ? new Date(event.ledgerClosedAt)
+                    : new Date();
+                await ingestGovernanceVoteEvent({
+                    accountId,
+                    proposalId,
+                    choice,
+                    weight,
+                    txHash,
+                    votedAt: closedAt,
+                });
+                if (ledger > this.lastProcessedLedger)
+                    this.lastProcessedLedger = ledger;
+            }
+            catch (err) {
+                logger.error("[EventListener] Failed to ingest GovernanceVoted event:", err);
+            }
         }
     }
     // ... (Keep extractMemoId and parseOperations methods as they were) ...

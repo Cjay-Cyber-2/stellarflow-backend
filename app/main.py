@@ -14,9 +14,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.models.proof import ProofVerificationRequest, ProofVerificationResponse
-from app.services.auth_challenge import (
-    consume_auth_challenge,
-    create_auth_challenge,
+from app.services.executor_pool import (
+    LATENCY_BUDGET_MS,
+    get_heavy_pool,
+    get_latency_monitor,
+    shutdown_pools,
+    start_latency_monitor,
+    stop_latency_monitor,
 )
 from app.services.proof_verification_engine import (
     PROOF_CACHE_TTL_SECONDS,
@@ -27,15 +31,25 @@ from app.services.proof_verification_engine import (
     verify_proof_batch,
 )
 
+try:
+    from app.routers import revenue as revenue_router
+    _HAS_REVENUE_ROUTER = True
+except ImportError:
+    _HAS_REVENUE_ROUTER = False
+
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage process pool lifecycle."""
+    """Manage executor pools and latency monitor lifecycle."""
     get_process_pool()
+    get_heavy_pool()
+    await start_latency_monitor()
     yield
+    await stop_latency_monitor()
     shutdown_process_pool()
+    shutdown_pools()
 
 
 app = FastAPI(
@@ -152,6 +166,22 @@ async def pool_status() -> JSONResponse:
     )
 
 
+@app.get("/proof/latency")
+async def latency_status() -> JSONResponse:
+    """Return event-loop latency monitor status."""
+    monitor = get_latency_monitor()
+    return JSONResponse(
+        {
+            "success": True,
+            "budgetMs": LATENCY_BUDGET_MS,
+            "maxLatencyMs": round(monitor.max_latency_ms, 3),
+            "avgLatencyMs": round(monitor.avg_latency_ms, 3),
+            "violationCount": monitor.violation_count,
+            "isHealthy": monitor.is_healthy,
+        }
+    )
+
+
 # Include existing routers (if any)
 try:
     from app.adapters.anchor import router as anchor_router
@@ -160,9 +190,5 @@ try:
 except ImportError:
     pass
 
-try:
-    from app.graphql import graphql_app
-
-    app.include_router(graphql_app, prefix="/graphql", tags=["GraphQL"])
-except ImportError:
-    logger.warning("GraphQL dependencies are unavailable; /graphql is disabled")
+if _HAS_REVENUE_ROUTER:
+    app.include_router(revenue_router.router, tags=["Analytics"])

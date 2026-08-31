@@ -25,7 +25,7 @@ import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
-import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
+import { apyWorker } from "./jobs/apyWorker";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
 import { validateDatabaseSchema } from "./utils/dbValidator";
@@ -35,8 +35,16 @@ import { registerTracingShutdownHandlers } from "./utils/shutdownTracing";
 import { providerSecretRotationService } from "./services/providerSecretRotationService";
 import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
+import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
+import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
+import { getRegionalHealthService } from "./services/regionalHealthService";
+import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { VolatilityService } from "./services/volatility.service";
+import { ArbitrageScanner } from "./services/arbitrageScanner";
+import { storageMonitorService } from "./services/storageMonitorService";
+import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 
 // Load environment variables
 dotenv.config();
@@ -221,6 +229,8 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     endpoints: {
       health: "/health",
+      liveness: "/health/liveness",
+      readiness: "/health/readiness",
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
@@ -257,6 +267,7 @@ let sorobanEventListener: SorobanEventListener | null = null;
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
+const circuitBreakerService = getCircuitBreakerService();
 
 let isShuttingDown = false;
 let stopEnvFileWatcher: (() => void) | undefined;
@@ -303,12 +314,20 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     multiSigSubmissionService.stop();
     governanceTimelockService.stop();
     liquidityRebalancingWorker?.stop();
+    apyWorker.stop();
+    storageMonitorService.stop(); // <--- ADDED
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
+    circuitBreakerService.stop();
     hourlyAverageService.stop();
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    redisOperationsWorker.stop();
+    complianceScreeningWorker.stop();
+    getOrderBookSnapshotEngine().stop();
+    VolatilityService.stop();
+    ArbitrageScanner.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -351,10 +370,43 @@ httpServer.listen(PORT, async () => {
     `📚 API Documentation available at http://localhost:${PORT}/api/docs`,
   );
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
+  console.log(`💓 Liveness probe at http://localhost:${PORT}/health/liveness`);
+  console.log(
+    `✅ Readiness probe at http://localhost:${PORT}/health/readiness`,
+  );
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  complianceScreeningWorker.start();
+  console.log(`🛡️ Compliance screening worker started`);
+
+  // Start PostgreSQL storage footprint monitor (Issue #813)
+  try {
+    storageMonitorService.start();
+    console.log(`💾 Storage monitor service started`);
+  } catch (err) {
+    console.warn(
+      "Storage monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // Start the order book snapshot engine (Issue #796)
+  try {
+    getOrderBookSnapshotEngine()
+      .start()
+      .catch((err) => {
+        console.error("Failed to start order book snapshot engine:", err);
+      });
+    console.log(`📖 Order book snapshot engine started`);
+  } catch (err) {
+    console.warn(
+      "Order book snapshot engine not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
 
   // Perform contract sanity check before starting ingestion loop
   let contractSanityPassed = true;
@@ -443,6 +495,9 @@ httpServer.listen(PORT, async () => {
     // Start OHLCV aggregator
     ohlcvAggregator.start();
     console.log(`📈 OHLCV aggregator started`);
+    // Start APY Calculation Worker
+    apyWorker.start();
+    console.log(`🏦 APY Calculation Worker started`);
   } catch (err) {
     console.warn(
       "Hourly average service not started:",
@@ -479,6 +534,22 @@ httpServer.listen(PORT, async () => {
     );
   }
 
+  // Invariant Violation Automated Circuit Breaker (Issue #829):
+  // monitors balance invariants off-chain and auto-submits a pause()
+  // transaction signed by the emergency keeper key when a CRITICAL breach
+  // is detected. Opt-in via CIRCUIT_BREAKER_ENABLED=true.
+  try {
+    circuitBreakerService.start().catch((err: Error) => {
+      console.error("Failed to start circuit breaker service:", err);
+    });
+    console.log(`🚨 Circuit breaker service started`);
+  } catch (err) {
+    console.warn(
+      "Circuit breaker service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   // Start storage rent bump service
   try {
     storageRentBumpService.start().catch((err: Error) => {
@@ -489,6 +560,20 @@ httpServer.listen(PORT, async () => {
       "Storage rent bump service not started:",
       err instanceof Error ? err.message : err,
     );
+  }
+
+  // Start Volatility Service
+  try {
+    VolatilityService.start();
+  } catch (err) {
+    console.error("Failed to start volatility service:", err);
+  }
+
+  // Start Arbitrage Scanner
+  try {
+    ArbitrageScanner.start();
+  } catch (err) {
+    console.error("Failed to start arbitrage scanner:", err);
   }
 });
 
