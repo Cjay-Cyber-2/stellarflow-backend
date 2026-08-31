@@ -26,7 +26,6 @@ import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
 import { apyWorker } from "./jobs/apyWorker";
-import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
 import { validateDatabaseSchema } from "./utils/dbValidator";
@@ -44,6 +43,7 @@ import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { VolatilityService } from "./services/volatility.service";
 import { ArbitrageScanner } from "./services/arbitrageScanner";
+import { storageMonitorService } from "./services/storageMonitorService";
 
 // Load environment variables
 dotenv.config();
@@ -312,6 +312,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     governanceTimelockService.stop();
     liquidityRebalancingWorker?.stop();
     apyWorker.stop();
+    storageMonitorService.stop(); // <--- ADDED
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -368,6 +369,17 @@ httpServer.listen(PORT, async () => {
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  // Start PostgreSQL storage footprint monitor (Issue #813)
+  try {
+    storageMonitorService.start();
+    console.log(`💾 Storage monitor service started`);
+  } catch (err) {
+    console.warn(
+      "Storage monitor service not started:",
+      err instanceof Error ? err.message : err,
+    );
+  }
 
   // Start the order book snapshot engine (Issue #796)
   try {
