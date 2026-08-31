@@ -375,6 +375,7 @@ model ApiKey {
   isActive   Boolean   @default(true)
   expiresAt  DateTime?
   lastUsedAt DateTime?
+  tier       String    @default("Free") // API Key tier (Free, Developer, Institutional)
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
 }

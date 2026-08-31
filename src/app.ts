@@ -117,8 +117,8 @@ app.get(
 );
 
 app.use("/api/v1/auth", authRouter);
-app.use("/api", rateLimitMiddleware);
 app.use("/api", apiKeyMiddleware);
+app.use("/api", rateLimitMiddleware);
 app.use("/api", jwtMiddleware);
 
 // Ed25519 signature verification for relayer payloads (Issue #225)
