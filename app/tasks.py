@@ -1,14 +1,17 @@
-"""Distributed tasks for heavy StellarFlow analytics workloads."""
+"""Distributed tasks for heavy StellarFlow analytics and document workloads."""
 
 import asyncio
+import hashlib
 import os
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 import asyncpg
 from celery import Task
 
 from app.celery_app import celery_app
 from app.services.anchor_status_poller import AnchorStatusPoller
+from app.services.receipt_service import generate_payment_receipt
 
 
 class DatabaseTask(Task):
@@ -111,13 +114,56 @@ def aggregate_ledger_analytics(
     return asyncio.run(_aggregate(granularity, cutoff))
 
 
+# ---------------------------------------------------------------------------
+# User activity CSV export (S3)
+# ---------------------------------------------------------------------------
+
+
 async def _export_user_activity(user_id: str) -> dict[str, object]:
+    """Stream a user's ``ledger_events`` to S3 as CSV and return a download URL."""
+    database_url = DatabaseTask._database_url
+    if not database_url:
+        raise RuntimeError("DATABASE_URL or DB_URL must be configured")
+
+    from app.services.user_activity_export import export_user_activity
+
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        async with pool.acquire() as connection:
+            rows = connection.cursor(
+                """
+                SELECT event_hash, ledger_sequence, tx_hash, event_type,
+                       created_at, payload
+                FROM ledger_events
+                WHERE payload->>'user_id' = $1
+                ORDER BY created_at ASC, event_hash ASC
+                """,
+                user_id,
+            )
+            return await export_user_activity(rows, user_id)
+    finally:
+        await pool.close()
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.export_user_activity_csv",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def export_user_activity_csv(self: DatabaseTask, user_id: str) -> dict[str, object]:
+    """Create a user activity CSV in S3 and return its signed download URL."""
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+    return asyncio.run(_export_user_activity(user_id.strip()))
+
+
 # ---------------------------------------------------------------------------
 # Flash-loan revenue accounting tasks
 # ---------------------------------------------------------------------------
-
-import hashlib
-from typing import Any, Dict, Optional
 
 
 def _event_id(tx_hash: str, event_index: int) -> str:
@@ -192,23 +238,6 @@ async def _ingest_flash_loan_events(lookback_minutes: int = 60) -> int:
     if not database_url:
         raise RuntimeError("DATABASE_URL or DB_URL must be configured")
 
-    from app.services.user_activity_export import export_user_activity
-
-    pool = await asyncpg.create_pool(database_url)
-    try:
-        async with pool.acquire() as connection:
-            async with connection.transaction():
-                rows = connection.cursor(
-                    """
-                    SELECT event_hash, ledger_sequence, tx_hash, event_type,
-                           created_at, payload
-                    FROM ledger_events
-                    WHERE payload->>'user_id' = $1
-                    ORDER BY created_at ASC, event_hash ASC
-                    """,
-                    user_id,
-                )
-                return await export_user_activity(rows, user_id)
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=lookback_minutes)
     pool = await asyncpg.create_pool(database_url)
     try:
@@ -259,6 +288,25 @@ async def _ingest_flash_loan_events(lookback_minutes: int = 60) -> int:
             return inserted
     finally:
         await pool.close()
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.ingest_flash_loan_revenue",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def ingest_flash_loan_revenue(
+    self: DatabaseTask,
+    lookback_minutes: int = 60,
+) -> int:
+    """Ingest ``FlashLoanFeesDistributed`` events from ``ledger_events``."""
+    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+    if lookback_minutes < 1:
+        raise ValueError("lookback_minutes must be positive")
+    return int(asyncio.run(_ingest_flash_loan_events(lookback_minutes)))
 
 
 async def _compute_yield_snapshots(granularity: str = "DAILY") -> int:
@@ -345,37 +393,11 @@ async def _compute_yield_snapshots(granularity: str = "DAILY") -> int:
 @celery_app.task(
     bind=True,
     base=DatabaseTask,
-    name="app.tasks.export_user_activity_csv",
-    name="app.tasks.ingest_flash_loan_revenue",
-    autoretry_for=(OSError, asyncpg.PostgresError),
-    retry_backoff=True,
-    max_retries=3,
-)
-def ingest_flash_loan_revenue(
-    self: DatabaseTask,
-    lookback_minutes: int = 60,
-) -> int:
-    """Ingest ``FlashLoanFeesDistributed`` events from ``ledger_events``."""
-    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
-    if lookback_minutes < 1:
-        raise ValueError("lookback_minutes must be positive")
-    return int(asyncio.run(_ingest_flash_loan_events(lookback_minutes)))
-
-
-@celery_app.task(
-    bind=True,
-    base=DatabaseTask,
     name="app.tasks.compute_yield_snapshots",
     autoretry_for=(OSError, asyncpg.PostgresError),
     retry_backoff=True,
     max_retries=3,
 )
-def export_user_activity_csv(self: DatabaseTask, user_id: str) -> dict[str, object]:
-    """Create a user activity CSV in S3 and return its signed download URL."""
-    if not isinstance(user_id, str) or not user_id.strip():
-        raise ValueError("user_id must be a non-empty string")
-    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
-    return asyncio.run(_export_user_activity(user_id.strip()))
 def compute_yield_snapshots(
     self: DatabaseTask,
     granularity: str = "DAILY",
@@ -385,3 +407,113 @@ def compute_yield_snapshots(
     if granularity not in {"HOURLY", "DAILY"}:
         raise ValueError("granularity must be HOURLY or DAILY")
     return int(asyncio.run(_compute_yield_snapshots(granularity)))
+
+
+# ---------------------------------------------------------------------------
+# Issue #772 — Asynchronous PDF payment receipt generation
+# ---------------------------------------------------------------------------
+
+_RECEIPT_QUERY = """
+    SELECT id, "userId", asset, "senderCurrency", "receiverCurrency",
+           amount, "outputAmount", fee, rate, status, provider,
+           "stellarTxHash", reference, "errorMessage", "createdAt", "updatedAt"
+    FROM "RemittanceTransaction"
+    WHERE id = $1 AND status = 'COMPLETED'
+"""
+
+
+async def _fetch_completed_transaction(
+    pool: Any, transaction_id: str
+) -> Optional[Dict[str, Any]]:
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(_RECEIPT_QUERY, transaction_id)
+    return dict(rows[0]) if rows else None
+
+
+async def _receipt_for_transaction(
+    transaction_id: str, user_id: str | None = None
+) -> dict[str, object]:
+    """Fetch a completed remittance transaction and generate its receipt PDF."""
+    database_url = DatabaseTask._database_url
+    if not database_url:
+        raise RuntimeError("DATABASE_URL or DB_URL must be configured")
+
+    if not user_id:
+        raise ValueError(
+            "user_id is required to generate a payment receipt for "
+            "transactions not owned by the authenticated caller"
+        )
+
+    pool = await asyncpg.create_pool(database_url)
+    try:
+        row = await _fetch_completed_transaction(pool, transaction_id)
+    finally:
+        await pool.close()
+
+    if row is None:
+        raise LookupError(
+            f"transaction {transaction_id!r} either does not exist or is not COMPLETED"
+        )
+
+    if row.get("userId") != user_id:
+        raise PermissionError(
+            f"transaction {transaction_id!r} does not belong to user {user_id!r}"
+        )
+
+    receipt_data = {
+        "transaction_id": transaction_id,
+        "user_id": user_id,
+        "asset": row.get("asset"),
+        "amount": row.get("amount"),
+        "sender_currency": row.get("senderCurrency"),
+        "receiver_currency": row.get("receiverCurrency"),
+        "output_amount": row.get("outputAmount"),
+        "fee": row.get("fee") or 0,
+        "rate": row.get("rate"),
+        "status": row.get("status") or "COMPLETED",
+        "provider": row.get("provider"),
+        "reference": row.get("reference"),
+        "stellar_tx_hash": row.get("stellarTxHash"),
+        "completed_at": _iso_or_none(row.get("updatedAt")) or _iso_or_none(row.get("createdAt")),
+    }
+    return generate_payment_receipt(receipt_data)
+
+
+def _iso_or_none(value: Any) -> Optional[str]:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, str):
+        return value
+    return None
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.generate_payment_receipt",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def generate_payment_receipt_task(
+    self: DatabaseTask,
+    transaction_id: str,
+    user_id: str,
+    recipient_email: str | None = None,
+) -> dict[str, object]:
+    """Render, store and notify a PDF receipt for a completed payout.
+
+    Compiles the Jinja2 receipt template to a PDF (WeasyPrint), uploads the
+    document to S3 and sends a signed download link through the configured
+    email / webhook notification handlers.
+    """
+    if not isinstance(transaction_id, str) or not transaction_id.strip():
+        raise ValueError("transaction_id must be a non-empty string")
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+
+    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+    context = {"transaction_id": transaction_id.strip(), "user_id": user_id.strip()}
+    if recipient_email:
+        context["recipient_email"] = recipient_email
+    return asyncio.run(_receipt_for_transaction(**context))

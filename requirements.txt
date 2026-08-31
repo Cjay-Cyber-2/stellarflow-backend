@@ -54,3 +54,16 @@ uvicorn[standard]>=0.24.0
 
 # Process pool executor for CPU-intensive ZK proof verification
 # (uses stdlib concurrent.futures, no extra package needed)
+
+# ---------------------------------------------------------------------------
+# Issue #772 — Asynchronous PDF Payment Receipt Generator Worker
+# ---------------------------------------------------------------------------
+
+# Jinja2 templates for rendering HTML payment receipt documents
+# (app/templates/receipt.html.jinja2)
+jinja2>=3.1.0
+
+# HTML-to-PDF engine used to compile receipt templates into PDF assets
+# (app/services/receipt_service.py). Requires libpango / libpangoft2 at
+# runtime — installed in the Docker image runtime stage.
+weasyprint>=61.0
