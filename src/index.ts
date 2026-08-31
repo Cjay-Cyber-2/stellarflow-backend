@@ -44,6 +44,7 @@ import { redisOperationsWorker } from "./services/redisOperationsWorker";
 import { VolatilityService } from "./services/volatility.service";
 import { ArbitrageScanner } from "./services/arbitrageScanner";
 import { storageMonitorService } from "./services/storageMonitorService";
+import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 
 // Load environment variables
 dotenv.config();
@@ -228,6 +229,8 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     endpoints: {
       health: "/health",
+      liveness: "/health/liveness",
+      readiness: "/health/readiness",
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
@@ -320,6 +323,8 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    redisOperationsWorker.stop();
+    complianceScreeningWorker.stop();
     getOrderBookSnapshotEngine().stop();
     VolatilityService.stop();
     ArbitrageScanner.stop();
@@ -365,10 +370,17 @@ httpServer.listen(PORT, async () => {
     `📚 API Documentation available at http://localhost:${PORT}/api/docs`,
   );
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
+  console.log(`💓 Liveness probe at http://localhost:${PORT}/health/liveness`);
+  console.log(
+    `✅ Readiness probe at http://localhost:${PORT}/health/readiness`,
+  );
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  complianceScreeningWorker.start();
+  console.log(`🛡️ Compliance screening worker started`);
 
   // Start PostgreSQL storage footprint monitor (Issue #813)
   try {

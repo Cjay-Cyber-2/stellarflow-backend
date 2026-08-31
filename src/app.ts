@@ -36,10 +36,12 @@ import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
 import zkRouter from "./routes/zk";
 import governanceRouter from "./routes/governance";
+import healthRouter from "./routes/health";
 import proofRouter from "./routes/proof";
 import ordersRouter from "./routes/orders";
 import sorobanSimulationRouter from "./routes/sorobanSimulation";
 import remittanceRouter from "./routes/remittance";
+import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate";
 import { sendApiError } from "./lib/apiError.js";
 import metricsRouter from "./routes/metrics";
 
@@ -99,6 +101,8 @@ app.use(express.json());
 // Add tracing middleware early in the stack
 app.use(tracingMiddleware);
 app.use(axiosTracingMiddleware);
+
+app.use("/health", healthRouter);
 
 app.use("/api/v1/docs", swaggerUi.serve);
 
@@ -178,6 +182,8 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     endpoints: {
       health: "/health",
+      liveness: "/health/liveness",
+      readiness: "/health/readiness",
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
