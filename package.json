@@ -31,7 +31,13 @@
     "db:validate": "python3 scripts/validate_migrations.py",
     "test:migrations": "python3 -m pytest tests/test_alembic_migrations.py",
     "docs": "typedoc",
-    "docs:watch": "typedoc --watch"
+    "docs:watch": "typedoc --watch",
+    "load:smoke": "k6 run tests/load/smoke.js",
+    "load:peak": "k6 run tests/load/peak.js",
+    "load:stress": "k6 run tests/load/stress.js",
+    "load:soak": "k6 run tests/load/soak.js",
+    "load:monitor": "node tests/load/monitor.js",
+    "load:report": "node tests/load/generate-report.js"
   },
   "keywords": [],
   "author": "",
