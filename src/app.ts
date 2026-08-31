@@ -34,6 +34,7 @@ import statusRouter from "./routes/status";
 import systemControlRouter from "./routes/systemControl";
 import systemFailoverRouter from "./routes/systemFailover";
 import analyticsRouter from "./routes/analytics";
+import gasProfileRouter from "./routes/gasProfile";
 import zkRouter from "./routes/zk";
 import governanceRouter from "./routes/governance";
 import healthRouter from "./routes/health";
@@ -158,6 +159,9 @@ app.use("/api/v1/cache", cacheMetricsRouter);
 
 // Issue #208 – Analytics / OHLC time-series endpoint
 app.use("/api/v1/analytics", analyticsRouter);
+
+// Issue #786 – Gas & CPU instruction profiler daily averages
+app.use("/api/v1/gas-profile", gasProfileRouter);
 
 app.use("/api/v1/zk", zkRouter);
 app.use("/api/v1/governance", governanceRouter);
