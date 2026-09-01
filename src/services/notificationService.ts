@@ -115,7 +115,7 @@ interface SlackPayload {
 export class NotificationService {
   private config: NotificationConfig;
   private lastSentTimes: Map<string, number> = new Map();
-  // eslint-disable-next-line @typescript-eslint/naming-convention
+
   private readonly COLORS = {
     [AlertSeverity.LOW]: 0x00ff00, // Green
     [AlertSeverity.MEDIUM]: 0xffff00, // Yellow
@@ -123,7 +123,6 @@ export class NotificationService {
     [AlertSeverity.CRITICAL]: 0xff0000, // Red
   };
 
-  // eslint-disable-next-line @typescript-eslint/naming-convention
   private readonly SLACK_COLORS = {
     [AlertSeverity.LOW]: "good",
     [AlertSeverity.MEDIUM]: "warning",

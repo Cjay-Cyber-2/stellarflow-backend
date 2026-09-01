@@ -50,12 +50,12 @@ dotenv.config();
 
 const app = express();
 
-const dashboardUrl =
-  process.env.DASHBOARD_URL ||
-  process.env.FRONTEND_URL ||
-  "http://localhost:3000";
-
 app.use(morgan("dev"));
+
+// Issue #792 – Security headers + strict CORS allowlist. Registered before
+// everything else so the headers reach every response, including short-circuit
+// replies such as CORS 403s, preflight 204s and maintenance 503s.
+applyHttpSecurity(app);
 
 // Maintenance mode middleware: must be early in the chain
 app.use(maintenanceMiddleware);
