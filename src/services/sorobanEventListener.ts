@@ -359,4 +359,8 @@ export class SorobanEventListener {
   isActive(): boolean {
     return this.isRunning;
   }
+
+  getQueueDepth(): number {
+    return this.bpManager.getQueueLength();
+  }
 }

@@ -162,29 +162,14 @@ app.use("/api/stats", statsRouter);
  *       '503':
  *         description: One or more services unavailable
  */
-app.get("/health", async (req, res) => {
-  const checks: { database: boolean; horizon: boolean } = {
-    database: false,
-    horizon: false,
+app.get("/health", async (_req, res) => {
+  const watchdog = await systemHealthWatchdog.runOnce();
+  const checks = {
+    database: watchdog.checks.database?.status === "healthy",
+    horizon: watchdog.checks.horizon?.status === "healthy",
+    soroban: watchdog.checks.soroban?.status === "healthy",
   };
-
-  // Check database connectivity
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    checks.database = true;
-  } catch {
-    checks.database = false;
-  }
-
-  // Check Stellar Horizon reachability
-  try {
-    await horizonServer.root();
-    checks.horizon = true;
-  } catch {
-    checks.horizon = false;
-  }
-
-  const healthy = checks.database && checks.horizon;
+  const healthy = watchdog.status === "healthy";
 
   res.status(healthy ? 200 : 503).json({
     success: healthy,
@@ -193,6 +178,7 @@ app.get("/health", async (req, res) => {
       : "One or more services unavailable",
     timestamp: new Date().toISOString(),
     checks,
+    watchdog,
   });
 });
 
@@ -267,6 +253,28 @@ initSocket(httpServer);
 const liquidityRebalancingWorker = startLiquidityRebalancingWorker();
 let sorobanEventListener: SorobanEventListener | null = null;
 
+systemHealthWatchdog.registerWorker({
+  name: "redis-operations",
+  getLastHeartbeatAt: () => redisOperationsWorker.getLastHeartbeatAt(),
+  heartbeatTimeoutMs: redisOperationsWorker.getHeartbeatTimeoutMs(),
+  restart: () => {
+    redisOperationsWorker.stop();
+    redisOperationsWorker.start();
+  },
+});
+
+if (liquidityRebalancingWorker) {
+  systemHealthWatchdog.registerWorker({
+    name: "liquidity-rebalancing",
+    getLastHeartbeatAt: () => liquidityRebalancingWorker.getLastHeartbeatAt(),
+    heartbeatTimeoutMs: liquidityRebalancingWorker.getHeartbeatTimeoutMs(),
+    restart: () => {
+      liquidityRebalancingWorker.stop();
+      liquidityRebalancingWorker.start();
+    },
+  });
+}
+
 // FIX 1: Typed as nullable — constructor is not called at module level,
 // so a missing secret env var won't crash the process before the server starts.
 let gasBalanceMonitorService: GasBalanceMonitorService | null = null;
@@ -319,6 +327,7 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     liquidityRebalancingWorker?.stop();
     apyWorker.stop();
     storageMonitorService.stop(); // <--- ADDED
+    systemHealthWatchdog.stop();
     // FIX 2: Optional chaining — safe to call even if service never started
     gasBalanceMonitorService?.stop();
     circuitBreakerService.stop();
@@ -445,6 +454,14 @@ httpServer.listen(PORT, async () => {
   if (contractSanityPassed) {
     try {
       sorobanEventListener = new SorobanEventListener();
+      systemHealthWatchdog.registerQueue({
+        name: "soroban-event-ingestion",
+        getDepth: () => sorobanEventListener?.getQueueDepth() ?? 0,
+        maxHealthyDepth:
+          Number(process.env.WATCHDOG_INGESTION_QUEUE_MAX_DEPTH) > 0
+            ? Number(process.env.WATCHDOG_INGESTION_QUEUE_MAX_DEPTH)
+            : 800,
+      });
       sorobanEventListener.start().catch((err) => {
         console.error("Failed to start event listener:", err);
       });
