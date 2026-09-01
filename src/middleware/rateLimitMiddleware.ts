@@ -60,13 +60,88 @@ export function rateLimitMiddleware(options?: RateLimitOptions) {
         return;
       }
 
-      res.setHeader("X-RateLimit-Limit", String(limit));
-      res.setHeader("X-RateLimit-Remaining", String(Math.max(0, limit - currentCount)));
-      next();
-    } catch (error) {
-      console.error("[RateLimit] Redis error during rate limiting:", error);
-      // Fail open to prevent service disruption if Redis fails
-      next();
-    }
+/**
+ * Returns true when the request IP is in the whitelist.
+ * Triggers a background refresh if the cache is stale.
+ */
+function isWhitelisted(req: Request): boolean {
+  const now = Date.now();
+  if (now - lastWhitelistRefresh > WHITELIST_REFRESH_MS) {
+    // Refresh in background — don't await so the hot path stays synchronous
+    void refreshWhitelistCache();
+  }
+
+  const clientIp = normaliseIp(resolveClientIp(req));
+  return whitelistedIpCache.has(clientIp);
+}
+
+/**
+ * Builds the express-rate-limit options, wiring up the Redis store when a
+ * Redis client is available and falling back to the default in-memory store
+ * otherwise.
+ */
+function buildRateLimitOptions(): Partial<Options> {
+  const redisClient = getRedisClient();
+
+  const store = redisClient?.isOpen
+    ? new RedisStore({
+        // rate-limit-redis v4 uses sendCommand for redis v4+ clients
+        sendCommand: async (...args: string[]) => {
+          const result = await redisClient.sendCommand(args);
+          // Cast through unknown to satisfy type checker
+          return result as unknown as
+            | boolean
+            | number
+            | string
+            | (boolean | number | string)[];
+        },
+        prefix: "rl:",
+      })
+    : undefined; // falls back to express-rate-limit's built-in MemoryStore
+
+  if (!store) {
+    console.warn(
+      "[RateLimit] Redis unavailable — using in-memory store. " +
+        "Throttling will NOT be shared across multiple instances.",
+    );
+  }
+
+  return {
+    windowMs: appConfig.rateLimit.windowMs,
+    max: async (req: Request) => {
+      if (req.apiKey && req.apiKey.tier) {
+        const tier = req.apiKey.tier.toLowerCase();
+        if (tier === 'institutional') return 10000;
+        if (tier === 'developer') return 1000;
+        return 100; // free tier
+      }
+      return appConfig.rateLimit.maxRequests;
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+    ...(store ? { store } : {}),
+    skip: (req: Request) => {
+      // Bypass entirely when global throttling is disabled
+      if (!appConfig.rateLimit.enabled) return true;
+      // Bypass for whitelisted relayer / admin IPs
+      return isWhitelisted(req);
+    },
+    keyGenerator: (req: Request) => normaliseIp(resolveClientIp(req)),
+    handler: (req: Request, res: Response) => {
+      let maxRequests = appConfig.rateLimit.maxRequests;
+      if (req.apiKey && req.apiKey.tier) {
+        const tier = req.apiKey.tier.toLowerCase();
+        if (tier === 'institutional') maxRequests = 10000;
+        else if (tier === 'developer') maxRequests = 1000;
+        else maxRequests = 100;
+      }
+      res.status(429).json({
+        ...apiErrorPayload(
+          "RATE_LIMITED",
+          `Too many requests. Limit: ${maxRequests} per ${Math.round(appConfig.rateLimit.windowMs / 60_000)} minutes.`,
+        ),
+        retryAfter: Math.ceil(appConfig.rateLimit.windowMs / 1000),
+      });
+    },
   };
 }
