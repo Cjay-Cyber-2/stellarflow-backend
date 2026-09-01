@@ -1,8 +1,8 @@
 import { createServer } from "http";
 import compression from "compression";
-import cors from "cors";
 import dotenv from "dotenv";
-import express from "express";
+import { Horizon } from "@stellar/stellar-sdk";
+import { getStellarNetwork } from "./lib/stellarNetwork";
 import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
 import priceUpdatesRouter from "./routes/priceUpdates";
@@ -20,6 +20,7 @@ import {
 } from "./services/gasBalanceMonitorService";
 import { sanitizeEnvironmentVariables } from "./config/environment";
 import { validateEnv } from "./utils/envValidator";
+import { refreshAllowedOrigins } from "./middleware/corsMiddleware";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
@@ -35,12 +36,15 @@ import { priceAggregatorService } from "./services/priceAggregatorService";
 import { contractSanityCheckService } from "./services/contractSanityCheckService";
 import { getCircuitBreakerService } from "./services/circuitBreakerService";
 import { governanceTimelockService } from "./services/governanceTimelockService";
+import { getRegionalHealthService } from "./services/regionalHealthService";
 import { storageRentBumpService } from "./services/storageRentBumpService";
 import { getOrderBookSnapshotEngine } from "./services/orderBookSnapshotEngine";
 import { getRegionalHealthService } from "./services/regionalHealthService";
 import { redisOperationsWorker } from "./services/redisOperationsWorker";
+import { VolatilityService } from "./services/volatility.service";
+import { ArbitrageScanner } from "./services/arbitrageScanner";
 import { storageMonitorService } from "./services/storageMonitorService";
-import { systemHealthWatchdog } from "./services/systemHealthWatchdog";
+import { complianceScreeningWorker } from "./services/complianceScreeningWorker";
 
 // Load environment variables
 dotenv.config();
@@ -89,21 +93,32 @@ if (missingEnvVars.length > 0) {
   process.exit(1);
 }
 
-const dashboardUrl =
-  process.env.DASHBOARD_URL ||
-  process.env.FRONTEND_URL ||
-  "http://localhost:3000";
+// Issue #792 – Fail fast when the CORS allowlist is empty in production rather
+// than starting a server that rejects every browser client.
+const allowedOrigins = refreshAllowedOrigins();
 
-if (!dashboardUrl) {
-  console.error("❌ Missing required environment variable: DASHBOARD_URL");
+if (allowedOrigins.length === 0) {
+  console.error(
+    "❌ No CORS origins configured. Set CORS_ALLOWED_ORIGINS (comma-separated) or DASHBOARD_URL.",
+  );
   process.exit(1);
 }
 
+console.log(`🔒 CORS allowlist: ${allowedOrigins.join(", ")}`);
+
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// Horizon server for health checks
+const stellarNetwork = getStellarNetwork();
+const horizonUrl =
+  stellarNetwork === "PUBLIC"
+    ? "https://horizon.stellar.org"
+    : "https://horizon-testnet.stellar.org";
+const horizonServer = new Horizon.Server(horizonUrl);
+
+// CORS, security headers and body parsing are configured once in app.ts.
+// Re-registering them here previously overwrote the strict allowlist with a
+// wildcard Access-Control-Allow-Origin.
 
 // Routes
 app.use("/api/market-rates", marketRatesRouter);
@@ -203,6 +218,8 @@ app.get("/", (req, res) => {
     version: "1.0.0",
     endpoints: {
       health: "/health",
+      liveness: "/health/liveness",
+      readiness: "/health/readiness",
       marketRates: {
         allRates: "/api/v1/market-rates/rates",
         singleRate: "/api/v1/market-rates/rate/:currency",
@@ -318,7 +335,11 @@ const shutdown = async (signal: "SIGINT" | "SIGTERM"): Promise<void> => {
     priceAggregatorService.stop();
     providerSecretRotationService.stop();
     storageRentBumpService.stop();
+    redisOperationsWorker.stop();
+    complianceScreeningWorker.stop();
     getOrderBookSnapshotEngine().stop();
+    VolatilityService.stop();
+    ArbitrageScanner.stop();
     stopConfigWatcher();
     stopEnvFileWatcher?.();
 
@@ -361,10 +382,17 @@ httpServer.listen(PORT, async () => {
     `📚 API Documentation available at http://localhost:${PORT}/api/docs`,
   );
   console.log(`🏥 Health check at http://localhost:${PORT}/health`);
+  console.log(`💓 Liveness probe at http://localhost:${PORT}/health/liveness`);
+  console.log(
+    `✅ Readiness probe at http://localhost:${PORT}/health/readiness`,
+  );
   console.log(`🔌 Socket.io ready for dashboard connections`);
 
   redisOperationsWorker.start();
   console.log(`🧹 Redis operations worker started`);
+
+  complianceScreeningWorker.start();
+  console.log(`🛡️ Compliance screening worker started`);
 
   // Start PostgreSQL storage footprint monitor (Issue #813)
   try {
@@ -554,8 +582,19 @@ httpServer.listen(PORT, async () => {
     );
   }
 
-  systemHealthWatchdog.start();
-  console.log(`🩺 System health watchdog started`);
+  // Start Volatility Service
+  try {
+    VolatilityService.start();
+  } catch (err) {
+    console.error("Failed to start volatility service:", err);
+  }
+
+  // Start Arbitrage Scanner
+  try {
+    ArbitrageScanner.start();
+  } catch (err) {
+    console.error("Failed to start arbitrage scanner:", err);
+  }
 });
 
 export default app;
