@@ -31,6 +31,8 @@ export default [
         URLSearchParams: "readonly",
         fetch: "readonly",
         Response: "readonly",
+        Headers: "readonly",
+        Request: "readonly",
       },
     },
     plugins: {

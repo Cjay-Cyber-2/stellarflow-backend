@@ -402,7 +402,7 @@ export class MultiSigService {
       collectedSignatures: updated.collectedSignatures,
       requiredSignatures: updated.requiredSignatures,
       thresholdMet,
-      broadcast,
+      ...(broadcast !== undefined ? { broadcast } : {}),
     };
   }
 

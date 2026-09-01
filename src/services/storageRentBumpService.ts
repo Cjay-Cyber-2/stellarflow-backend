@@ -6,7 +6,9 @@ import {
   SorobanDataBuilder,
 } from "@stellar/stellar-sdk";
 import stellarProvider from "../lib/stellarProvider";
+import { getStellarNetworkPassphrase } from "../lib/stellarNetwork";
 import { StellarService } from "./stellarService";
+import { getGasProfilerService } from "./gasProfiler/gasProfilerService";
 import { logger } from "../utils/logger";
 import dotenv from "dotenv";
 
@@ -125,12 +127,9 @@ export class StorageRentBumpService {
 
         const ttl = entry.liveUntilLedgerSeq - currentLedger;
         if (ttl < this.MIN_TTL_LEDGERS) {
-          const keyBase64 = entry.xdr.toXDR("base64"); // We could parse it back, but we can just use the returned key directly from entry.xdr if it was the LedgerKey. Wait, entry has key? No, `entry` has `key` which is xdr.LedgerKey ?
-          // In Soroban RPC 20+, `entry` contains the `xdr` of the ledger entry data.
-          // The request keys map 1:1, but the simplest is just to rebuild from the original keys.
-          // Wait, `getLedgerEntries` returns an array of `entries`.
-          // Let's just blindly add all our keys to `keysToBump` if we notice ANY of them are below TTL.
-          keysToBump.push(xdr.LedgerKey.fromXDR(entry.key, "base64"));
+          // `getLedgerEntries` returns each entry with its `key` already decoded
+          // as an `xdr.LedgerKey`, so we can push it directly onto the bump list.
+          keysToBump.push(entry.key);
         }
       }
 
@@ -159,7 +158,7 @@ export class StorageRentBumpService {
         (sourceAccount, currentFee) => {
           return new TransactionBuilder(sourceAccount, {
             fee: currentFee.toString(),
-            networkPassphrase: stellarProvider.getNetworkPassphrase(),
+            networkPassphrase: getStellarNetworkPassphrase(),
           })
             .addOperation(
               Operation.extendFootprintTtl({
@@ -177,6 +176,16 @@ export class StorageRentBumpService {
       console.info(
         `[StorageRentBumpService] ✅ Storage bump transaction confirmed: ${txHash}`,
       );
+
+      // Issue #786 – Horizon confirmation does not include Soroban meta; fetch
+      // the result from RPC and profile it. Fire-and-forget.
+      const hash =
+        typeof txHash === "string"
+          ? txHash
+          : (txHash as { hash?: string })?.hash;
+      if (hash) {
+        void getGasProfilerService().profileByHash(hash, "submission");
+      }
     } catch (error) {
       console.error("[StorageRentBumpService] Error bumping storage:", error);
     }

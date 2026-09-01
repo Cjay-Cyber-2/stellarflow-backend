@@ -1,68 +1,66 @@
-import { Router, Request, Response } from "express";
-import { votingPowerService } from "../services/votingPowerService";
-import { sendApiError } from "../lib/apiError";
+/**
+ * Governance Routes
+ *
+ * Mounted at: /api/v1/governance
+ *
+ * Endpoints:
+ *   GET /api/v1/governance/voters/:account_id  – voter history + delegation tree
+ */
+
+import { Router } from "express";
+import { getVoterProfile, governanceVoterCache } from "../controllers/governanceController.js";
 
 const router = Router();
 
 /**
- * @route GET /api/v1/governance/voting-weight
- * @desc Get voting weight for an account at a specific ledger sequence
- * @access Public (or authenticated depending on frontend requirements)
+ * @swagger
+ * /api/v1/governance/voters/{account_id}:
+ *   get:
+ *     tags:
+ *       - Governance
+ *     summary: Voter history and delegation tree
+ *     description: >
+ *       Returns a voter's past on-chain votes (ingested from Soroban GovernanceVoted
+ *       events), their active inbound/outbound delegation chain resolved via a
+ *       PostgreSQL recursive CTE, and a per-day voting weight trend.
+ *     parameters:
+ *       - in: path
+ *         name: account_id
+ *         required: true
+ *         schema:
+ *           type: string
+ *           pattern: '^G[A-Z2-7]{55}$'
+ *         description: Stellar public key of the voter
+ *       - in: query
+ *         name: from
+ *         schema: { type: string, format: date-time }
+ *         description: "Vote history start (ISO-8601). Default: 90 days ago."
+ *       - in: query
+ *         name: to
+ *         schema: { type: string, format: date-time }
+ *         description: "Vote history end (ISO-8601). Default: now."
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+ *         description: Max votes per page.
+ *       - in: query
+ *         name: cursor
+ *         schema: { type: integer }
+ *         description: Pagination cursor (nextCursor from previous response).
+ *       - in: query
+ *         name: trendDays
+ *         schema: { type: integer, minimum: 7, maximum: 365, default: 90 }
+ *         description: Rolling window for weight trend (days).
+ *     responses:
+ *       '200':
+ *         description: Voter profile
+ *       '400':
+ *         description: Invalid parameters
+ *       '404':
+ *         description: No governance activity for this account
+ *       '500':
+ *         description: Internal server error
  */
-router.get("/voting-weight", async (req: Request, res: Response) => {
-  try {
-    const { account, ledgerSequence } = req.query;
-
-    if (!account || typeof account !== "string") {
-      return sendApiError(res, 400, "BAD_REQUEST", "Account is required");
-    }
-
-    if (!ledgerSequence || isNaN(Number(ledgerSequence))) {
-      return sendApiError(
-        res,
-        400,
-        "BAD_REQUEST",
-        "Valid ledgerSequence is required",
-      );
-    }
-
-    const data = await votingPowerService.getVotingWeightAtLedger(
-      account,
-      Number(ledgerSequence),
-    );
-
-    res.json({
-      success: true,
-      data,
-    });
-  } catch (error) {
-    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", (error as Error).message);
-  }
-});
-
-/**
- * @route GET /api/v1/governance/voting-power/:account
- * @desc Calculate and return user's voting power snapshot based on current lock durations
- * @access Public
- */
-router.get("/voting-power/:account", async (req: Request, res: Response) => {
-  try {
-    const { account } = req.params;
-
-    if (!account) {
-      return sendApiError(res, 400, "BAD_REQUEST", "Account is required");
-    }
-
-    const snapshot =
-      await votingPowerService.getUserVotingPowerSnapshot(account);
-
-    res.json({
-      success: true,
-      data: snapshot,
-    });
-  } catch (error) {
-    sendApiError(res, 500, "INTERNAL_SERVER_ERROR", (error as Error).message);
-  }
-});
+router.get("/voters/:account_id", governanceVoterCache(), getVoterProfile);
 
 export default router;
