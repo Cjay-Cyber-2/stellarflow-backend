@@ -4,7 +4,9 @@ import os
 
 from celery import Celery
 from celery.schedules import crontab
+from app.sentry import init_sentry
 
+init_sentry()
 
 celery_app = Celery(
     "stellarflow",
@@ -21,6 +23,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     beat_schedule={
+        "poll-anchor-settlement-statuses": {
+            "task": "app.tasks.poll_anchor_settlement_statuses",
+            "schedule": 30.0,
+        },
         "aggregate-minute-analytics": {
             "task": "app.tasks.aggregate_ledger_analytics",
             "schedule": crontab(minute="*/5"),

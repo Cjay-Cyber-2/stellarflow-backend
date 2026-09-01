@@ -8,12 +8,26 @@ import asyncpg
 from celery import Task
 
 from app.celery_app import celery_app
+from app.services.anchor_status_poller import AnchorStatusPoller
 
 
 class DatabaseTask(Task):
     """Base task that exposes the configured PostgreSQL connection string."""
 
     _database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.poll_anchor_settlement_statuses",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def poll_anchor_settlement_statuses(self: DatabaseTask) -> int:
+    """Poll SEP-24/SEP-31 payout statuses and notify WebSocket subscribers."""
+    return asyncio.run(AnchorStatusPoller().poll_once())
 
 
 async def _aggregate(granularity: str, cutoff: datetime) -> int:
