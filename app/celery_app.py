@@ -23,6 +23,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     beat_schedule={
+        "poll-anchor-settlement-statuses": {
+            "task": "app.tasks.poll_anchor_settlement_statuses",
+            "schedule": 30.0,
+        },
         "aggregate-minute-analytics": {
             "task": "app.tasks.aggregate_ledger_analytics",
             "schedule": crontab(minute="*/5"),
