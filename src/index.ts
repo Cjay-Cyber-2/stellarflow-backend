@@ -2,6 +2,7 @@ import { createServer } from "http";
 import compression from "compression";
 import dotenv from "dotenv";
 import { Horizon } from "@stellar/stellar-sdk";
+import stellarProvider from "./lib/stellarProvider";
 import { getStellarNetwork } from "./lib/stellarNetwork";
 import marketRatesRouter from "./routes/marketRates";
 import historyRouter from "./routes/history";
@@ -109,13 +110,8 @@ console.log(`🔒 CORS allowlist: ${allowedOrigins.join(", ")}`);
 
 const PORT = process.env.PORT || 3000;
 
-// Horizon server for health checks
-const stellarNetwork = getStellarNetwork();
-const horizonUrl =
-  stellarNetwork === "PUBLIC"
-    ? "https://horizon.stellar.org"
-    : "https://horizon-testnet.stellar.org";
-const horizonServer = new Horizon.Server(horizonUrl);
+// Use shared StellarProvider for health checks (supports failover)
+const horizonServer = stellarProvider.getServer();
 
 // CORS, security headers and body parsing are configured once in app.ts.
 // Re-registering them here previously overwrote the strict allowlist with a
