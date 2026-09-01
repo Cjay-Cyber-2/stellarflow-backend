@@ -10,11 +10,10 @@ const environment = process.env.NODE_ENV || "development";
 // Add default metrics (e.g., memory, CPU)
 promClient.collectDefaultMetrics({
   register,
-  labels: { app: 'stellarflow-backend', environment },
+  labels: { app: "stellarflow-backend" },
 });
 
-/** 
- * Ingestion Queue Metrics 
+/** * NEW: Ingestion Queue Metrics
  * Tracks the current depth of the backpressure queue
  */
 export const ingestionQueueDepth = new promClient.Gauge({
@@ -119,6 +118,7 @@ export const metricsMiddleware = (
     } else {
       if (
         ["/health", "/", "/metrics"].includes(req.path) ||
+        req.path.startsWith("/health/") ||
         req.path.startsWith("/api/v1/docs")
       ) {
         routeStr = req.path;

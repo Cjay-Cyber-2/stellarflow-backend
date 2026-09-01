@@ -21,6 +21,7 @@ import { validateEnv } from "./utils/envValidator";
 import { enableGlobalLogMasking } from "./utils/logMasker";
 import { hourlyAverageService } from "./services/hourlyAverageService";
 import { ohlcvAggregator } from "./jobs/ohlcvJob";
+import { apyWorker } from "./jobs/apyWorker";
 import { watchConfig } from "./config/configWatcher";
 import { startEnvFileWatcher } from "./config/envFileWatcher";
 import { validateDatabaseSchema } from "./utils/dbValidator";
@@ -368,6 +369,9 @@ httpServer.listen(PORT, async () => {
         // Start OHLCV aggregator
         ohlcvAggregator.start();
         console.log(`📈 OHLCV aggregator started`);
+        // Start APY Calculation Worker
+        apyWorker.start();
+        console.log(`🏦 APY Calculation Worker started`);
     }
     catch (err) {
         console.warn("Hourly average service not started:", err instanceof Error ? err.message : err);
