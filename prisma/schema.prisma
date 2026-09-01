@@ -486,6 +486,31 @@ model RemittanceTransaction {
   @@index([senderPublicKey])
   @@index([recipientPublicKey])
 }
+
+// Remittance Dispute Model – Issue #834
+// Tracks dispute tickets opened when fiat payouts fail or time out.
+// State machine: open -> investigating -> refunded | closed.
+model RemittanceDispute {
+  id           String    @id @default(uuid())
+  remittanceId String    // RemittanceTransaction.id the dispute belongs to
+  userId       String    // Relayer / end-user identifier
+  status       String    @db.VarChar(20) @default("open") // open | investigating | refunded | closed
+  reason       String    @db.VarChar(255) // Payout failure / timeout reason captured at open
+  details      String?   // Structured JSON details captured when the dispute was opened
+  email        String?   // Contact address notified on state changes
+  webhookUrl   String?   // Endpoint notified on state changes (webhook updates)
+  refundAmount Decimal?  @db.Decimal(24, 10) // Amount refunded for manual refunds
+  refundedById String?   // Operator / admin identifier that triggered the refund
+  refundedAt   DateTime? // When the manual refund was issued
+  resolvedById String?   // Operator / admin identifier that closed the dispute
+  resolvedAt   DateTime? // When the dispute was closed
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([userId, status, createdAt])
+  @@index([remittanceId])
+  @@index([status, createdAt])
+}
 model OhlcvCandle {
   id        String   @id @default(uuid())
   pair      String   @db.VarChar(10)
