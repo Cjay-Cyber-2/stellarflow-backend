@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
+from pydantic import BaseModel
 
 from app.core.logging import bind_request_context, clear_contextvars
 from app.models.proof import ProofVerificationRequest, ProofVerificationResponse
@@ -139,6 +139,42 @@ app.add_middleware(StructlogRequestMiddleware)
 # Routes
 # ---------------------------------------------------------------------------
 
+class AuthChallengeConsumeRequest(BaseModel):
+    nonce: str
+
+
+@app.post("/api/v1/auth/challenge")
+async def auth_challenge() -> JSONResponse:
+    """Issue a one-time authentication challenge nonce."""
+    try:
+        nonce = await create_auth_challenge()
+        return JSONResponse({"success": True, "data": {"nonce": nonce}})
+    except Exception as exc:
+        logger.exception("Auth challenge creation failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Authentication unavailable"
+        ) from exc
+
+
+@app.post("/api/v1/auth/challenge/consume")
+async def auth_challenge_consume(
+    request: AuthChallengeConsumeRequest,
+) -> JSONResponse:
+    """Atomically consume an authentication challenge nonce exactly once."""
+    try:
+        consumed = await consume_auth_challenge(request.nonce)
+    except Exception as exc:
+        logger.exception("Auth challenge consumption failed: %s", exc)
+        raise HTTPException(
+            status_code=503, detail="Authentication unavailable"
+        ) from exc
+
+    if not consumed:
+        raise HTTPException(status_code=401, detail="Invalid or expired challenge")
+
+    return JSONResponse({"success": True, "data": {"consumed": True}})
+
+
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse(
@@ -149,92 +185,21 @@ async def health() -> JSONResponse:
             "cacheTtlSeconds": PROOF_CACHE_TTL_SECONDS,
         }
     )
-
-
-@app.post("/proof/verify", response_model=ProofVerificationResponse)
-async def verify_proof(request: ProofVerificationRequest) -> ProofVerificationResponse:
-    """Verify a single shielded transaction proof.
-
-    Offloads CPU-intensive ZK proof checks to a background worker process pool.
-    Returns cached results within the 100ms latency budget when available.
-    """
+    
     try:
-        result = await verify_proof_async(
-            proof_hex=request.proof.proof_hex,
-            public_inputs=request.proof.public_inputs,
-            contract_params=request.proof.contract_params,
-            proof_scheme=request.proof.proof_scheme.value,
-            simulate_contract=request.simulate_contract,
-        )
-        return ProofVerificationResponse(
-            success=True,
-            result=result,
-        )
-    except Exception as exc:
-        log.exception("proof.verify.error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        status_code = getattr(e, "status_code", 500)
+        if isinstance(e, HTTPException):
+            status_code = e.status_code
+        if status_code in (401, 404):
+            raise e
+        sentry_sdk.capture_exception(e)
+        raise e
 
+app.include_router(revenue.router, prefix="/api/v1")
 
-@app.post("/proof/verify-batch")
-async def verify_proof_batch_endpoint(
-    requests: list[ProofVerificationRequest],
-) -> JSONResponse:
-    """Verify multiple shielded transaction proofs concurrently."""
-    if not requests:
-        raise HTTPException(status_code=400, detail="requests list is empty")
-
-    try:
-        payloads = [req.model_dump() for req in requests]
-        results = await verify_proof_batch(payloads)
-        return JSONResponse(
-            {
-                "success": True,
-                "results": [r.to_dict() for r in results],
-            }
-        )
-    except Exception as exc:
-        log.exception("proof.verify_batch.error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.get("/proof/pool-status")
-async def pool_status() -> JSONResponse:
-    """Return process pool status for observability."""
-    pool = get_process_pool()
-    return JSONResponse(
-        {
-            "success": True,
-            "maxWorkers": PROOF_PROCESS_POOL_WORKERS,
-        }
-    )
-
-
-@app.get("/proof/latency")
-async def latency_status() -> JSONResponse:
-    """Return event-loop latency monitor status."""
-    monitor = get_latency_monitor()
-    return JSONResponse(
-        {
-            "success": True,
-            "budgetMs": LATENCY_BUDGET_MS,
-            "maxLatencyMs": round(monitor.max_latency_ms, 3),
-            "avgLatencyMs": round(monitor.avg_latency_ms, 3),
-            "violationCount": monitor.violation_count,
-            "isHealthy": monitor.is_healthy,
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
-# Mount optional routers
-# ---------------------------------------------------------------------------
-
-try:
-    from app.adapters.anchor import router as anchor_router
-
-    app.include_router(anchor_router, prefix="/webhook", tags=["Webhooks"])
-except ImportError:
-    pass
-
-if _HAS_REVENUE_ROUTER:
-    app.include_router(revenue_router.router, tags=["Analytics"])
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
