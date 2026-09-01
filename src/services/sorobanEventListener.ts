@@ -1,6 +1,5 @@
 import { BackpressureManager, PacketPriority } from "../queue/backpressure";
 import { Horizon } from "@stellar/stellar-sdk";
-import type { ServerApi } from "@stellar/stellar-sdk/lib/horizon";
 import prisma from "../lib/prisma";
 import { broadcastToSessions } from "../lib/socket";
 import stellarProvider from "../lib/stellarProvider";
@@ -308,13 +307,15 @@ export class SorobanEventListener {
 
   // ... (Keep extractMemoId and parseOperations methods as they were) ...
 
-  private extractMemoId(tx: ServerApi.TransactionRecord): string | null {
+  private extractMemoId(
+    tx: Horizon.ServerApi.TransactionRecord,
+  ): string | null {
     if (tx.memo_type === "text" && tx.memo) return tx.memo;
     return null;
   }
 
   private async parseOperations(
-    tx: ServerApi.TransactionRecord,
+    tx: Horizon.ServerApi.TransactionRecord,
     memoId: string,
   ): Promise<ConfirmedPrice[]> {
     const confirmedPrices: ConfirmedPrice[] = [];
@@ -322,7 +323,7 @@ export class SorobanEventListener {
       const operations = await tx.operations();
       for (const op of operations.records) {
         if (op.type !== "manage_data") continue;
-        const manageDataOp = op as ServerApi.ManageDataOperationRecord;
+        const manageDataOp = op as Horizon.ServerApi.ManageDataOperationRecord;
         if (!manageDataOp.name.endsWith("_PRICE")) continue;
 
         const currency = manageDataOp.name.replace("_PRICE", "");
@@ -358,5 +359,9 @@ export class SorobanEventListener {
 
   isActive(): boolean {
     return this.isRunning;
+  }
+
+  getQueueDepth(): number {
+    return this.bpManager.getQueueLength();
   }
 }
