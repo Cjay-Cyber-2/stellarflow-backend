@@ -550,6 +550,7 @@ model GovernanceProposal {
   id              Int       @id @default(autoincrement())
   proposalId      String    @unique
   contractId      String
+  title           String?
   actionType      String?
   actionData      String?
   expiresAt       DateTime
@@ -557,12 +558,134 @@ model GovernanceProposal {
   transactionHash String?
   executedAt      DateTime?
   cancelledAt     DateTime?
+  queuedAt        DateTime?
+  timelockActionSource String?
+  notificationCount Int @default(0)
+  executionReadyNotifiedAt DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+  votes           GovernanceVote[]
 
   @@index([status, expiresAt])
   @@index([contractId])
   @@index([actionType])
+}
+
+enum RebalancingSwapStatus {
+  QUEUED
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model RebalancingSwap {
+  id                String   @id
+  poolKey           String   @db.VarChar(100)
+  anchorAccount     String   @db.VarChar(56)
+  fromCurrency      String   @db.VarChar(12)
+  toCurrency        String   @db.VarChar(12)
+  fromAmount        Decimal  @db.Decimal(30, 7)
+  estimatedToAmount Decimal  @db.Decimal(30, 7)
+  normalizedVolume  Decimal  @db.Decimal(30, 7)
+  fromReserveRatio  Decimal  @db.Decimal(8, 7)
+  toReserveRatio    Decimal  @db.Decimal(8, 7)
+  status            RebalancingSwapStatus @default(QUEUED)
+  managerAccounts   String[]
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([poolKey, status])
+  @@index([status, createdAt])
+}
+
+model PaymentRoute {
+  id              String   @id @default(uuid())
+  senderCurrency  String
+  receiverCurrency String
+  sourceAsset     String
+  targetRail      String
+  provider        String
+  rate            Decimal  @db.Decimal(30, 12)
+  fee             Decimal  @db.Decimal(30, 12)
+  estimatedAmount Decimal  @db.Decimal(30, 12)
+  slippageBps     Int      @default(0)
+  liquidityPoolId String?
+  priority        Int      @default(0)
+  status          String   @default("ACTIVE")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  quotes          FxQuote[]
+
+  @@index([senderCurrency, receiverCurrency, status])
+}
+
+model FxQuote {
+  id              String   @id @default(uuid())
+  paymentRouteId  String
+  senderCurrency  String
+  receiverCurrency String
+  inputAmount     Decimal  @db.Decimal(30, 12)
+  outputAmount    Decimal  @db.Decimal(30, 12)
+  rate            Decimal  @db.Decimal(30, 12)
+  fee             Decimal  @db.Decimal(30, 12)
+  slippageBps     Int
+  liveFeedRate    Decimal  @db.Decimal(30, 12)
+  feedSource      String
+  feedTimestamp   DateTime
+  rateDeviationBps Int
+  status          String
+  expiresAt       DateTime
+  lockedAt        DateTime?
+  executedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  paymentRoute    PaymentRoute @relation(fields: [paymentRouteId], references: [id])
+
+  @@index([paymentRouteId, status])
+  @@index([status, expiresAt])
+}
+
+model VaultApyMetric {
+  id         String   @id @default(uuid())
+  vaultId    String
+  ledgerSeq  Int
+  sharePrice Decimal  @db.Decimal(38, 18)
+  apy7d      Decimal? @db.Decimal(20, 10)
+  apy30d     Decimal? @db.Decimal(20, 10)
+  timestamp  DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([vaultId, timestamp])
+}
+
+model GovernanceVote {
+  id         Int      @id @default(autoincrement())
+  accountId  String
+  proposalId String
+  choice     String
+  weight     Decimal  @db.Decimal(38, 18)
+  txHash     String?
+  votedAt    DateTime
+  proposal   GovernanceProposal @relation(fields: [proposalId], references: [proposalId])
+
+  @@unique([accountId, proposalId])
+  @@index([accountId, votedAt])
+}
+
+model TimelockEvent {
+  id         String   @id @default(uuid())
+  eventType  String
+  proposalId String
+  contractId String
+  ledgerSeq  Int
+  txHash     String
+  topics     String
+  value      String
+  createdAt  DateTime @default(now())
+
+  @@unique([txHash, eventType, proposalId])
+  @@index([ledgerSeq])
 }
 
 model HarvestExecution {

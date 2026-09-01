@@ -41,6 +41,7 @@ import healthRouter from "./routes/health";
 import proofRouter from "./routes/proof";
 import ordersRouter from "./routes/orders";
 import sorobanSimulationRouter from "./routes/sorobanSimulation";
+import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate";
 import remittanceRouter from "./routes/remittance";
 import sorobanRentEstimateRouter from "./routes/sorobanRentEstimate";
 import { sendApiError } from "./lib/apiError.js";
