@@ -92,3 +92,31 @@ To export results as JSON:
 ```bash
 k6 run --out json=results.json tests/load/latest-prices.js
 ```
+
+## Monitoring & Reporting
+
+Run the resource monitor alongside any k6 scenario to capture CPU, memory,
+event-loop lag, and database connection pool usage during the test, then
+turn the results into a documented report:
+
+```bash
+mkdir -p tests/load/results
+
+# terminal 1 — sample every 2s while the load test runs
+DATABASE_URL=$DATABASE_URL node tests/load/monitor.js --out tests/load/results/peak-monitor.csv
+
+# terminal 2 — run the peak scenario and export k6's summary
+k6 run --summary-export tests/load/results/peak-summary.json -e API_KEY=$API_KEY tests/load/peak.js
+# then stop the monitor (Ctrl+C) in terminal 1
+
+# generate the bottleneck report
+node tests/load/generate-report.js \
+  --summary tests/load/results/peak-summary.json \
+  --monitor tests/load/results/peak-monitor.csv \
+  --out tests/load/results/peak-report.md
+```
+
+The report documents threshold pass/fail, request latency percentiles, and
+peak resource utilization (memory, event-loop lag, DB connections) so
+bottlenecks can be traced back to a specific component instead of just an
+elevated p95.

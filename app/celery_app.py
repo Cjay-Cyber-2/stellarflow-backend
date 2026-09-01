@@ -6,6 +6,7 @@ from celery import Celery
 from celery.schedules import crontab
 from kombu import Exchange, Queue
 
+init_sentry()
 
 celery_app = Celery(
     "stellarflow",
