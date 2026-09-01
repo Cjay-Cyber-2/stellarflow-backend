@@ -11,8 +11,15 @@ from celery import Task
 
 from app.celery_app import celery_app
 from app.services.anchor_status_poller import AnchorStatusPoller
-from app.services.receipt_service import generate_payment_receipt
-
+from app.services.webhook_retry import (
+    InMemoryEndpointStateStore,
+    WebhookDelivery,
+    WebhookEndpointHealth,
+    WebhookDeliveryError,
+    PermanentWebhookDeliveryError,
+    WEBHOOK_DLQ_QUEUE,
+    run_delivery,
+)
 
 class DatabaseTask(Task):
     """Base task that exposes the configured PostgreSQL connection string."""
@@ -120,7 +127,6 @@ def aggregate_ledger_analytics(
 
 
 async def _export_user_activity(user_id: str) -> dict[str, object]:
-    """Stream a user's ``ledger_events`` to S3 as CSV and return a download URL."""
     database_url = DatabaseTask._database_url
     if not database_url:
         raise RuntimeError("DATABASE_URL or DB_URL must be configured")
@@ -130,35 +136,20 @@ async def _export_user_activity(user_id: str) -> dict[str, object]:
     pool = await asyncpg.create_pool(database_url)
     try:
         async with pool.acquire() as connection:
-            rows = connection.cursor(
-                """
-                SELECT event_hash, ledger_sequence, tx_hash, event_type,
-                       created_at, payload
-                FROM ledger_events
-                WHERE payload->>'user_id' = $1
-                ORDER BY created_at ASC, event_hash ASC
-                """,
-                user_id,
-            )
-            return await export_user_activity(rows, user_id)
+            async with connection.transaction():
+                rows = connection.cursor(
+                    """
+                    SELECT event_hash, ledger_sequence, tx_hash, event_type,
+                           created_at, payload
+                    FROM ledger_events
+                    WHERE payload->>'user_id' = $1
+                    ORDER BY created_at ASC, event_hash ASC
+                    """,
+                    user_id,
+                )
+                return await export_user_activity(rows, user_id)
     finally:
         await pool.close()
-
-
-@celery_app.task(
-    bind=True,
-    base=DatabaseTask,
-    name="app.tasks.export_user_activity_csv",
-    autoretry_for=(OSError, asyncpg.PostgresError),
-    retry_backoff=True,
-    max_retries=3,
-)
-def export_user_activity_csv(self: DatabaseTask, user_id: str) -> dict[str, object]:
-    """Create a user activity CSV in S3 and return its signed download URL."""
-    if not isinstance(user_id, str) or not user_id.strip():
-        raise ValueError("user_id must be a non-empty string")
-    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
-    return asyncio.run(_export_user_activity(user_id.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +225,6 @@ def _safe_numeric(value: Any) -> Optional[float]:
 async def _ingest_flash_loan_events(lookback_minutes: int = 60) -> int:
     """Scan recent ``ledger_events`` for ``FlashLoanFeesDistributed`` events
     and persist any new rows into ``flash_loan_revenue``."""
-    database_url = DatabaseTask._database_url
-    if not database_url:
-        raise RuntimeError("DATABASE_URL or DB_URL must be configured")
-
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=lookback_minutes)
     pool = await asyncpg.create_pool(database_url)
     try:
@@ -393,7 +380,7 @@ async def _compute_yield_snapshots(granularity: str = "DAILY") -> int:
 @celery_app.task(
     bind=True,
     base=DatabaseTask,
-    name="app.tasks.compute_yield_snapshots",
+    name="app.tasks.ingest_flash_loan_revenue",
     autoretry_for=(OSError, asyncpg.PostgresError),
     retry_backoff=True,
     max_retries=3,
@@ -490,7 +477,7 @@ def _iso_or_none(value: Any) -> Optional[str]:
 @celery_app.task(
     bind=True,
     base=DatabaseTask,
-    name="app.tasks.generate_payment_receipt",
+    name="app.tasks.export_user_activity_csv",
     autoretry_for=(OSError, asyncpg.PostgresError),
     retry_backoff=True,
     max_retries=3,
@@ -513,7 +500,117 @@ def generate_payment_receipt_task(
         raise ValueError("user_id must be a non-empty string")
 
     DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
-    context = {"transaction_id": transaction_id.strip(), "user_id": user_id.strip()}
-    if recipient_email:
-        context["recipient_email"] = recipient_email
-    return asyncio.run(_receipt_for_transaction(**context))
+    return asyncio.run(_export_user_activity(user_id.strip()))
+
+
+@celery_app.task(
+    bind=True,
+    base=DatabaseTask,
+    name="app.tasks.compute_yield_snapshots",
+    autoretry_for=(OSError, asyncpg.PostgresError),
+    retry_backoff=True,
+    max_retries=3,
+)
+def compute_yield_snapshots(
+    self: DatabaseTask,
+    granularity: str = "DAILY",
+) -> int:
+    """Compute aggregate protocol yield snapshots from ``flash_loan_revenue``."""
+    DatabaseTask._database_url = os.getenv("DATABASE_URL", os.getenv("DB_URL"))
+    if granularity not in {"HOURLY", "DAILY"}:
+        raise ValueError("granularity must be HOURLY or DAILY")
+    return int(asyncio.run(_compute_yield_snapshots(granularity)))
+
+
+_webhook_health_store = InMemoryEndpointStateStore()
+
+
+def _webhook_health() -> WebhookEndpointHealth:
+    """Build endpoint health storage, preferring the configured Redis backend."""
+    redis_url = os.getenv("WEBHOOK_REDIS_URL") or os.getenv("REDIS_URL")
+    if not redis_url:
+        return WebhookEndpointHealth(_webhook_health_store)
+
+    import redis.asyncio as redis
+
+    return WebhookEndpointHealth(redis.from_url(redis_url, decode_responses=True))
+
+
+def _webhook_retry_policy():
+    from app.services.webhook_retry import WebhookRetryPolicy
+
+    return WebhookRetryPolicy(
+        max_attempts=5,
+        base_delay_seconds=int(os.getenv("WEBHOOK_RETRY_BASE_SECONDS", "60")),
+        backoff_factor=int(os.getenv("WEBHOOK_RETRY_BACKOFF_FACTOR", "2")),
+        max_delay_seconds=int(os.getenv("WEBHOOK_RETRY_MAX_SECONDS", "3600")),
+        jitter_seconds=int(os.getenv("WEBHOOK_RETRY_JITTER_SECONDS", "10")),
+    )
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.deliver_webhook_task",
+    max_retries=4,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def deliver_webhook_task(self: Task, message: dict[str, object]) -> int:
+    """Deliver a webhook, retrying transient failures up to five total attempts."""
+    delivery = WebhookDelivery.from_message(message)
+    delivery = WebhookDelivery(
+        endpoint_id=delivery.endpoint_id,
+        endpoint_url=delivery.endpoint_url,
+        event_id=delivery.event_id,
+        payload=delivery.payload,
+        attempt=self.request.retries + 1,
+    )
+    health = _webhook_health()
+
+    try:
+        return run_delivery(
+            delivery,
+            health,
+            timeout_seconds=float(os.getenv("WEBHOOK_TIMEOUT_SECONDS", "10")),
+        )
+    except PermanentWebhookDeliveryError as error:
+        webhook_dead_letter_task.apply_async(
+            kwargs={"message": delivery.to_message(), "reason": str(error)},
+            queue=WEBHOOK_DLQ_QUEUE,
+        )
+        raise
+    except WebhookDeliveryError as error:
+        if self.request.retries >= 4:
+            webhook_dead_letter_task.apply_async(
+                kwargs={"message": delivery.to_message(), "reason": str(error)},
+                queue=WEBHOOK_DLQ_QUEUE,
+            )
+            raise
+        raise self.retry(
+            exc=error,
+            countdown=_webhook_retry_policy().delay_for_retry(delivery.attempt),
+        )
+    except Exception as error:
+        if self.request.retries >= 4:
+            webhook_dead_letter_task.apply_async(
+                kwargs={"message": delivery.to_message(), "reason": "unexpected delivery failure"},
+                queue=WEBHOOK_DLQ_QUEUE,
+            )
+            raise
+        raise self.retry(
+            exc=error,
+            countdown=_webhook_retry_policy().delay_for_retry(delivery.attempt),
+        )
+
+
+@celery_app.task(name="app.tasks.webhook_dead_letter_task")
+def webhook_dead_letter_task(message: dict[str, object], reason: str) -> None:
+    """Terminal webhook DLQ consumer hook for operator inspection/replay."""
+    import logging
+
+    logging.getLogger(__name__).error(
+        "Webhook delivery moved to terminal DLQ endpoint_id=%s event_id=%s reason=%s",
+        message.get("endpoint_id"),
+        message.get("event_id"),
+        reason,
+    )
